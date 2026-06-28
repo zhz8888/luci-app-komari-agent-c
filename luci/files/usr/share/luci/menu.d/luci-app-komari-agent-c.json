@@ -1,0 +1,14 @@
+{
+    "admin/services/komari-agent-c": {
+        "title": "Komari Agent (C Language Version)",
+        "order": 60,
+        "action": {
+            "type": "alias",
+            "path": "admin/services/komari-agent-c/config"
+        },
+        "depends": {
+            "acl": ["luci-app-komari-agent-c"],
+            "uci": {"komari-agent-c": true}
+        }
+    }
+}

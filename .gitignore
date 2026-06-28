@@ -1,0 +1,40 @@
+# 编译产物
+build*/
+obj/
+/komari-agent-c
+*.o
+*.a
+*.so
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.bak
+
+# 调试文件
+*.dSYM/
+core.*
+
+# Claude 配置
+.claude/
+
+# Trae 辅助目录
+.trae/
+.komari-agent-main/
+
+# 测试覆盖率
+coverage/
+*.gcda
+*.gcno
+tests/*.o
+tests/test_runner

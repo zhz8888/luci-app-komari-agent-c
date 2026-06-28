@@ -1,0 +1,21 @@
+{
+    "luci-app-komari-agent-c": {
+        "description": "Grant access to Komari Agent (C Language Version) configuration",
+        "read": {
+            "ubus": {
+                "service": ["list"]
+            },
+            "uci": ["komari-agent-c"],
+            "file": {
+                "/etc/config/komari-agent-c": ["read"],
+                "/tmp/komari-agent-c-status.json": ["read"]
+            }
+        },
+        "write": {
+            "uci": ["komari-agent-c"],
+            "file": {
+                "/etc/config/komari-agent-c": ["write"]
+            }
+        }
+    }
+}

@@ -1,0 +1,55 @@
+<%#
+Copyright (C) 2026 zhz8888/luci-app-komari-agent-c Contributors
+Licensed under MIT License
+-%>
+
+<%
+local running = false
+local pid = luci.util.exec("pidof komari-agent-c 2>/dev/null")
+if pid and pid ~= "" then
+    running = true
+end
+-%>
+
+<div class="cbi-section">
+    <div class="cbi-section-node">
+        <div class="table">
+            <div class="tr">
+                <div class="td left" style="width: 30%;">
+                    <strong><%:Service Status%></strong>
+                </div>
+                <div class="td left">
+                    <% if running then %>
+                        <span class="label label-success"><%:Running%></span>
+                    <% else %>
+                        <span class="label label-warning"><%:Not Running%></span>
+                    <% end %>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style type="text/css">
+    .label {
+        display: inline-block;
+        padding: 3px 8px;
+        font-size: 12px;
+        font-weight: bold;
+        line-height: 1;
+        color: #fff;
+        text-align: center;
+        white-space: nowrap;
+        vertical-align: baseline;
+        border-radius: 3px;
+    }
+    .label-success {
+        background-color: #5cb85c;
+    }
+    .label-warning {
+        background-color: #f0ad4e;
+    }
+    .label-danger {
+        background-color: #d9534f;
+    }
+</style>

@@ -1,0 +1,19 @@
+Package: komari-agent-c
+Version: 1.0.1-1
+Section: net
+Priority: optional
+Depends: libpthread, libopenssl, librt, zlib
+Maintainer: zhz8888
+License: MIT
+Description: Komari Agent (C Language Version) for OpenWrt
+ Lightweight monitoring agent designed for OpenWrt.
+ It collects system metrics (CPU, memory, disk, network) and reports
+ to a central Komari Monitor dashboard via WebSocket.
+ .
+ Features:
+ - Real-time system monitoring
+ - Web SSH terminal support
+ - Monthly traffic statistics
+ - Auto-discovery registration
+ - UCI configuration support
+ - Multi-language support (English, Chinese)

@@ -1,0 +1,139 @@
+<%#
+Copyright (C) 2026 zhz8888/luci-app-komari-agent-c Contributors
+Licensed under MIT License
+-%>
+
+<%+header%>
+
+<script type="text/javascript">
+//<![CDATA[
+    var translations = {
+        noLogEntries: '<%:No log entries found%>',
+        failedToLoadLog: '<%:Failed to load log%>',
+        stopAutoRefresh: '<%:Stop Auto Refresh%>',
+        autoRefresh: '<%:Auto Refresh%>',
+        clearLogConfirm: '<%:Are you sure you want to clear the log?%>',
+        logCleared: '<%:Log cleared successfully%>',
+        failedToClearLog: '<%:Failed to clear log%>',
+        loading: '<%:Loading...%>'
+    };
+
+    var autoRefreshInterval = null;
+    var currentLines = 100;
+
+    function loadLog() {
+        XHR.get('<%=luci.dispatcher.build_url("admin", "services", "komari-agent-c", "api", "log")%>', 
+            { lines: currentLines },
+            function(x, data) {
+                var logEl = document.getElementById('log-content');
+                if (data && data.code === 0 && data.log) {
+                    if (data.log.trim() === '') {
+                        logEl.innerHTML = '<p>' + translations.noLogEntries + '</p>';
+                    } else {
+                        logEl.innerHTML = '<pre>' + escapeHtml(data.log) + '</pre>';
+                    }
+                } else {
+                    logEl.innerHTML = '<p>' + translations.failedToLoadLog + '</p>';
+                }
+            }
+        );
+    }
+
+    function escapeHtml(text) {
+        var div = document.createElement('div');
+        div.appendChild(document.createTextNode(text));
+        return div.innerHTML;
+    }
+
+    function startAutoRefresh() {
+        if (!autoRefreshInterval) {
+            autoRefreshInterval = setInterval(loadLog, 5000);
+            document.getElementById('auto-refresh-btn').textContent = translations.stopAutoRefresh;
+        }
+    }
+
+    function stopAutoRefresh() {
+        if (autoRefreshInterval) {
+            clearInterval(autoRefreshInterval);
+            autoRefreshInterval = null;
+            document.getElementById('auto-refresh-btn').textContent = translations.autoRefresh;
+        }
+    }
+
+    function toggleAutoRefresh() {
+        if (autoRefreshInterval) {
+            stopAutoRefresh();
+        } else {
+            startAutoRefresh();
+        }
+    }
+
+    function clearLog() {
+        if (confirm(translations.clearLogConfirm)) {
+            XHR.get('<%=luci.dispatcher.build_url("admin", "services", "komari-agent-c", "api", "clear_log")%>', null,
+                function(x, data) {
+                    if (data.code === 0) {
+                        alert(translations.logCleared);
+                        loadLog();
+                    } else {
+                        alert(translations.failedToClearLog);
+                    }
+                }
+            );
+        }
+    }
+
+    function changeLines() {
+        currentLines = parseInt(document.getElementById('log-lines').value) || 100;
+        loadLog();
+    }
+
+    window.onload = function() {
+        loadLog();
+    };
+
+    window.onbeforeunload = function() {
+        if (autoRefreshInterval) {
+            stopAutoRefresh();
+        }
+    };
+//]]>
+</script>
+
+<h2><%:Komari Agent Log%></h2>
+
+<div class="cbi-section">
+    <h3><%:Log Settings%></h3>
+    <div class="cbi-section-node">
+        <table class="cbi-section-table">
+            <tr class="cbi-section-table-row">
+                <td class="cbi-section-table-cell">
+                    <label><%:Log Lines%>:</label>
+                    <select id="log-lines" onchange="changeLines()">
+                        <option value="50">50</option>
+                        <option value="100" selected>100</option>
+                        <option value="200">200</option>
+                        <option value="500">500</option>
+                        <option value="1000">1000</option>
+                    </select>
+                </td>
+                <td class="cbi-section-table-cell">
+                    <button class="cbi-button cbi-button-action" onclick="loadLog()"><%:Refresh%></button>
+                    <button class="cbi-button cbi-button-action" id="auto-refresh-btn" onclick="toggleAutoRefresh()"><%:Auto Refresh%></button>
+                    <button class="cbi-button cbi-button-negative" onclick="clearLog()"><%:Clear Log%></button>
+                </td>
+            </tr>
+        </table>
+    </div>
+</div>
+
+<div class="cbi-section">
+    <h3><%:Log Content%></h3>
+    <div class="cbi-section-node">
+        <div id="log-content" style="background: #000; color: #fff; padding: 10px; max-height: 600px; overflow-y: auto; font-family: monospace;">
+            <p><%:Loading...%></p>
+        </div>
+    </div>
+</div>
+
+<%+footer%>

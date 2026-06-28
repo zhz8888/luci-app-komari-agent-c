@@ -1,0 +1,348 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PACKAGE_NAME: komari-agent-c
+  FEED_NAME: komari_ci
+
+jobs:
+  build-openwrt:
+    name: Build ${{ matrix.arch }} on ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x86_64
+          - aarch64_generic
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_cortex-a76
+          - arm_cortex-a7_neon-vfpv4
+          - arm_cortex-a9_vfpv3-d16
+          - arm_cortex-a15_neon-vfpv4
+          - mips_24kc
+          - mipsel_24kc
+        version:
+          - 24.10.6
+          - 25.12.2
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+
+      - name: Prepare package
+        run: |
+          mkdir -p package/${{ env.PACKAGE_NAME }}
+          cp -r src package/${{ env.PACKAGE_NAME }}/
+          cp -r include package/${{ env.PACKAGE_NAME }}/
+          cp -r cmake package/${{ env.PACKAGE_NAME }}/ 2>/dev/null || true
+          cp CMakeLists.txt package/${{ env.PACKAGE_NAME }}/
+          cp openwrt/Makefile package/${{ env.PACKAGE_NAME }}/Makefile
+
+          mkdir -p package/${{ env.PACKAGE_NAME }}/files
+          cp openwrt/files/komari-agent-c.config package/${{ env.PACKAGE_NAME }}/files/
+          cp openwrt/files/komari-agent-c.init package/${{ env.PACKAGE_NAME }}/files/
+
+      - name: Build
+        uses: openwrt/gh-action-sdk@v9
+        env:
+          ARCH: ${{ matrix.arch }}-${{ matrix.version }}
+          FEEDNAME: ${{ env.FEED_NAME }}
+          PACKAGES: komari-agent-c
+
+      - name: Rename packages with arch suffix
+        run: |
+          cd bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/
+          for f in *.ipk; do mv "$f" "${f/.ipk/-${{ matrix.arch }}.ipk}" 2>/dev/null || true; done
+          for f in *.apk; do mv "$f" "${f/.apk/-${{ matrix.arch }}.apk}" 2>/dev/null || true; done
+
+      - name: Verify package formats
+        run: |
+          echo "Checking for IPK packages (legacy OpenWrt < 24.10)..."
+          IPK_COUNT=$(find bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/ -name "*.ipk" 2>/dev/null | wc -l)
+          echo "Found $IPK_COUNT IPK package(s)"
+
+          echo "Checking for APK packages (OpenWrt >= 24.10)..."
+          APK_COUNT=$(find bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/ -name "*.apk" 2>/dev/null | wc -l)
+          echo "Found $APK_COUNT APK package(s)"
+
+          if [ "$IPK_COUNT" -eq 0 ] && [ "$APK_COUNT" -eq 0 ]; then
+            echo "Error: Build failed - no package files found!"
+            exit 1
+          fi
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}-${{ matrix.version }}
+          path: bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/*.*pk
+          retention-days: 1
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ matrix.arch }}-${{ matrix.version }}
+          path: logs/
+          retention-days: 1
+
+  build-binaries:
+    name: Build linux/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            cc: x86_64-linux-gnu-gcc
+            pkg: gcc-x86-64-linux-gnu
+          - goarch: arm64
+            cc: aarch64-linux-gnu-gcc
+            pkg: gcc-aarch64-linux-gnu
+          - goarch: arm
+            cc: arm-linux-gnueabi-gcc
+            pkg: gcc-arm-linux-gnueabi
+          - goarch: armv7
+            cc: arm-linux-gnueabihf-gcc
+            pkg: gcc-arm-linux-gnueabihf
+          - goarch: mipsel
+            cc: mipsel-linux-gnu-gcc
+            pkg: gcc-mipsel-linux-gnu
+          - goarch: mips64
+            cc: mips64el-linux-gnuabi64-gcc
+            pkg: gcc-mips64el-linux-gnuabi64
+          - goarch: riscv64
+            cc: riscv64-linux-gnu-gcc
+            pkg: gcc-riscv64-linux-gnu
+          - goarch: 386
+            cc: i686-linux-gnu-gcc
+            pkg: gcc-i686-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ${{ matrix.pkg }} libssl-dev zlib1g-dev pkg-config
+
+      - name: Get version
+        id: get_version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build binary
+        run: |
+          VERSION="${{ steps.get_version.outputs.VERSION }}"
+          GOARCH="${{ matrix.goarch }}"
+
+          echo "Building for linux/$GOARCH..."
+
+          rm -rf build
+          cmake -B build -DCMAKE_C_COMPILER="${{ matrix.cc }}"
+          cmake --build build
+
+          if [ ! -f "build/bin/komari-agent-c" ]; then
+            echo "Error: Build failed - binary not found!"
+            exit 1
+          fi
+
+          mkdir -p dist
+          tar -czf "dist/komari-agent-c-${VERSION}-linux-${GOARCH}.tar.gz" -C build/bin komari-agent-c
+
+      - name: Upload binary artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-linux-${{ matrix.goarch }}
+          path: dist/*
+          retention-days: 1
+
+  build-luci:
+    name: Build LuCI app
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - 24.10.6
+          - 25.12.2
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+
+      - name: Prepare packages
+        run: |
+          mkdir -p package/luci-app-komari-agent-c
+          cp -r luci/* package/luci-app-komari-agent-c/
+
+          mkdir -p package/${{ env.PACKAGE_NAME }}
+          cp -r src package/${{ env.PACKAGE_NAME }}/
+          cp -r include package/${{ env.PACKAGE_NAME }}/
+          cp -r cmake package/${{ env.PACKAGE_NAME }}/ 2>/dev/null || true
+          cp CMakeLists.txt package/${{ env.PACKAGE_NAME }}/
+          cp openwrt/Makefile package/${{ env.PACKAGE_NAME }}/Makefile
+
+          mkdir -p package/${{ env.PACKAGE_NAME }}/files
+          cp openwrt/files/komari-agent-c.config package/${{ env.PACKAGE_NAME }}/files/
+          cp openwrt/files/komari-agent-c.init package/${{ env.PACKAGE_NAME }}/files/
+
+      - name: Build
+        uses: openwrt/gh-action-sdk@v9
+        env:
+          ARCH: x86_64-${{ matrix.version }}
+          FEEDNAME: ${{ env.FEED_NAME }}
+          PACKAGES: luci-app-komari-agent-c
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-komari-agent-c-${{ matrix.version }}
+          path: bin/packages/*/${{ env.FEED_NAME }}/luci-app-komari-agent-c*.*pk
+          retention-days: 1
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-luci-${{ matrix.version }}
+          path: logs/
+          retention-days: 1
+
+  release:
+    needs: [build-openwrt, build-binaries, build-luci]
+    if: always() && (needs.build-openwrt.result == 'success' || needs.build-openwrt.result == 'skipped') && (needs.build-luci.result == 'success' || needs.build-luci.result == 'skipped')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download OpenWrt packages
+        if: needs.build-openwrt.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Download binary packages
+        if: needs.build-binaries.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Download LuCI packages
+        if: needs.build-luci.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: luci-app-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Get version
+        id: get_version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate release notes
+        run: |
+          VERSION="${{ steps.get_version.outputs.VERSION }}"
+          BUILT_BIN="${{ needs.build-binaries.result == 'success' && 'true' || 'false' }}"
+
+          {
+            echo "# Komari Agent v${VERSION}"
+            echo ""
+            echo "## Supported Platforms"
+            echo "- OpenWrt 18.06.x / 24.10.x / 25.12.x"
+            echo "- Architectures: x86_64, aarch64, ARM, MIPS, RISC-V, i386"
+
+            if [ "$BUILT_BIN" = "true" ]; then
+              echo "- Standalone binary: Linux multi-architecture static build"
+            else
+              echo ""
+              echo "> Warning: This release does not include standalone binaries. Please use the OpenWrt packages instead."
+            fi
+
+            echo ""
+            echo "## Quick Installation"
+            echo ""
+            echo '```bash'
+            echo "# OpenWrt >= 24.10 (using apk)"
+            echo "apk add komari-agent-c-<version>-1-<arch>.apk"
+            echo ""
+            echo "# OpenWrt < 24.10 (using opkg)"
+            echo "opkg install komari-agent-c_<version>-1_<arch>.ipk"
+            echo '```'
+            echo ""
+            echo "## Documentation"
+            echo ""
+            echo "For full usage instructions, configuration guides, and build documentation, see:"
+            echo "[Project Docs](https://github.com/${{ github.repository }}/tree/main/docs)"
+            echo ""
+            echo "| Document | Description |"
+            echo "|------|------|"
+            echo "| [OpenWrt Package Guide](https://github.com/${{ github.repository }}/blob/main/docs/openwrt-package.md) | IPK/APK package installation, configuration, and management guide |"
+            echo "| [Binary Usage Guide](https://github.com/${{ github.repository }}/blob/main/docs/binary-usage.md) | Standalone binary download, installation, and usage instructions |"
+            echo "| [Build and Debug Guide](https://github.com/${{ github.repository }}/blob/main/docs/build-debug.md) | Complete guide for local compilation, cross-compilation, and debugging |"
+            echo "| [Configuration Guide](https://github.com/${{ github.repository }}/blob/main/docs/configuration.md) | UCI configuration, environment variables, and command-line options |"
+            echo "| [Features Guide](https://github.com/${{ github.repository }}/blob/main/docs/features.md) | Monitoring data, ping tasks, virtualization detection, and more |"
+            echo ""
+            echo "## Release Assets"
+            echo ""
+            echo "| File | Description |"
+            echo "|--------|------|"
+
+            for file in dist/*; do
+              if [ -f "$file" ]; then
+                filename=$(basename "$file")
+                if [[ "$filename" == luci-app-* ]]; then
+                  if [[ "$filename" == *.apk ]]; then
+                    echo "| \`${filename}\` | LuCI web interface (APK) |"
+                  else
+                    echo "| \`${filename}\` | LuCI web interface (IPK) |"
+                  fi
+                elif [[ "$filename" == *.apk ]]; then
+                  echo "| \`${filename}\` | OpenWrt package (APK) |"
+                elif [[ "$filename" == *.ipk ]]; then
+                  echo "| \`${filename}\` | OpenWrt package (IPK) |"
+                elif [[ "$filename" == *.tar.gz ]]; then
+                  echo "| \`${filename}\` | Standalone binary |"
+                fi
+              fi
+            done
+          } > release_notes.md
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Komari Agent v${{ steps.get_version.outputs.VERSION }}
+          body_path: release_notes.md
+          files: dist/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

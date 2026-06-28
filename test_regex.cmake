@@ -1,0 +1,5 @@
+file(READ "include/komari-agent-c/version.h" _CONTENT)
+message(STATUS "Content: ${_CONTENT}")
+string(REGEX MATCH "KOMARI_AGENT_C_VERSION_MAJOR[ \t]+([0-9]+)" _MATCH "${_CONTENT}")
+message(STATUS "Match: ${_MATCH}")
+message(STATUS "Group1: ${CMAKE_MATCH_1}")

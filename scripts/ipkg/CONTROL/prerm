@@ -1,0 +1,6 @@
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] || {
+	/etc/init.d/komari-agent-c stop
+	/etc/init.d/komari-agent-c disable
+}
+exit 0

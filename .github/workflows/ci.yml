@@ -1,0 +1,290 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE_NAME: komari-agent-c
+  FEED_NAME: komari_ci
+
+jobs:
+  test-binary-build:
+    name: Test binary build on linux/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            cc: x86_64-linux-gnu-gcc
+            pkg: gcc-x86-64-linux-gnu
+          - goarch: arm64
+            cc: aarch64-linux-gnu-gcc
+            pkg: gcc-aarch64-linux-gnu
+          - goarch: arm
+            cc: arm-linux-gnueabi-gcc
+            pkg: gcc-arm-linux-gnueabi
+          - goarch: armv7
+            cc: arm-linux-gnueabihf-gcc
+            pkg: gcc-arm-linux-gnueabihf
+          - goarch: mipsel
+            cc: mipsel-linux-gnu-gcc
+            pkg: gcc-mipsel-linux-gnu
+          - goarch: mips64
+            cc: mips64el-linux-gnuabi64-gcc
+            pkg: gcc-mips64el-linux-gnuabi64
+          - goarch: riscv64
+            cc: riscv64-linux-gnu-gcc
+            pkg: gcc-riscv64-linux-gnu
+          - goarch: 386
+            cc: i686-linux-gnu-gcc
+            pkg: gcc-i686-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ${{ matrix.pkg }} libssl-dev zlib1g-dev pkg-config
+
+      - name: Build binary
+        run: |
+          echo "Building for linux/${{ matrix.goarch }} with ${{ matrix.cc }}..."
+          START_TIME=$(date +%s)
+
+          rm -rf build
+          if cmake -B build -DCMAKE_C_COMPILER="${{ matrix.cc }}" 2>&1 && cmake --build build 2>&1; then
+            END_TIME=$(date +%s)
+            BUILD_TIME=$((END_TIME - START_TIME))
+            echo "Build completed in ${BUILD_TIME}s"
+
+            if [ ! -f "build/bin/komari-agent-c" ]; then
+              echo "Error: Build failed - binary not found!"
+              exit 1
+            fi
+
+            BINARY_SIZE=$(stat -f%z "build/bin/komari-agent-c" 2>/dev/null || stat -c%s "build/bin/komari-agent-c" 2>/dev/null)
+            echo "Binary size: $((BINARY_SIZE / 1024)) KB"
+
+            echo "Checking binary file type..."
+            file build/bin/komari-agent-c || true
+
+            echo "Checking binary is statically linked..."
+            ldd build/bin/komari-agent-c 2>&1 || echo "Static linking confirmed (ldd error expected)"
+
+            echo "Checking binary is executable..."
+            if [ -x "build/bin/komari-agent-c" ]; then
+              echo "Binary is executable: YES"
+            else
+              echo "Error: Binary is not executable!"
+              exit 1
+            fi
+
+            echo "Build successful for linux/${{ matrix.goarch }}"
+          else
+            echo "Error: Build failed with compilation errors!"
+            exit 1
+          fi
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-binary-linux-${{ matrix.goarch }}
+          path: build/bin/komari-agent-c
+          retention-days: 7
+
+  test-build:
+    name: Test build on ${{ matrix.arch }} (${{ matrix.version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x86_64
+          - aarch64_generic
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_cortex-a76
+          - arm_cortex-a7_neon-vfpv4
+          - arm_cortex-a9_vfpv3-d16
+          - arm_cortex-a15_neon-vfpv4
+          - mips_24kc
+          - mipsel_24kc
+        version:
+          - 18.06.7
+          - 24.10.6
+          - 25.12.2
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+
+      - name: Prepare package
+        run: |
+          mkdir -p package/${{ env.PACKAGE_NAME }}
+          cp -r src package/${{ env.PACKAGE_NAME }}/
+          cp -r include package/${{ env.PACKAGE_NAME }}/
+          cp -r cmake package/${{ env.PACKAGE_NAME }}/ 2>/dev/null || true
+          cp CMakeLists.txt package/${{ env.PACKAGE_NAME }}/
+          cp openwrt/Makefile package/${{ env.PACKAGE_NAME }}/Makefile
+
+          mkdir -p package/${{ env.PACKAGE_NAME }}/files
+          cp openwrt/files/komari-agent-c.config package/${{ env.PACKAGE_NAME }}/files/
+          cp openwrt/files/komari-agent-c.init package/${{ env.PACKAGE_NAME }}/files/
+
+      - name: Build
+        uses: openwrt/gh-action-sdk@v9
+        env:
+          ARCH: ${{ matrix.arch }}-${{ matrix.version }}
+          FEEDNAME: ${{ env.FEED_NAME }}
+          PACKAGES: komari-agent-c
+
+      - name: Rename packages with arch suffix
+        run: |
+          cd bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/
+          for f in *.ipk; do mv "$f" "${f/.ipk/-${{ matrix.arch }}.ipk}" 2>/dev/null || true; done
+          for f in *.apk; do mv "$f" "${f/.apk/-${{ matrix.arch }}.apk}" 2>/dev/null || true; done
+
+      - name: Verify build
+        run: |
+          echo "Checking for IPK packages..."
+          IPK_COUNT=$(find bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/ -name "*.ipk" 2>/dev/null | wc -l)
+          echo "Found $IPK_COUNT IPK package(s)"
+
+          echo "Checking for APK packages..."
+          APK_COUNT=$(find bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/ -name "*.apk" 2>/dev/null | wc -l)
+          echo "Found $APK_COUNT APK package(s)"
+
+          if [ "$IPK_COUNT" -eq 0 ] && [ "$APK_COUNT" -eq 0 ]; then
+            echo "Error: Build failed - no package files found!"
+            exit 1
+          fi
+
+          echo "Build successful for ${{ matrix.arch }} on ${{ matrix.version }}"
+          echo ""
+          echo "IPK packages:"
+          find bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/ -name "*.ipk" -exec ls -lh {} \; 2>/dev/null || echo "  (none)"
+          echo ""
+          echo "APK packages:"
+          find bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/ -name "*.apk" -exec ls -lh {} \; 2>/dev/null || echo "  (none)"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-${{ matrix.arch }}-${{ matrix.version }}
+          path: bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/*.*pk
+          retention-days: 7
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-test-${{ matrix.arch }}-${{ matrix.version }}
+          path: logs/
+          retention-days: 7
+
+  lint:
+    name: Code quality checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install lint tools
+        run: |
+          pip install codespell pyyaml
+
+      - name: Spell check
+        run: |
+          codespell --skip=".git,*.po,*.ipk,*.apk,*.lmo" --ignore-words-list="ba,dne,nce,nam,ot,tht" || true
+
+      - name: Check shell scripts
+        run: |
+          find . -name "*.sh" -exec bash -n {} \;
+
+      - name: Check YAML syntax
+        run: |
+          python -c "
+          import yaml
+          import sys
+          files = ['.github/workflows/build.yml', '.github/workflows/release.yml', '.github/workflows/ci.yml']
+          for f in files:
+              try:
+                  with open(f) as fh:
+                      yaml.safe_load(fh)
+                  print(f'✅ {f}: Valid')
+              except yaml.YAMLError as e:
+                  print(f'❌ {f}: {e}')
+                  sys.exit(1)
+          "
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev zlib1g-dev pkg-config cppcheck
+
+      - name: Build for verification
+        run: |
+          rm -rf build
+          cmake -B build -DCMAKE_C_COMPILER=gcc 2>&1 || { echo "CMake configuration failed"; exit 1; }
+          cmake --build build 2>&1 || { echo "Build failed"; exit 1; }
+
+      - name: Run cppcheck
+        run: |
+          if command -v cppcheck &> /dev/null; then
+            echo "Running cppcheck static analysis on src/..."
+            cppcheck --enable=warning,style,performance,portability \
+              --suppress=missingIncludeSystem \
+              -I include -I include/komari-agent-c \
+              -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+              src/ \
+              --output-file=cppcheck-report.txt --xml 2>&1 || true
+            if [ -f cppcheck-report.txt ] && [ -s cppcheck-report.txt ]; then
+              echo "⚠️ Cppcheck found issues:"
+              cat cppcheck-report.txt
+            else
+              echo "✅ No issues found by cppcheck"
+            fi
+          else
+            echo "cppcheck not installed, skipping..."
+          fi
+
+      - name: Run unit tests
+        run: |
+          if command -v gcc &> /dev/null; then
+            echo "Running unit tests..."
+            rm -rf build
+            cmake -B build -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc 2>&1
+            cmake --build build 2>&1
+            ctest --test-dir build --output-on-failure 2>&1
+          else
+            echo "gcc not installed, skipping unit tests..."
+          fi

@@ -1,0 +1,223 @@
+<%#
+Copyright (C) 2026 zhz8888/luci-app-komari-agent-c Contributors
+Licensed under MIT License
+-%>
+
+<%+header%>
+
+<script type="text/javascript">
+//<![CDATA[
+    var translations = {
+        running: '<%:Running%>',
+        notRunning: '<%:Not Running%>',
+        connected: '<%:Connected%>',
+        disconnected: '<%:Disconnected%>',
+        serviceStarted: '<%:Service started%>',
+        failedToStart: '<%:Failed to start service%>',
+        serviceStopped: '<%:Service stopped%>',
+        failedToStop: '<%:Failed to stop service%>',
+        serviceRestarted: '<%:Service restarted%>',
+        failedToRestart: '<%:Failed to restart service%>',
+        testing: '<%:Testing...%>',
+        testConnection: '<%:Test Connection%>',
+        days: '<%:d%>',
+        hours: '<%:h%>',
+        minutes: '<%:min%>'
+    };
+
+    function formatUptime(seconds) {
+        var days = Math.floor(seconds / 86400);
+        var hours = Math.floor((seconds % 86400) / 3600);
+        var minutes = Math.floor((seconds % 3600) / 60);
+        
+        var result = '';
+        if (days > 0) {
+            result += days + ' ' + translations.days + ' ';
+        }
+        if (hours > 0) {
+            result += hours + ' ' + translations.hours + ' ';
+        }
+        result += minutes + ' ' + translations.minutes;
+        return result;
+    }
+
+    function formatSpeed(bytes) {
+        if (bytes >= 1048576) {
+            return (bytes / 1048576).toFixed(2) + ' MB/s';
+        } else if (bytes >= 1024) {
+            return (bytes / 1024).toFixed(2) + ' KB/s';
+        } else {
+            return bytes + ' B/s';
+        }
+    }
+
+    function updateStatus() {
+        XHR.poll(5, '<%=luci.dispatcher.build_url("admin", "services", "komari-agent-c", "api", "status")%>', null,
+            function(x, data) {
+                if (data && data.code === 0) {
+                    var statusEl = document.getElementById('service-status');
+                    var uptimeEl = document.getElementById('agent-uptime');
+                    var connectedEl = document.getElementById('connection-status');
+                    var endpointEl = document.getElementById('endpoint');
+                    var cpuEl = document.getElementById('cpu-usage');
+                    var memoryEl = document.getElementById('memory-usage');
+                    var diskEl = document.getElementById('disk-usage');
+                    var rxEl = document.getElementById('rx-speed');
+                    var txEl = document.getElementById('tx-speed');
+
+                    if (data.running) {
+                        statusEl.innerHTML = '<span style="color: green;">●</span> ' + translations.running;
+                        uptimeEl.textContent = formatUptime(data.uptime || 0);
+                        
+                        if (data.data) {
+                            connectedEl.innerHTML = data.data.connected ? 
+                                '<span style="color: green;">●</span> ' + translations.connected : 
+                                '<span style="color: red;">●</span> ' + translations.disconnected;
+                            endpointEl.textContent = data.data.endpoint || '-';
+                            cpuEl.textContent = (data.data.cpu_usage || 0).toFixed(1) + '%';
+                            memoryEl.textContent = (data.data.memory_usage || 0).toFixed(1) + '%';
+                            diskEl.textContent = (data.data.disk_usage || 0).toFixed(1) + '%';
+                            rxEl.textContent = formatSpeed(data.data.rx_speed || 0);
+                            txEl.textContent = formatSpeed(data.data.tx_speed || 0);
+                        }
+                    } else {
+                        statusEl.innerHTML = '<span style="color: red;">●</span> ' + translations.notRunning;
+                        uptimeEl.textContent = '-';
+                        connectedEl.innerHTML = '-';
+                        endpointEl.textContent = '-';
+                        cpuEl.textContent = '-';
+                        memoryEl.textContent = '-';
+                        diskEl.textContent = '-';
+                        rxEl.textContent = '-';
+                        txEl.textContent = '-';
+                    }
+                }
+            }
+        );
+    }
+
+    function startService() {
+        XHR.get('<%=luci.dispatcher.build_url("admin", "services", "komari-agent-c", "api", "start")%>', null,
+            function(x, data) {
+                if (data.code === 0) {
+                    alert(translations.serviceStarted);
+                } else {
+                    alert(translations.failedToStart);
+                }
+            }
+        );
+    }
+
+    function stopService() {
+        XHR.get('<%=luci.dispatcher.build_url("admin", "services", "komari-agent-c", "api", "stop")%>', null,
+            function(x, data) {
+                if (data.code === 0) {
+                    alert(translations.serviceStopped);
+                } else {
+                    alert(translations.failedToStop);
+                }
+            }
+        );
+    }
+
+    function restartService() {
+        XHR.get('<%=luci.dispatcher.build_url("admin", "services", "komari-agent-c", "api", "restart")%>', null,
+            function(x, data) {
+                if (data.code === 0) {
+                    alert(translations.serviceRestarted);
+                } else {
+                    alert(translations.failedToRestart);
+                }
+            }
+        );
+    }
+
+    function testConnection() {
+        var btn = document.getElementById('test-btn');
+        btn.disabled = true;
+        btn.textContent = translations.testing;
+        
+        XHR.get('<%=luci.dispatcher.build_url("admin", "services", "komari-agent-c", "api", "test_connection")%>', null,
+            function(x, data) {
+                btn.disabled = false;
+                btn.textContent = translations.testConnection;
+                alert(data.message);
+            }
+        );
+    }
+
+    window.onload = function() {
+        updateStatus();
+    };
+//]]>
+</script>
+
+<h2><%:Komari Agent Status%></h2>
+
+<div class="cbi-section">
+    <h3><%:Service Status%></h3>
+    <div class="cbi-section-node">
+        <table class="cbi-section-table">
+            <tr class="cbi-section-table-titles">
+                <th class="cbi-section-table-cell"><%:Status%></th>
+                <th class="cbi-section-table-cell"><%:Agent Uptime%></th>
+            </tr>
+            <tr class="cbi-section-table-row">
+                <td id="service-status">-</td>
+                <td id="agent-uptime">-</td>
+            </tr>
+        </table>
+    </div>
+</div>
+
+<div class="cbi-section">
+    <h3><%:Connection Status%></h3>
+    <div class="cbi-section-node">
+        <table class="cbi-section-table">
+            <tr class="cbi-section-table-titles">
+                <th class="cbi-section-table-cell"><%:Connection Status%></th>
+                <th class="cbi-section-table-cell"><%:Panel Server%></th>
+            </tr>
+            <tr class="cbi-section-table-row">
+                <td id="connection-status">-</td>
+                <td id="endpoint">-</td>
+            </tr>
+        </table>
+    </div>
+</div>
+
+<div class="cbi-section">
+    <h3><%:System Metrics%></h3>
+    <div class="cbi-section-node">
+        <table class="cbi-section-table">
+            <tr class="cbi-section-table-titles">
+                <th class="cbi-section-table-cell"><%:CPU Usage%></th>
+                <th class="cbi-section-table-cell"><%:Memory Usage%></th>
+                <th class="cbi-section-table-cell"><%:Disk Usage%></th>
+                <th class="cbi-section-table-cell"><%:Download Speed%></th>
+                <th class="cbi-section-table-cell"><%:Upload Speed%></th>
+            </tr>
+            <tr class="cbi-section-table-row">
+                <td id="cpu-usage">-</td>
+                <td id="memory-usage">-</td>
+                <td id="disk-usage">-</td>
+                <td id="rx-speed">-</td>
+                <td id="tx-speed">-</td>
+            </tr>
+        </table>
+    </div>
+</div>
+
+<div class="cbi-section">
+    <h3><%:Actions%></h3>
+    <div class="cbi-section-node">
+        <div class="cbi-value-field">
+            <button class="cbi-button cbi-button-positive" onclick="startService()"><%:Start%></button>
+            <button class="cbi-button cbi-button-negative" onclick="stopService()"><%:Stop%></button>
+            <button class="cbi-button cbi-button-reload" onclick="restartService()"><%:Restart%></button>
+            <button class="cbi-button cbi-button-action" id="test-btn" onclick="testConnection()"><%:Test Connection%></button>
+        </div>
+    </div>
+</div>
+
+<%+footer%>
