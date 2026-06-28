@@ -24,7 +24,7 @@ typedef struct {
     log_level_t level;
     bool use_syslog;
     bool use_stdout;
-    const char *tag;
+    char *tag;
 } logger_config_t;
 
 /**

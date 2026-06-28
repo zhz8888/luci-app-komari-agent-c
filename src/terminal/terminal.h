@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <signal.h>
 #include <pthread.h>
 
 typedef struct terminal terminal_t;
@@ -22,7 +23,7 @@ struct terminal {
     int pgid;
     int cols;
     int rows;
-    bool running;
+    volatile sig_atomic_t running;  /* cross-thread: read thread reads, owner thread writes */
     pthread_t read_thread;
     terminal_output_cb_t output_cb;
     void *user_data;

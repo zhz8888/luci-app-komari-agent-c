@@ -118,47 +118,46 @@ static int http_post_get_body(const char *url,
         port = atoi(colon + 1);
     }
 
-    /* DNS resolution */
-    struct addrinfo hints, *res;
+    /* DNS resolution: iterate through all addresses for IPv4/IPv6 support */
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
-    if (getaddrinfo(host, NULL, &hints, &res) != 0) {
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
         KOMARI_LOG_ERROR("Auto-discovery: DNS resolution failed host=%s", host);
         return -1;
     }
 
-    /* Create socket */
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
-        freeaddrinfo(res);
-        KOMARI_LOG_ERROR("Auto-discovery: Failed to create socket");
-        return -1;
-    }
+    int fd = -1;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) continue;
 
-    /* Set timeout */
-    struct timeval tv;
-    tv.tv_sec = 10;
-    tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        /* Set timeout */
+        struct timeval tv;
+        tv.tv_sec = 10;
+        tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    /* Connect */
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = res->ai_family;
-    addr.sin_port = htons(port);
-    memcpy(&addr.sin_addr, &((struct sockaddr_in*)res->ai_addr)->sin_addr, sizeof(addr.sin_addr));
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break;  /* Success */
+        }
 
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         close(fd);
-        freeaddrinfo(res);
-        KOMARI_LOG_ERROR("Auto-discovery: Connection failed host=%s port=%d", host, port);
-        return -1;
+        fd = -1;
     }
 
     freeaddrinfo(res);
+
+    if (fd < 0) {
+        KOMARI_LOG_ERROR("Auto-discovery: Connection failed host=%s port=%d", host, port);
+        return -1;
+    }
 
     SSL *ssl = NULL;
     SSL_CTX *ssl_ctx = NULL;
@@ -402,7 +401,8 @@ int autodiscovery_save_config(const autodiscovery_config_t *config) {
         return -1;
     }
 
-    int ret = utils_write_file_string(path, json_str);
+    /* Persist with restrictive permissions: the file contains the agent token */
+    int ret = utils_write_file_string(path, json_str, 0600);
     cJSON_free(json_str);
 
     if (ret != 0) {
@@ -414,11 +414,30 @@ int autodiscovery_save_config(const autodiscovery_config_t *config) {
     return 0;
 }
 
+/* Check whether a string contains CR or LF characters (header injection prevention). */
+static int contains_crlf(const char *s) {
+    if (!s) return 0;
+    for (; *s; s++) {
+        if (*s == '\r' || *s == '\n') return 1;
+    }
+    return 0;
+}
+
 int autodiscovery_register(const char *endpoint,
                             const char *auto_discovery_key,
                             const char *hostname,
                             autodiscovery_config_t *config) {
     if (!endpoint || !auto_discovery_key || !hostname || !config) return -1;
+
+    /* Prevent HTTP header injection: reject CR/LF in user-controlled fields */
+    if (contains_crlf(auto_discovery_key)) {
+        KOMARI_LOG_ERROR("Auto-discovery: auto_discovery_key contains CR/LF characters");
+        return -1;
+    }
+    if (contains_crlf(hostname)) {
+        KOMARI_LOG_ERROR("Auto-discovery: hostname contains CR/LF characters");
+        return -1;
+    }
 
     /* Build registration URL: {endpoint}/api/clients/register?name={hostname} */
     char url[768];

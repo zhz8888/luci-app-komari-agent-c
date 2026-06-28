@@ -33,11 +33,6 @@ static int is_basic_code_point(uint32_t cp) {
     return cp < 0x80;
 }
 
-/* Internal helper: returns 1 if the code point is a Punycode delimiter. */
-static int is_delimiter(uint32_t cp) {
-    return cp == 0x2D || cp == 0x2E || cp == 0x5F || cp == 0x7E;
-}
-
 /* Internal helper: Punycode adaptive bias function (RFC 3492 section 6). */
 static int adapt(int delta, int numpoints, int first) {
     delta = first ? delta / PUNYCODE_DAMP : delta >> 1;

@@ -27,27 +27,55 @@
 #include "virtual.h"
 #include "gpu.h"
 
-/* Escape special characters in a string for safe inclusion in a JSON string literal. */
+/* Escape special characters in a string for safe inclusion in a JSON string literal.
+ * Conforms to RFC 8259: escapes ", \, and control characters (0x00-0x1F). */
 static void escape_json_string(const char *src, char *dst, size_t dst_len) {
+    static const char hex[] = "0123456789ABCDEF";
     size_t j = 0;
     for (size_t i = 0; src[i] && j < dst_len - 1; i++) {
-        if (src[i] == '"' || src[i] == '\\') {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') {
             if (j < dst_len - 2) {
                 dst[j++] = '\\';
-                dst[j++] = src[i];
+                dst[j++] = c;
             }
-        } else if (src[i] == '\n') {
+        } else if (c == '\n') {
             if (j < dst_len - 2) {
                 dst[j++] = '\\';
                 dst[j++] = 'n';
             }
-        } else if (src[i] == '\r') {
+        } else if (c == '\r') {
             if (j < dst_len - 2) {
                 dst[j++] = '\\';
                 dst[j++] = 'r';
             }
-        } else if ((unsigned char)src[i] >= 0x20) {
-            dst[j++] = src[i];
+        } else if (c == '\t') {
+            if (j < dst_len - 2) {
+                dst[j++] = '\\';
+                dst[j++] = 't';
+            }
+        } else if (c == '\b') {
+            if (j < dst_len - 2) {
+                dst[j++] = '\\';
+                dst[j++] = 'b';
+            }
+        } else if (c == '\f') {
+            if (j < dst_len - 2) {
+                dst[j++] = '\\';
+                dst[j++] = 'f';
+            }
+        } else if (c < 0x20) {
+            /* Other control characters: \u00XX (uppercase hex) */
+            if (j < dst_len - 6) {
+                dst[j++] = '\\';
+                dst[j++] = 'u';
+                dst[j++] = '0';
+                dst[j++] = '0';
+                dst[j++] = hex[(c >> 4) & 0xF];
+                dst[j++] = hex[c & 0xF];
+            }
+        } else {
+            dst[j++] = c;
         }
     }
     dst[j] = '\0';
@@ -74,9 +102,10 @@ int report_generate(const agent_config_t *config, char *buf, size_t buf_len) {
     uint64_t uptime = monitoring_get_uptime();
     int process_count = monitoring_get_process_count();
     
+    /* Report the real CPU usage, including 0% for an idle system. The server
+     * treats 0.00 as a valid value, so no artificial floor is needed. */
     double cpu_usage = cpu.cpu_usage;
-    if (cpu_usage < 0.001) cpu_usage = 0.001;
-    
+
     int len = snprintf(buf, buf_len,
         "{"
         "\"cpu\":{\"usage\":%.2f},"
@@ -216,51 +245,58 @@ static int http_post_with_headers(const char *url, const char *payload, int igno
         host[sizeof(host) - 1] = '\0';
     }
     
-    /* Parse port */
+    /* Parse port with validation: atoi gives no error indication, so use strtol
+     * and verify the value is in the valid port range [1, 65535]. On invalid
+     * input, keep the scheme default port (80 for http, 443 for https). */
     char *colon = strchr(host, ':');
     if (colon) {
         *colon = '\0';
-        port = atoi(colon + 1);
+        char *endptr = NULL;
+        long parsed_port = strtol(colon + 1, &endptr, 10);
+        if (endptr != colon + 1 && *endptr == '\0' &&
+            parsed_port >= 1 && parsed_port <= 65535) {
+            port = (int)parsed_port;
+        }
     }
     
-    /* DNS resolution */
-    struct addrinfo hints, *res;
+    /* DNS resolution: iterate through all addresses for IPv4/IPv6 support */
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    
-    if (getaddrinfo(host, NULL, &hints, &res) != 0) {
+
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
         return -1;
     }
-    
-    /* Create socket */
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
-        freeaddrinfo(res);
-        return -1;
-    }
-    
-    /* Set timeout */
-    struct timeval tv;
-    tv.tv_sec = 10;
-    tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
-    /* Connect */
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = res->ai_family;
-    addr.sin_port = htons(port);
-    memcpy(&addr.sin_addr, &((struct sockaddr_in*)res->ai_addr)->sin_addr, sizeof(addr.sin_addr));
-    
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+
+    int fd = -1;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) continue;
+
+        /* Set timeout */
+        struct timeval tv;
+        tv.tv_sec = 10;
+        tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break;  /* Success */
+        }
+
         close(fd);
-        freeaddrinfo(res);
+        fd = -1;
+    }
+
+    freeaddrinfo(res);
+
+    if (fd < 0) {
         return -1;
     }
-    
-    freeaddrinfo(res);
     
     SSL *ssl = NULL;
     SSL_CTX *ssl_ctx = NULL;
@@ -325,16 +361,33 @@ static int http_post_with_headers(const char *url, const char *payload, int igno
             "%s",
             path, host, strlen(payload), payload);
     }
-    
-    /* Send request */
-    int sent = 0;
-    if (ssl) {
-        sent = SSL_write(ssl, request, req_len);
-    } else {
-        sent = send(fd, request, req_len, 0);
+
+    /* Check for snprintf truncation or encoding error */
+    if (req_len < 0 || (size_t)req_len >= sizeof(request)) {
+        if (ssl) SSL_free(ssl);
+        if (ssl_ctx) SSL_CTX_free(ssl_ctx);
+        close(fd);
+        return -1;
     }
-    
-    if (sent < 0) {
+
+    /* Send request: loop until all bytes are flushed. send(2) and SSL_write
+     * may return fewer bytes than requested, so retry the remainder. */
+    size_t sent = 0;
+    while (sent < (size_t)req_len) {
+        ssize_t n;
+        if (ssl) {
+            n = SSL_write(ssl, request + sent, req_len - sent);
+        } else {
+            n = send(fd, request + sent, req_len - sent, 0);
+        }
+        if (n <= 0) {
+            if (!ssl && n < 0 && errno == EINTR) continue;
+            break;  /* error or connection closed */
+        }
+        sent += (size_t)n;
+    }
+
+    if (sent < (size_t)req_len) {
         if (ssl) SSL_free(ssl);
         if (ssl_ctx) SSL_CTX_free(ssl_ctx);
         close(fd);
@@ -353,8 +406,10 @@ static int http_post_with_headers(const char *url, const char *payload, int igno
     int ret = 0;
     if (recv_len > 0) {
         response[recv_len] = '\0';
-        /* Check HTTP status code */
-        if (strstr(response, "HTTP/1.1 200") || strstr(response, "HTTP/1.0 200")) {
+        /* Check HTTP status code at the start of the response. Using strncmp
+         * avoids matching "HTTP/1.1 200" inside the response body. */
+        if (strncmp(response, "HTTP/1.1 200", 12) == 0 ||
+            strncmp(response, "HTTP/1.0 200", 12) == 0) {
             ret = 0;
         } else {
             ret = -1;
@@ -384,21 +439,42 @@ int report_upload_task_result(const agent_config_t *config,
                                int exit_code,
                                uint64_t finished_at) {
     if (!config || !task_id) return -1;
-    
+
     char *escaped_result = utils_json_escape(result ? result : "");
     if (!escaped_result) return -1;
-    
+
+    /* Escape task_id to prevent breaking the JSON structure if it contains
+     * quotes, backslashes, or control characters. */
+    char *escaped_task_id = utils_json_escape(task_id);
+    if (!escaped_task_id) {
+        free(escaped_result);
+        return -1;
+    }
+
+    /* The token is passed as a URL query parameter for server-side
+     * compatibility. Using an Authorization: Bearer header would be safer
+     * (avoids token leakage via access logs and intermediary caches), but
+     * the server endpoint expects the token in the query string and does not
+     * accept the Authorization header. Switching would break authentication,
+     * so the current approach is retained. */
     char url[512];
     snprintf(url, sizeof(url), "%s/api/clients/task/result?token=%s",
              config->endpoint, config->token);
-    
+
     char payload[8192];
-    snprintf(payload, sizeof(payload),
+    int n = snprintf(payload, sizeof(payload),
         "{\"task_id\":\"%s\",\"result\":\"%s\",\"exit_code\":%d,\"finished_at\":%lu}",
-        task_id, escaped_result, exit_code, (unsigned long)finished_at);
-    
+        escaped_task_id, escaped_result, exit_code, (unsigned long)finished_at);
+
     free(escaped_result);
-    
+    free(escaped_task_id);
+
+    /* Abort if the payload was truncated: a truncated JSON body would be
+     * rejected by the server and could expose partial/malformed data. */
+    if (n < 0 || (size_t)n >= sizeof(payload)) {
+        return -1;
+    }
+
     char headers[512] = "";
     if (config->cf_access_client_id[0] != '\0' && config->cf_access_client_secret[0] != '\0') {
         snprintf(headers, sizeof(headers),

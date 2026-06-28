@@ -23,6 +23,7 @@
 #include <ifaddrs.h>
 #include <ctype.h>
 #include <netdb.h>
+#include <inttypes.h>
 
 #include "monitoring.h"
 #include "utils.h"
@@ -87,7 +88,10 @@ int monitoring_get_cpu_info(cpu_info_t *info) {
             unsigned long long total = user + nice + system + idle + iowait + irq + softirq;
             unsigned long long used = user + nice + system + irq + softirq;
             
-            usleep(100000);
+            /* Sleep in smaller increments for responsiveness */
+            for (int i = 0; i < 10; i++) {
+                usleep(10000);
+            }
             
             fseek(stat_fp, 0, SEEK_SET);
             unsigned long long user2, nice2, system2, idle2, iowait2, irq2, softirq2;
@@ -267,7 +271,10 @@ int monitoring_get_net_info(net_info_t *info) {
         uint64_t rx_bytes, rx_packets, rx_errs, rx_drop, rx_fifo, rx_frame, rx_compressed, rx_multicast;
         uint64_t tx_bytes, tx_packets, tx_errs, tx_drop, tx_fifo, tx_colls, tx_carrier, tx_compressed;
         
-        if (sscanf(line, "%31[^:]: %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu",
+        if (sscanf(line, "%31[^:]: %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
+                   " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
+                   " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
+                   " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64,
                    iface, &rx_bytes, &rx_packets, &rx_errs, &rx_drop, &rx_fifo, &rx_frame,
                    &rx_compressed, &rx_multicast, &tx_bytes, &tx_packets, &tx_errs, &tx_drop,
                    &tx_fifo, &tx_colls, &tx_carrier, &tx_compressed) >= 10) {
@@ -294,8 +301,11 @@ int monitoring_get_net_info(net_info_t *info) {
     if (g_last_time > 0) {
         uint64_t time_diff = now - g_last_time;
         if (time_diff > 0) {
-            info->rx_speed = (total_rx - g_last_rx) / time_diff;
-            info->tx_speed = (total_tx - g_last_tx) / time_diff;
+            /* Guard against counter wraparound or reset to avoid underflow */
+            uint64_t rx_diff = (total_rx >= g_last_rx) ? (total_rx - g_last_rx) : 0;
+            uint64_t tx_diff = (total_tx >= g_last_tx) ? (total_tx - g_last_tx) : 0;
+            info->rx_speed = rx_diff / time_diff;
+            info->tx_speed = tx_diff / time_diff;
         }
     }
     

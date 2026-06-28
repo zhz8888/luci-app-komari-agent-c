@@ -34,7 +34,6 @@
 #include "idn.h"
 
 #define TERMINAL_BUFFER_SIZE 4096
-#define TERMINAL_MOTD_SCRIPT "for f in /etc/update-motd.d/*; do [ -x \"$f\" ] && \"$f\"; done; [ -r /etc/motd ] && cat /etc/motd; exec \"$0\""
 
 /* Terminal read thread function */
 static void *terminal_read_thread(void *arg) {
@@ -71,15 +70,27 @@ static void *terminal_read_thread(void *arg) {
 
 /* Find an available shell */
 static const char *find_shell(void) {
-    /* Get the user's default shell from /etc/passwd */
+    /* Get the user's default shell from /etc/passwd.
+     * Use the reentrant getpwuid_r because getpwuid returns a pointer to a
+     * shared static buffer that can be clobbered by other threads. The shell
+     * path is copied into a stable static buffer so the caller can use it
+     * after the getpwuid_r scratch buffer goes out of scope. */
     uid_t uid = getuid();
-    struct passwd *pw = getpwuid(uid);
-    if (pw && pw->pw_shell && pw->pw_shell[0] != '\0') {
-        if (access(pw->pw_shell, X_OK) == 0) {
-            return pw->pw_shell;
+    struct passwd pwd;
+    struct passwd *result = NULL;
+    char buf[1024];
+    static char shell_path[256];
+
+    if (getpwuid_r(uid, &pwd, buf, sizeof(buf), &result) == 0 && result) {
+        if (pwd.pw_shell && pwd.pw_shell[0] != '\0') {
+            if (access(pwd.pw_shell, X_OK) == 0) {
+                strncpy(shell_path, pwd.pw_shell, sizeof(shell_path) - 1);
+                shell_path[sizeof(shell_path) - 1] = '\0';
+                return shell_path;
+            }
         }
     }
-    
+
     /* Fall back to a list of common shells */
     const char *shells[] = {"/bin/bash", "/bin/zsh", "/bin/sh", "/bin/ash", NULL};
     for (int i = 0; shells[i]; i++) {
@@ -87,7 +98,7 @@ static const char *find_shell(void) {
             return shells[i];
         }
     }
-    
+
     return NULL;
 }
 
@@ -150,7 +161,7 @@ int terminal_start(terminal_t *term, const char *shell) {
         }
 
         /* Execute the shell */
-        execl(sh, sh, NULL);
+        execl(sh, sh, (char *)NULL);
         _exit(127);
     }
 
@@ -176,13 +187,24 @@ int terminal_start(terminal_t *term, const char *shell) {
 
 int terminal_write(terminal_t *term, const char *data, size_t len) {
     if (!term || !data || len == 0) return -1;
-    
+
     if (term->master_fd < 0 || !term->running) {
         return -1;
     }
-    
-    ssize_t n = write(term->master_fd, data, len);
-    return (n > 0) ? (int)n : -1;
+
+    /* Loop until all bytes are written; write() may return a short count on
+     * a PTY, and EINTR must be retried. */
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = write(term->master_fd, data + written, len - written);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) break;
+        written += (size_t)n;
+    }
+    return (int)written;
 }
 
 int terminal_resize(terminal_t *term, int cols, int rows) {
@@ -211,51 +233,56 @@ void terminal_set_user_data(terminal_t *term, void *data) {
 
 int terminal_wait(terminal_t *term) {
     if (!term || term->pid <= 0) return -1;
-    
+
     int status;
-    waitpid(term->pid, &status, 0);
-    
+    pid_t ret = waitpid(term->pid, &status, 0);
+    if (ret > 0) {
+        term->pid = -1;  /* mark as reaped to prevent double-reap */
+    }
+
     if (WIFEXITED(status)) {
         return WEXITSTATUS(status);
     }
-    
+
     return -1;
 }
 
 void terminal_terminate(terminal_t *term) {
     if (!term) return;
-    
+
     if (term->running) {
         term->running = false;
-        
+
         if (term->pid > 0) {
-            int pgid = term->pgid > 0 ? term->pgid : term->pid;
-            
+            pid_t pid = term->pid;
+            int pgid = term->pgid > 0 ? term->pgid : pid;
+            term->pid = -1;  /* mark as reaped to prevent pid reuse issues */
+
             KOMARI_LOG_INFO("Sending SIGTERM to process group %d...", pgid);
             kill(-pgid, SIGTERM);
-            
+
             int retries = 50;
             while (retries > 0) {
                 int status;
-                pid_t result = waitpid(term->pid, &status, WNOHANG);
-                if (result == term->pid) {
+                pid_t result = waitpid(pid, &status, WNOHANG);
+                if (result == pid) {
                     KOMARI_LOG_INFO("Process group %d exited gracefully", pgid);
                     break;
                 }
                 usleep(100000);
                 retries--;
             }
-            
+
             if (retries == 0) {
                 KOMARI_LOG_WARN("Process group %d did not exit, sending SIGKILL", pgid);
                 kill(-pgid, SIGKILL);
-                waitpid(term->pid, NULL, 0);
+                waitpid(pid, NULL, 0);
             }
         }
-        
+
         pthread_join(term->read_thread, NULL);
     }
-    
+
     if (term->master_fd >= 0) {
         close(term->master_fd);
         term->master_fd = -1;

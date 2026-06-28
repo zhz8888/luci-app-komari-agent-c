@@ -22,7 +22,7 @@
 static int check_file_contains(const char *path, const char *keyword) {
     char buf[4096];
     int n = utils_read_file_string(path, buf, sizeof(buf));
-    if (n <= 0) return 0;
+    if (n != 0) return 0;
     return (strstr(buf, keyword) != NULL) ? 1 : 0;
 }
 
@@ -31,16 +31,22 @@ static int file_exists(const char *path) {
     return utils_file_exists(path);
 }
 
-static int run_command_contains(const char *cmd, const char *keyword) {
-    char output[4096];
-    int exit_code = 0;
-    if (utils_exec_command(cmd, output, sizeof(output), &exit_code) != 0) {
-        return 0;
+/* Cached output of "systemd-detect-virt --vm" so the command is executed only
+ * once instead of being re-run for every keyword probe. */
+static char g_virt_vm_output[256] = {0};
+static int g_virt_vm_cached = 0;
+
+static const char *virt_vm_output(void) {
+    if (!g_virt_vm_cached) {
+        int exit_code = 0;
+        utils_exec_command("systemd-detect-virt --vm 2>/dev/null",
+                           g_virt_vm_output, sizeof(g_virt_vm_output), &exit_code);
+        g_virt_vm_cached = 1;
     }
-    return (strstr(output, keyword) != NULL) ? 1 : 0;
+    return g_virt_vm_output;
 }
 
-const char *virt_detect(void) {
+static const char *virt_detect_once(void) {
     if (file_exists("/.dockerenv")) {
         KOMARI_LOG_DEBUG("Virtualization detected: docker (/.dockerenv exists)");
         return VIRT_TYPE_DOCKER;
@@ -67,32 +73,32 @@ const char *virt_detect(void) {
         return VIRT_TYPE_OPENVZ;
     }
 
-    if (run_command_contains("systemd-detect-virt --vm 2>/dev/null", "kvm")) {
+    if (strstr(virt_vm_output(), "kvm") != NULL) {
         KOMARI_LOG_DEBUG("Virtualization detected: kvm (systemd-detect-virt)");
         return VIRT_TYPE_KVM;
     }
 
-    if (run_command_contains("systemd-detect-virt --vm 2>/dev/null", "qemu")) {
+    if (strstr(virt_vm_output(), "qemu") != NULL) {
         KOMARI_LOG_DEBUG("Virtualization detected: qemu (systemd-detect-virt)");
         return VIRT_TYPE_QEMU;
     }
 
-    if (run_command_contains("systemd-detect-virt --vm 2>/dev/null", "vmware")) {
+    if (strstr(virt_vm_output(), "vmware") != NULL) {
         KOMARI_LOG_DEBUG("Virtualization detected: vmware (systemd-detect-virt)");
         return VIRT_TYPE_VMWARE;
     }
 
-    if (run_command_contains("systemd-detect-virt --vm 2>/dev/null", "oracle")) {
+    if (strstr(virt_vm_output(), "oracle") != NULL) {
         KOMARI_LOG_DEBUG("Virtualization detected: virtualbox (systemd-detect-virt)");
         return VIRT_TYPE_VIRTUALBOX;
     }
 
-    if (run_command_contains("systemd-detect-virt --vm 2>/dev/null", "microsoft")) {
+    if (strstr(virt_vm_output(), "microsoft") != NULL) {
         KOMARI_LOG_DEBUG("Virtualization detected: hyperv (systemd-detect-virt)");
         return VIRT_TYPE_HYPERV;
     }
 
-    if (run_command_contains("systemd-detect-virt --vm 2>/dev/null", "xen")) {
+    if (strstr(virt_vm_output(), "xen") != NULL) {
         KOMARI_LOG_DEBUG("Virtualization detected: xen (systemd-detect-virt)");
         return VIRT_TYPE_XEN;
     }
@@ -120,6 +126,16 @@ const char *virt_detect(void) {
 
     KOMARI_LOG_DEBUG("No virtualization detected");
     return VIRT_TYPE_NONE;
+}
+
+/* Cached detection result so repeated calls (including virt_is_container /
+ * virt_is_vm) do not re-run the full probe each time. */
+static const char *g_virt_type = NULL;
+
+const char *virt_detect(void) {
+    if (g_virt_type) return g_virt_type;
+    g_virt_type = virt_detect_once();
+    return g_virt_type;
 }
 
 bool virt_is_container(void) {

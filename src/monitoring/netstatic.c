@@ -11,9 +11,11 @@
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <inttypes.h>
 
 #include "netstatic.h"
 #include "utils.h"
+#include "cJSON.h"
 
 /* Collect per-interface traffic deltas from /proc/net/dev for tracked interfaces. */
 static void netstatic_collect(netstatic_t *ns) {
@@ -29,7 +31,10 @@ static void netstatic_collect(netstatic_t *ns) {
         uint64_t rx_bytes, tx_bytes;
         uint64_t dummy;
         
-        if (sscanf(line, "%31[^:]: %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu",
+        if (sscanf(line, "%31[^:]: %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
+                   " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
+                   " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
+                   " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64,
                    iface, &rx_bytes, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy,
                    &tx_bytes, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy) >= 10) {
             
@@ -106,7 +111,6 @@ static void *netstatic_worker(void *arg) {
     netstatic_t *ns = (netstatic_t *)arg;
     
     useconds_t detect_us = (useconds_t)(ns->detect_interval * 1000000);
-    useconds_t save_us = (useconds_t)(ns->save_interval * 1000000);
     uint64_t last_save = 0;
     
     while (ns->running) {
@@ -269,87 +273,173 @@ int netstatic_get_monthly_traffic(netstatic_t *ns, const char *iface,
 
 int netstatic_save(netstatic_t *ns) {
     if (!ns || !ns->save_path[0]) return -1;
-    
+
     FILE *fp = fopen(ns->save_path, "w");
     if (!fp) return -1;
-    
-    fprintf(fp, "{\n");
-    fprintf(fp, "  \"config\": {\n");
-    fprintf(fp, "    \"data_preserve_day\": %.1f,\n", ns->data_preserve_days);
-    fprintf(fp, "    \"detect_interval\": %.1f,\n", ns->detect_interval);
-    fprintf(fp, "    \"save_interval\": %.1f\n", ns->save_interval);
-    fprintf(fp, "  },\n");
-    fprintf(fp, "  \"interfaces\": {\n");
-    
+
+    int rc = 0;
+
+    if (fprintf(fp, "{\n") < 0 ||
+        fprintf(fp, "  \"config\": {\n") < 0 ||
+        fprintf(fp, "    \"data_preserve_day\": %.1f,\n", ns->data_preserve_days) < 0 ||
+        fprintf(fp, "    \"detect_interval\": %.1f,\n", ns->detect_interval) < 0 ||
+        fprintf(fp, "    \"save_interval\": %.1f\n", ns->save_interval) < 0 ||
+        fprintf(fp, "  },\n") < 0 ||
+        fprintf(fp, "  \"interfaces\": {\n") < 0) {
+        rc = -1;
+        goto done;
+    }
+
     for (size_t i = 0; i < ns->interface_count; i++) {
         interface_stats_t *is = &ns->interfaces[i];
-        
-        fprintf(fp, "    \"%s\": [\n", is->name);
-        
-        for (size_t j = 0; j < is->data_count; j++) {
-            fprintf(fp, "      {\"timestamp\": %lu, \"tx\": %lu, \"rx\": %lu}%s\n",
-                    (unsigned long)is->data[j].timestamp,
-                    (unsigned long)is->data[j].tx,
-                    (unsigned long)is->data[j].rx,
-                    (j < is->data_count - 1) ? "," : "");
+
+        /* Escape the interface name so quotes/backslashes/control chars in
+           the name cannot break the surrounding JSON structure. */
+        char *escaped_name = utils_json_escape(is->name);
+        if (!escaped_name) {
+            rc = -1;
+            goto done;
         }
-        
-        fprintf(fp, "    ]%s\n", (i < ns->interface_count - 1) ? "," : "");
+
+        if (fprintf(fp, "    \"%s\": [\n", escaped_name) < 0) {
+            free(escaped_name);
+            rc = -1;
+            goto done;
+        }
+        free(escaped_name);
+
+        for (size_t j = 0; j < is->data_count; j++) {
+            if (fprintf(fp, "      {\"timestamp\": %lu, \"tx\": %lu, \"rx\": %lu}%s\n",
+                        (unsigned long)is->data[j].timestamp,
+                        (unsigned long)is->data[j].tx,
+                        (unsigned long)is->data[j].rx,
+                        (j < is->data_count - 1) ? "," : "") < 0) {
+                rc = -1;
+                goto done;
+            }
+        }
+
+        if (fprintf(fp, "    ]%s\n", (i < ns->interface_count - 1) ? "," : "") < 0) {
+            rc = -1;
+            goto done;
+        }
     }
-    
-    fprintf(fp, "  }\n");
-    fprintf(fp, "}\n");
-    
+
+    if (fprintf(fp, "  }\n") < 0 ||
+        fprintf(fp, "}\n") < 0) {
+        rc = -1;
+    }
+
+done:
     fclose(fp);
-    return 0;
+    return rc;
 }
 
 int netstatic_load(netstatic_t *ns) {
     if (!ns || !ns->save_path[0]) return -1;
-    
+
     FILE *fp = fopen(ns->save_path, "r");
     if (!fp) return -1;
-    
+
     fseek(fp, 0, SEEK_END);
     long size = ftell(fp);
+    if (size < 0) {
+        fclose(fp);
+        return -1;
+    }
     fseek(fp, 0, SEEK_SET);
-    
-    char *json = malloc(size + 1);
+
+    char *json = malloc((size_t)size + 1);
     if (!json) {
         fclose(fp);
         return -1;
     }
 
-    size_t bytes_read = fread(json, 1, size, fp);
-    if (bytes_read != (size_t)size) {
-        fprintf(stderr, "Warning: Netstatic data file read incomplete: %zu/%ld bytes\n", bytes_read, size);
-    }
-    json[size] = '\0';
+    size_t bytes_read = fread(json, 1, (size_t)size, fp);
+    json[bytes_read] = '\0';
     fclose(fp);
-    
-    char *p = json;
-    while ((p = strstr(p, "\"config\"")) != NULL) {
-        p = strchr(p, '{');
-        if (!p) break;
-        
-        char *end = strchr(p, '}');
-        if (!end) break;
-        
-        char *dpd = strstr(p, "\"data_preserve_day\"");
-        if (dpd && dpd < end) {
-            char *colon = strchr(dpd, ':');
-            if (colon) ns->data_preserve_days = atof(colon + 1);
-        }
-        
-        char *di = strstr(p, "\"detect_interval\"");
-        if (di && di < end) {
-            char *colon = strchr(di, ':');
-            if (colon) ns->detect_interval = atof(colon + 1);
-        }
-        
-        break;
-    }
-    
+
+    cJSON *root = cJSON_Parse(json);
     free(json);
+    if (!root) {
+        return -1;
+    }
+
+    /* Parse config section: sampling intervals and preserve window */
+    cJSON *config = cJSON_GetObjectItem(root, "config");
+    if (config && cJSON_IsObject(config)) {
+        cJSON *item;
+        if ((item = cJSON_GetObjectItem(config, "data_preserve_day")) && cJSON_IsNumber(item)) {
+            ns->data_preserve_days = item->valuedouble;
+        }
+        if ((item = cJSON_GetObjectItem(config, "detect_interval")) && cJSON_IsNumber(item)) {
+            ns->detect_interval = item->valuedouble;
+        }
+        if ((item = cJSON_GetObjectItem(config, "save_interval")) && cJSON_IsNumber(item)) {
+            ns->save_interval = item->valuedouble;
+        }
+    }
+
+    /* Parse interfaces section: each key is an interface name mapped to an array of records */
+    cJSON *interfaces = cJSON_GetObjectItem(root, "interfaces");
+    if (interfaces && cJSON_IsObject(interfaces)) {
+        cJSON *iface_entry;
+        cJSON_ArrayForEach(iface_entry, interfaces) {
+            if (!iface_entry->string || !cJSON_IsArray(iface_entry)) continue;
+            if (ns->interface_count >= NETSTATIC_MAX_INTERFACES) break;
+
+            const char *iface_name = iface_entry->string;
+
+            /* Locate an existing tracked interface, or register a new one */
+            interface_stats_t *is = NULL;
+            for (size_t i = 0; i < ns->interface_count; i++) {
+                if (strcmp(ns->interfaces[i].name, iface_name) == 0) {
+                    is = &ns->interfaces[i];
+                    break;
+                }
+            }
+            if (!is) {
+                if (netstatic_add_interface(ns, iface_name) != 0) continue;
+                is = &ns->interfaces[ns->interface_count - 1];
+            }
+
+            int record_count = cJSON_GetArraySize(iface_entry);
+            if (record_count <= 0) continue;
+            size_t count = (size_t)record_count;
+
+            /* Grow the sample buffer if the persisted history exceeds current capacity */
+            if (count > is->data_capacity) {
+                traffic_data_t *new_data = realloc(is->data, count * sizeof(traffic_data_t));
+                if (!new_data) continue;
+                memset(new_data + is->data_capacity, 0,
+                       (count - is->data_capacity) * sizeof(traffic_data_t));
+                is->data = new_data;
+                is->data_capacity = count;
+            }
+
+            /* Restore traffic samples: timestamp, tx, rx */
+            size_t idx = 0;
+            cJSON *record;
+            cJSON_ArrayForEach(record, iface_entry) {
+                if (idx >= is->data_capacity) break;
+                cJSON *ts = cJSON_GetObjectItem(record, "timestamp");
+                cJSON *tx = cJSON_GetObjectItem(record, "tx");
+                cJSON *rx = cJSON_GetObjectItem(record, "rx");
+                if (ts && cJSON_IsNumber(ts)) {
+                    is->data[idx].timestamp = (uint64_t)ts->valuedouble;
+                }
+                if (tx && cJSON_IsNumber(tx)) {
+                    is->data[idx].tx = (uint64_t)tx->valuedouble;
+                }
+                if (rx && cJSON_IsNumber(rx)) {
+                    is->data[idx].rx = (uint64_t)rx->valuedouble;
+                }
+                idx++;
+            }
+            is->data_count = idx;
+        }
+    }
+
+    cJSON_Delete(root);
     return 0;
 }

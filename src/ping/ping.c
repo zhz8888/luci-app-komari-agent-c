@@ -63,7 +63,13 @@ static void set_socket_timeout(int fd, int timeout_ms) {
 }
 
 int ping_resolve_ip(const char *target, char *ip_out, size_t ip_size, const char *custom_dns) {
-    if (inet_pton(AF_INET, target, ip_out) == 1 || inet_pton(AF_INET6, target, ip_out) == 1) {
+    /* Validate target with temporary buffers to avoid writing binary address
+     * data (up to 16 bytes for IPv6) into the caller's string buffer, which
+     * may be smaller than sizeof(struct in6_addr). */
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    if (inet_pton(AF_INET, target, &addr4) == 1 ||
+        inet_pton(AF_INET6, target, &addr6) == 1) {
         strncpy(ip_out, target, ip_size - 1);
         ip_out[ip_size - 1] = '\0';
         return 0;
@@ -172,12 +178,37 @@ int ping_task_icmp(const char *target, int timeout_ms, const char *custom_dns) {
             return -1;
         }
 
+        /* Reject ICMP responses that originate from a different host than the
+           one we probed; otherwise stray packets from other hosts could be
+           mistaken for our echo reply. */
+        if (src_addr.sin_family != AF_INET ||
+            src_addr.sin_addr.s_addr != dest_addr.sin_addr.s_addr) {
+            continue;
+        }
+
+        /* Validate that the received datagram is large enough to hold an IP header. */
+        if (n < (int)sizeof(struct iphdr)) {
+            continue;
+        }
+
         struct iphdr *iph = (struct iphdr *)recv_buf;
+
+        /* Validate the IP header length field (ihl is in 32-bit words, minimum 5). */
+        int ip_hdr_len = iph->ihl * 4;
+        if (iph->ihl < 5 || ip_hdr_len > n) {
+            continue;
+        }
+
         if (iph->protocol != IPPROTO_ICMP) {
             continue;
         }
 
-        struct icmphdr *icmph = (struct icmphdr *)(recv_buf + iph->ihl * 4);
+        /* Ensure the ICMP header fits within the remaining payload. */
+        if (ip_hdr_len > n - (int)sizeof(struct icmphdr)) {
+            continue;
+        }
+
+        struct icmphdr *icmph = (struct icmphdr *)(recv_buf + ip_hdr_len);
         if (icmph->type == ICMP_ECHOREPLY && icmph->un.echo.id == packet.hdr.un.echo.id) {
             int64_t end_time = get_time_ms();
             close(fd);
@@ -190,11 +221,9 @@ int ping_task_icmp(const char *target, int timeout_ms, const char *custom_dns) {
 }
 
 int ping_task_tcp(const char *target, int timeout_ms, const char *custom_dns) {
-    char ip[INET6_ADDRSTRLEN];
-    if (ping_resolve_ip(target, ip, sizeof(ip), custom_dns) != 0) {
-        return -1;
-    }
-
+    /* Split host:port first so the host part can be resolved correctly.
+       Use strrchr to locate the last colon, which avoids mistaking the
+       colons inside a literal IPv6 address for the port separator. */
     char host[256];
     char port_str[8] = "80";
     const char *colon = strrchr(target, ':');
@@ -208,6 +237,13 @@ int ping_task_tcp(const char *target, int timeout_ms, const char *custom_dns) {
     } else {
         strncpy(host, target, sizeof(host) - 1);
         host[sizeof(host) - 1] = '\0';
+    }
+
+    /* Resolve only the host part; inet_pton/getaddrinfo cannot parse
+       strings that contain a port suffix. */
+    char ip[INET6_ADDRSTRLEN];
+    if (ping_resolve_ip(host, ip, sizeof(ip), custom_dns) != 0) {
+        return -1;
     }
 
     int port = atoi(port_str);
@@ -393,6 +429,14 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
 
         SSL_set_fd(ssl, fd);
 
+        /* Restore blocking mode for the TLS handshake. SSL_connect on a
+           non-blocking socket may return -1 with SSL_ERROR_WANT_READ or
+           SSL_ERROR_WANT_WRITE, which the previous code treated as failure.
+           Switching back to blocking mode (with the socket timeout already
+           set via SO_RCVTIMEO/SO_SNDTIMEO) lets OpenSSL complete the
+           handshake synchronously. */
+        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+
         if (SSL_connect(ssl) <= 0) {
             KOMARI_LOG_ERROR("HTTP TLS handshake failed");
             SSL_free(ssl);
@@ -520,19 +564,4 @@ int ping_task_execute(const char *target, const char *type, ping_task_config_t *
     result->finished_at = time(NULL);
 
     return (latency >= 0) ? 0 : -1;
-}
-
-int ping_upload_result(int fd, const char *token, ping_task_result_t *result, bool use_tls, bool ignore_cert) {
-    if (!token || !result) {
-        return -1;
-    }
-
-    char json_buf[512];
-    snprintf(json_buf, sizeof(json_buf),
-             "{\"type\":\"ping_result\",\"task_id\":%u,\"ping_type\":\"%s\",\"value\":%d,\"finished_at\":%ld}",
-             result->task_id, result->ping_type, result->result, (long)result->finished_at);
-
-    KOMARI_LOG_DEBUG("Uploading ping result: %s", json_buf);
-
-    return 0;
 }

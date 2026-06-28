@@ -10,6 +10,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <signal.h>
 
 #include "update.h"
 #include "utils.h"
@@ -25,8 +26,15 @@
 /* Background check interval: 6 hours = 21600 seconds */
 #define UPDATE_CHECK_INTERVAL_SECONDS 21600
 
-/* Command output buffer size */
-#define CMD_OUTPUT_BUF_SIZE 4096
+/* Command output buffer size.
+ * Kept large enough for "opkg list-upgradable" / "apk list --upgradable"
+ * output which may exceed the original 4 KiB on systems with many packages. */
+#define CMD_OUTPUT_BUF_SIZE 16384
+
+/* Running flag for the background update checker thread.
+ * Volatile sig_atomic_t so it can be safely read by the worker thread
+ * and written by update_stop() from another thread / signal context. */
+static volatile sig_atomic_t g_update_running = 1;
 
 /**
  * Check whether the specified directory exists
@@ -210,8 +218,12 @@ int update_compare_versions(const char *v1, const char *v2) {
     while (*v1 && *v2) {
         /* Extract numeric segments for comparison */
         if (isdigit((unsigned char)*v1) && isdigit((unsigned char)*v2)) {
-            long n1 = strtol(v1, (char**)&v1, 10);
-            long n2 = strtol(v2, (char**)&v2, 10);
+            char *endp1 = NULL;
+            char *endp2 = NULL;
+            long n1 = strtol(v1, &endp1, 10);
+            long n2 = strtol(v2, &endp2, 10);
+            v1 = endp1;
+            v2 = endp2;
             if (n1 < n2) return -1;
             if (n1 > n2) return 1;
         } else {
@@ -329,20 +341,32 @@ int update_check_available(const char *current_version) {
     return ret;
 }
 
+void update_stop(void) {
+    /* Signal the background worker to exit its loop.
+     * The worker wakes up at most once per second, so it stops promptly. */
+    g_update_running = 0;
+}
+
 void *update_do_check_works(void *arg) {
     (void)arg;  /* Unused */
 
     KOMARI_LOG_INFO("Update check: background check thread started, interval %d seconds", UPDATE_CHECK_INTERVAL_SECONDS);
 
-    while (1) {
+    while (g_update_running) {
         /* Run a check immediately */
         if (update_check_available(NULL) < 0) {
             KOMARI_LOG_DEBUG("Update check: this check failed, will retry in the next cycle");
         }
 
-        /* Sleep for 6 hours before checking again */
-        sleep(UPDATE_CHECK_INTERVAL_SECONDS);
+        /* Sleep for the configured interval before checking again.
+         * Break the long sleep into 1-second slices so that update_stop()
+         * is observed within ~1 second rather than waiting the full
+         * UPDATE_CHECK_INTERVAL_SECONDS (6 hours). */
+        for (int i = 0; i < UPDATE_CHECK_INTERVAL_SECONDS && g_update_running; i++) {
+            sleep(1);
+        }
     }
 
+    KOMARI_LOG_INFO("Update check: background check thread stopping");
     return NULL;
 }

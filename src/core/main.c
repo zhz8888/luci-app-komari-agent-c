@@ -38,7 +38,7 @@
 
 #define DEFAULT_INTERVAL 1.0
 
-static volatile int g_running = 1;
+static volatile sig_atomic_t g_running = 1;
 static agent_config_t g_config;
 static ws_client_t *g_ws_client = NULL;
 static netstatic_t *g_netstatic = NULL;
@@ -47,14 +47,16 @@ static netstatic_t *g_netstatic = NULL;
  * Signal handler for graceful shutdown (SIGINT, SIGTERM).
  *
  * Sets the global running flag to 0 so worker threads can exit their
- * loops and log a shutdown message.
+ * loops. Only async-signal-safe operations are performed here; no
+ * logging/printf/syslog calls which are non-reentrant and could
+ * deadlock if the signal interrupts the thread currently holding
+ * their internal locks.
  *
  * @param sig Received signal number
  */
 static void signal_handler(int sig) {
     (void)sig;
     g_running = 0;
-    KOMARI_LOG_INFO("Shutting down...");
 }
 
 /**
@@ -290,6 +292,76 @@ static int establish_terminal_connection(const char *token, const char *request_
 }
 
 /**
+ * Parse a command string into a NULL-terminated argv array without invoking a
+ * shell. Tokens are split on whitespace; runs enclosed in single or double
+ * quotes are kept together (the surrounding quotes are removed). No escape
+ * sequence processing is performed, so shell metacharacters (|, >, ;, ...) end
+ * up as literal argument characters instead of being interpreted.
+ *
+ * On success returns a malloc'd argv array and stores a malloc'd buffer
+ * (holding the tokenized string) in *buf_out. The caller MUST free(argv) and
+ * free(*buf_out). Returns NULL on allocation failure or when no tokens are
+ * present.
+ */
+static char **parse_exec_command_argv(const char *cmd, char **buf_out) {
+    if (!cmd || !buf_out) return NULL;
+
+    size_t len = strlen(cmd);
+    char *buf = malloc(len + 1);
+    if (!buf) return NULL;
+    memcpy(buf, cmd, len + 1);
+
+    /* Upper bound on tokens: every token needs at least one separator */
+    size_t max_argv = len / 2 + 2;
+    char **argv = calloc(max_argv, sizeof(char *));
+    if (!argv) {
+        free(buf);
+        return NULL;
+    }
+
+    int argc = 0;
+    char *p = buf;
+    while (*p) {
+        /* Skip leading whitespace */
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p == '\0') break;
+
+        char *token_start = p;
+        char *write = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+            if (*p == '"') {
+                p++;
+                while (*p && *p != '"') {
+                    *write++ = *p++;
+                }
+                if (*p == '"') p++;
+            } else if (*p == '\'') {
+                p++;
+                while (*p && *p != '\'') {
+                    *write++ = *p++;
+                }
+                if (*p == '\'') p++;
+            } else {
+                *write++ = *p++;
+            }
+        }
+        *write = '\0';
+        argv[argc++] = token_start;
+        if (*p) p++;
+    }
+    argv[argc] = NULL;
+
+    if (argc == 0) {
+        free(argv);
+        free(buf);
+        return NULL;
+    }
+
+    *buf_out = buf;
+    return argv;
+}
+
+/**
  * Handle incoming WebSocket messages from the panel.
  *
  * Dispatches terminal requests (Web SSH), exec task commands and ping
@@ -310,13 +382,24 @@ static void handle_ws_message(ws_client_t *client, const ws_message_t *msg) {
         }
     } else if (strcmp(msg->message, "exec") == 0) {
         KOMARI_LOG_INFO("[Task] Executing command: %s (Task ID: %s)", msg->exec_command, msg->exec_task_id);
-        
+
         char output[8192] = "";
         int exit_code = 0;
-        
-        if (utils_exec_command(msg->exec_command, output, sizeof(output), &exit_code) == 0) {
-            report_upload_task_result(&g_config, msg->exec_task_id, output, exit_code,
-                                       utils_get_current_timestamp());
+
+        /* Parse the command into an argv array and execute it directly via
+         * execvp() to avoid shell injection (msg->exec_command originates from
+         * the WebSocket panel and is untrusted input). */
+        char *argv_buf = NULL;
+        char **argv = parse_exec_command_argv(msg->exec_command, &argv_buf);
+        if (argv) {
+            if (utils_exec_command_argv(argv, output, sizeof(output), &exit_code) == 0) {
+                report_upload_task_result(&g_config, msg->exec_task_id, output, exit_code,
+                                           utils_get_current_timestamp());
+            }
+            free(argv);
+            free(argv_buf);
+        } else {
+            KOMARI_LOG_WARN("[Task] Failed to parse exec command (Task ID: %s)", msg->exec_task_id);
         }
     } else if (strcmp(msg->message, "ping") == 0 || msg->ping_type[0] != '\0') {
         KOMARI_LOG_INFO("[Ping] Received ping request: %s (%s) Task ID: %u",
@@ -367,12 +450,12 @@ static void *report_thread(void *arg) {
         pthread_mutex_unlock(&g_ws_client->state_mutex);
         
         if (!connected) {
-            printf("[WebSocket] Connecting to %s...\n", g_config.endpoint);
+            KOMARI_LOG_INFO("[WebSocket] Connecting to %s...", g_config.endpoint);
             
             int retries = 0;
             while (retries < g_config.max_retries && g_running) {
                 if (ws_client_connect(g_ws_client) == 0) {
-                    printf("[WebSocket] Connected successfully\n");
+                    KOMARI_LOG_INFO("[WebSocket] Connected successfully");
                     
                     int len = report_generate_basic_info(&g_config, report_buf, sizeof(report_buf));
                     if (len > 0) {
@@ -382,12 +465,12 @@ static void *report_thread(void *arg) {
                 }
                 
                 retries++;
-                printf("[WebSocket] Connection failed, retry %d/%d\n", retries, g_config.max_retries);
+                KOMARI_LOG_WARN("[WebSocket] Connection failed, retry %d/%d", retries, g_config.max_retries);
                 sleep(g_config.reconnect_interval);
             }
             
             if (retries >= g_config.max_retries) {
-                printf("[WebSocket] Max retries reached\n");
+                KOMARI_LOG_ERROR("[WebSocket] Max retries reached");
                 break;
             }
         }
@@ -400,7 +483,7 @@ static void *report_thread(void *arg) {
         
         if (len > 0 && is_connected) {
             if (ws_client_send_text(g_ws_client, report_buf, len) != 0) {
-                printf("[WebSocket] Failed to send data\n");
+                KOMARI_LOG_ERROR("[WebSocket] Failed to send data");
                 ws_client_disconnect(g_ws_client);
             }
         }
@@ -434,16 +517,23 @@ static void *report_thread(void *arg) {
  */
 static void *heartbeat_thread(void *arg) {
     (void)arg;
-    
+
     while (g_running && g_ws_client) {
-        if (g_ws_client->connected) {
+        /* Protect read of connected flag with state_mutex to avoid torn
+         * reads on architectures without atomic word loads and to
+         * synchronize with writers in websocket.c. */
+        pthread_mutex_lock(&g_ws_client->state_mutex);
+        bool connected = g_ws_client->connected;
+        pthread_mutex_unlock(&g_ws_client->state_mutex);
+
+        if (connected) {
             if (ws_client_send_ping(g_ws_client) != 0) {
                 printf("[WebSocket] Heartbeat failed\n");
             }
         }
         sleep(30);
     }
-    
+
     return NULL;
 }
 
@@ -482,33 +572,57 @@ int main(int argc, char *argv[]) {
         {0, 0, 0, 0}
     };
     
+    /* Command-line values are saved to separate buffers and applied after all
+     * other configuration sources are loaded. This guarantees command-line
+     * arguments always win over UCI/JSON/env, matching the priority order:
+     * command-line > env > UCI > JSON > defaults. Without this, later loaders
+     * (e.g. UCI emitting an empty token) would silently overwrite values
+     * explicitly passed on the command line. */
+    char cli_token[MAX_TOKEN_LEN] = {0};
+    char cli_endpoint[MAX_ENDPOINT_LEN] = {0};
+    char cli_custom_dns[MAX_DNS_LEN] = {0};
+    char cli_config_file[MAX_CONFIG_FILE_LEN] = {0};
+    double cli_interval = 0.0;
+    bool cli_set_token = false;
+    bool cli_set_endpoint = false;
+    bool cli_set_interval = false;
+    bool cli_set_custom_dns = false;
+    bool cli_set_config_file = false;
+    bool cli_set_insecure = false;
+    bool cli_set_disable_ssh = false;
+
     int opt;
     while ((opt = getopt_long(argc, argv, "t:e:i:d:c:ksvh", long_options, NULL)) != -1) {
         switch (opt) {
             case 't':
-                strncpy(g_config.token, optarg, sizeof(g_config.token) - 1);
-                g_config.token[sizeof(g_config.token) - 1] = '\0';
+                strncpy(cli_token, optarg, sizeof(cli_token) - 1);
+                cli_token[sizeof(cli_token) - 1] = '\0';
+                cli_set_token = true;
                 break;
             case 'e':
-                strncpy(g_config.endpoint, optarg, sizeof(g_config.endpoint) - 1);
-                g_config.endpoint[sizeof(g_config.endpoint) - 1] = '\0';
+                strncpy(cli_endpoint, optarg, sizeof(cli_endpoint) - 1);
+                cli_endpoint[sizeof(cli_endpoint) - 1] = '\0';
+                cli_set_endpoint = true;
                 break;
             case 'i':
-                g_config.interval = atof(optarg);
+                cli_interval = atof(optarg);
+                cli_set_interval = true;
                 break;
             case 'd':
-                strncpy(g_config.custom_dns, optarg, sizeof(g_config.custom_dns) - 1);
-                g_config.custom_dns[sizeof(g_config.custom_dns) - 1] = '\0';
+                strncpy(cli_custom_dns, optarg, sizeof(cli_custom_dns) - 1);
+                cli_custom_dns[sizeof(cli_custom_dns) - 1] = '\0';
+                cli_set_custom_dns = true;
                 break;
             case 'c':
-                strncpy(g_config.config_file, optarg, sizeof(g_config.config_file) - 1);
-                g_config.config_file[sizeof(g_config.config_file) - 1] = '\0';
+                strncpy(cli_config_file, optarg, sizeof(cli_config_file) - 1);
+                cli_config_file[sizeof(cli_config_file) - 1] = '\0';
+                cli_set_config_file = true;
                 break;
             case 'k':
-                g_config.ignore_unsafe_cert = true;
+                cli_set_insecure = true;
                 break;
             case 's':
-                g_config.disable_web_ssh = true;
+                cli_set_disable_ssh = true;
                 break;
             case 'v':
                 break;
@@ -520,14 +634,61 @@ int main(int argc, char *argv[]) {
                 return 1;
         }
     }
-    
-    config_load_from_env(&g_config);
-    
+
+    /* Resolve the JSON config file path: command-line -c takes priority over
+     * the AGENT_CONFIG_FILE environment variable. Both must be resolved before
+     * loading JSON so the correct file is read. */
+    if (cli_set_config_file) {
+        strncpy(g_config.config_file, cli_config_file, sizeof(g_config.config_file) - 1);
+        g_config.config_file[sizeof(g_config.config_file) - 1] = '\0';
+    } else {
+        char *env_cfg = getenv("AGENT_CONFIG_FILE");
+        if (env_cfg && env_cfg[0] != '\0') {
+            strncpy(g_config.config_file, env_cfg, sizeof(g_config.config_file) - 1);
+            g_config.config_file[sizeof(g_config.config_file) - 1] = '\0';
+        }
+    }
+
+    /* Load configuration sources in priority order from lowest to highest:
+     * JSON file -> UCI -> env. Defaults are already set by config_init.
+     * Command-line values are applied last to guarantee they win. */
     if (g_config.config_file[0] != '\0') {
         config_load_from_file(&g_config, g_config.config_file);
     }
-    
+
     config_load_from_uci(&g_config);
+
+    config_load_from_env(&g_config);
+
+    /* Apply command-line arguments last so they take precedence over every
+     * other source. Also restore the config_file field, which
+     * config_load_from_env may have overwritten with AGENT_CONFIG_FILE even
+     * though JSON was already loaded from the command-line path. */
+    if (cli_set_token) {
+        strncpy(g_config.token, cli_token, sizeof(g_config.token) - 1);
+        g_config.token[sizeof(g_config.token) - 1] = '\0';
+    }
+    if (cli_set_endpoint) {
+        strncpy(g_config.endpoint, cli_endpoint, sizeof(g_config.endpoint) - 1);
+        g_config.endpoint[sizeof(g_config.endpoint) - 1] = '\0';
+    }
+    if (cli_set_interval) {
+        g_config.interval = cli_interval;
+    }
+    if (cli_set_custom_dns) {
+        strncpy(g_config.custom_dns, cli_custom_dns, sizeof(g_config.custom_dns) - 1);
+        g_config.custom_dns[sizeof(g_config.custom_dns) - 1] = '\0';
+    }
+    if (cli_set_insecure) {
+        g_config.ignore_unsafe_cert = true;
+    }
+    if (cli_set_disable_ssh) {
+        g_config.disable_web_ssh = true;
+    }
+    if (cli_set_config_file) {
+        strncpy(g_config.config_file, cli_config_file, sizeof(g_config.config_file) - 1);
+        g_config.config_file[sizeof(g_config.config_file) - 1] = '\0';
+    }
 
     /* Auto-discovery: if auto_discovery_key is configured and token is empty, attempt auto-registration */
     if (g_config.auto_discovery_key[0] != '\0') {
@@ -619,15 +780,48 @@ int main(int argc, char *argv[]) {
 
     pthread_t report_tid, heartbeat_tid;
 
-    pthread_create(&report_tid, NULL, report_thread, NULL);
-    pthread_create(&heartbeat_tid, NULL, heartbeat_thread, NULL);
+    if (pthread_create(&report_tid, NULL, report_thread, NULL) != 0) {
+        KOMARI_LOG_ERROR("Failed to create report thread");
+        if (g_netstatic) {
+            netstatic_stop(g_netstatic);
+            netstatic_destroy(g_netstatic);
+        }
+        ws_client_stop(g_ws_client);
+        ws_client_disconnect(g_ws_client);
+        ws_client_destroy(g_ws_client);
+        logger_cleanup();
+        return 1;
+    }
+
+    if (pthread_create(&heartbeat_tid, NULL, heartbeat_thread, NULL) != 0) {
+        KOMARI_LOG_ERROR("Failed to create heartbeat thread");
+        /* Signal report thread to exit and join it before cleanup so it
+         * does not keep accessing the ws client we are about to destroy. */
+        g_running = 0;
+        pthread_join(report_tid, NULL);
+        if (g_netstatic) {
+            netstatic_stop(g_netstatic);
+            netstatic_destroy(g_netstatic);
+        }
+        ws_client_stop(g_ws_client);
+        ws_client_disconnect(g_ws_client);
+        ws_client_destroy(g_ws_client);
+        logger_cleanup();
+        return 1;
+    }
     
     while (g_running) {
         sleep(1);
     }
-    
+
     printf("Stopping service...\n");
-    
+
+    /* Signal the detached update checker thread to exit its loop promptly
+     * (within ~1 second). It cannot be joined because it was created with
+     * pthread_detach, so we just flip its running flag and let it wind down
+     * on its own while we tear down the rest of the resources below. */
+    update_stop();
+
     if (g_netstatic) {
         netstatic_stop(g_netstatic);
         netstatic_destroy(g_netstatic);
@@ -645,5 +839,12 @@ int main(int argc, char *argv[]) {
     logger_cleanup();
 
     printf("Service stopped\n");
+
+    /* OpenSSL 1.0.2 requires manual cleanup; 1.1.0+ auto-cleans */
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_cleanup();
+    ERR_remove_state(0);
+#endif
+
     return 0;
 }

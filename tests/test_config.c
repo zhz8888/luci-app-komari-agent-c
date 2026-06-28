@@ -16,6 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* UCI line parser helper (extracted from config.c for testability).
+ * Not declared in config.h to keep the public API unchanged. */
+extern int config_parse_uci_line(agent_config_t *config, const char *raw_line);
+
 /* 临时配置文件路径 */
 #define TEST_CONFIG_FILE_PATH "/tmp/test_komari_config.json"
 #define TEST_CONFIG_PRIORITY_PATH "/tmp/test_komari_config_priority.json"
@@ -409,6 +413,86 @@ void test_config_print_null(void) {
     TEST_PASS();
 }
 
+/* ====== UCI 行解析测试 ======
+ *
+ * config_load_from_uci 依赖 popen("uci show ...")，无法在非 OpenWrt 环境
+ * 直接测试。解析逻辑已提取为 config_parse_uci_line 辅助函数，以下用例
+ * 直接验证该函数，覆盖核心 bug 场景（包名与节名均含点）。
+ */
+
+/* 测试 UCI 行解析：核心 bug 场景
+ * 输入 komari-agent-c.komari-agent-c.token='xxx'
+ * 旧逻辑 strchr 找第一个点，key 错为 "komari-agent-c.token"，分支不匹配
+ * 新逻辑 strrchr 找 '=' 前最后一个点，key 正确为 "token" */
+void test_config_parse_uci_line_token(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    int ret = config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.token='uci_token_xyz'");
+    TEST_ASSERT_EQUAL_INT(0, ret);
+    TEST_ASSERT_EQUAL_STRING("uci_token_xyz", config.token);
+}
+
+/* 测试 UCI 行解析：逐行解析多个字段 */
+void test_config_parse_uci_line_multiple_fields(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.endpoint='wss://uci.example.com/ws'"));
+    TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.interval=2.5"));
+    TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.disable_web_ssh='1'"));
+    TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.enable_gpu='true'"));
+    TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.language='zh-CN'"));
+    TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.max_retries=10"));
+    TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.custom_dns='1.1.1.1'"));
+
+    TEST_ASSERT_EQUAL_STRING("wss://uci.example.com/ws", config.endpoint);
+    TEST_ASSERT_EQUAL_DOUBLE(2.5, config.interval);
+    TEST_ASSERT_TRUE(config.disable_web_ssh);
+    TEST_ASSERT_TRUE(config.enable_gpu);
+    TEST_ASSERT_EQUAL_STRING("zh-CN", config.language);
+    TEST_ASSERT_EQUAL_INT(10, config.max_retries);
+    TEST_ASSERT_EQUAL_STRING("1.1.1.1", config.custom_dns);
+}
+
+/* 测试 UCI 行解析：不带引号的值 */
+void test_config_parse_uci_line_unquoted_value(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.token=plain_token"));
+    TEST_ASSERT_EQUAL_STRING("plain_token", config.token);
+}
+
+/* 测试 UCI 行解析：未知 key 不覆盖已有值 */
+void test_config_parse_uci_line_unknown_key_preserves_value(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.token='keep_me'"));
+    TEST_ASSERT_EQUAL_STRING("keep_me", config.token);
+
+    /* 未知选项应被忽略，不应破坏已有 token */
+    TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.unknown_option='ignore'"));
+    TEST_ASSERT_EQUAL_STRING("keep_me", config.token);
+}
+
+/* 测试 UCI 行解析：畸形行与 NULL 参数返回 -1 */
+void test_config_parse_uci_line_malformed(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    /* 缺少 '=' */
+    TEST_ASSERT_EQUAL_INT(-1, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.token"));
+    /* 缺少 '.'（无法提取选项名） */
+    TEST_ASSERT_EQUAL_INT(-1, config_parse_uci_line(&config, "token=value"));
+    /* 空行 */
+    TEST_ASSERT_EQUAL_INT(-1, config_parse_uci_line(&config, ""));
+    /* NULL 参数 */
+    TEST_ASSERT_EQUAL_INT(-1, config_parse_uci_line(NULL, "komari-agent-c.komari-agent-c.token='x'"));
+    TEST_ASSERT_EQUAL_INT(-1, config_parse_uci_line(&config, NULL));
+}
+
 int main(void) {
     UNITY_BEGIN();
 
@@ -428,6 +512,13 @@ int main(void) {
     RUN_TEST(test_config_priority_file_over_defaults);
     RUN_TEST(test_config_print_basic);
     RUN_TEST(test_config_print_null);
+
+    /* UCI 行解析测试 */
+    RUN_TEST(test_config_parse_uci_line_token);
+    RUN_TEST(test_config_parse_uci_line_multiple_fields);
+    RUN_TEST(test_config_parse_uci_line_unquoted_value);
+    RUN_TEST(test_config_parse_uci_line_unknown_key_preserves_value);
+    RUN_TEST(test_config_parse_uci_line_malformed);
 
     return UNITY_END();
 }

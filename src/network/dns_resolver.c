@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
@@ -48,8 +49,9 @@ int dns_resolver_is_custom(void) {
 }
 
 /* Internal helper: query a specific DNS server for `hostname` over UDP and
- * return the first A/AAAA record as a string in ip_out. */
-static int dns_query_server(const char *hostname, const char *dns_server, char *ip_out, size_t ip_size) {
+ * return the first A or AAAA record as a string in ip_out. The record type
+ * is selected based on prefer_ipv4: T_A when non-zero, T_AAAA otherwise. */
+static int dns_query_server(const char *hostname, const char *dns_server, char *ip_out, size_t ip_size, int prefer_ipv4) {
     struct sockaddr_storage dns_addr;
     socklen_t addr_len = 0;
     
@@ -73,8 +75,10 @@ static int dns_query_server(const char *hostname, const char *dns_server, char *
         addr_len = sizeof(struct sockaddr_in);
     }
     
+    /* Select DNS query type based on IP preference: AAAA for IPv6, A for IPv4. */
+    int query_type = prefer_ipv4 ? T_A : T_AAAA;
     unsigned char query_buf[512];
-    int query_len = res_mkquery(QUERY, hostname, C_IN, T_A, NULL, 0, NULL, query_buf, sizeof(query_buf));
+    int query_len = res_mkquery(QUERY, hostname, C_IN, query_type, NULL, 0, NULL, query_buf, sizeof(query_buf));
     if (query_len <= 0) {
         return -1;
     }
@@ -95,11 +99,40 @@ static int dns_query_server(const char *hostname, const char *dns_server, char *
         return -1;
     }
     
+    struct sockaddr_storage src_addr;
+    socklen_t src_len = sizeof(src_addr);
+    memset(&src_addr, 0, sizeof(src_addr));
+
     unsigned char response_buf[1024];
-    int response_len = recv(sock, response_buf, sizeof(response_buf), 0);
+    ssize_t n = recvfrom(sock, response_buf, sizeof(response_buf), 0,
+                         (struct sockaddr *)&src_addr, &src_len);
     close(sock);
-    
-    if (response_len <= 0) {
+
+    if (n <= 0) {
+        return -1;
+    }
+    int response_len = (int)n;
+
+    /* validate response came from the queried DNS server */
+    if (src_len != addr_len ||
+        memcmp(&src_addr, &dns_addr, src_len) != 0) {
+        return -1;
+    }
+
+    /* minimum DNS header size is 12 bytes */
+    if (response_len < 12) {
+        return -1;
+    }
+
+    /* validate transaction ID matches the query */
+    uint16_t query_txn_id = ((uint16_t)query_buf[0] << 8) | query_buf[1];
+    uint16_t recv_txn_id = ((uint16_t)response_buf[0] << 8) | response_buf[1];
+    if (recv_txn_id != query_txn_id) {
+        return -1;
+    }
+
+    /* validate QR bit is set (response, not query) */
+    if (!(response_buf[2] & 0x80)) {
         return -1;
     }
     
@@ -114,11 +147,17 @@ static int dns_query_server(const char *hostname, const char *dns_server, char *
         if (ns_parserr(&handle, ns_s_an, i, &rr) == 0) {
             if (ns_rr_type(rr) == T_A) {
                 struct in_addr addr;
+                if (ns_rr_rdlen(rr) < sizeof(addr)) {
+                    continue;  /* skip malformed record */
+                }
                 memcpy(&addr, ns_rr_rdata(rr), sizeof(addr));
                 inet_ntop(AF_INET, &addr, ip_out, ip_size);
                 return 0;
             } else if (ns_rr_type(rr) == T_AAAA) {
                 struct in6_addr addr;
+                if (ns_rr_rdlen(rr) < sizeof(addr)) {
+                    continue;  /* skip malformed record */
+                }
                 memcpy(&addr, ns_rr_rdata(rr), sizeof(addr));
                 inet_ntop(AF_INET6, &addr, ip_out, ip_size);
                 return 0;
@@ -133,15 +172,21 @@ int dns_resolver_lookup(const char *hostname, char *ip_out, size_t ip_size, int 
     if (!hostname || !ip_out || ip_size == 0) {
         return -1;
     }
-    
-    if (inet_pton(AF_INET, hostname, ip_out) == 1 || inet_pton(AF_INET6, hostname, ip_out) == 1) {
+
+    /* Validate hostname with temporary buffers to avoid writing binary address
+     * data (up to 16 bytes for IPv6) into the caller's string buffer, which
+     * may be smaller than sizeof(struct in6_addr). */
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    if (inet_pton(AF_INET, hostname, &addr4) == 1 ||
+        inet_pton(AF_INET6, hostname, &addr6) == 1) {
         strncpy(ip_out, hostname, ip_size - 1);
         ip_out[ip_size - 1] = '\0';
         return 0;
     }
     
     if (g_use_custom_dns) {
-        if (dns_query_server(hostname, g_custom_dns, ip_out, ip_size) == 0) {
+        if (dns_query_server(hostname, g_custom_dns, ip_out, ip_size, prefer_ipv4) == 0) {
             return 0;
         }
         KOMARI_LOG_WARN("Custom DNS %s unreachable, falling back to system resolver", g_custom_dns);

@@ -59,10 +59,20 @@ static int get_env_bool(const char *name, bool default_val) {
     
     if (strcasecmp(val, "true") == 0 ||
         strcasecmp(val, "1") == 0 ||
-        strcasecmp(val, "yes") == 0) {
+        strcasecmp(val, "yes") == 0 ||
+        strcasecmp(val, "on") == 0) {
         return true;
     }
-    return false;
+
+    if (strcasecmp(val, "false") == 0 ||
+        strcasecmp(val, "0") == 0 ||
+        strcasecmp(val, "no") == 0 ||
+        strcasecmp(val, "off") == 0) {
+        return false;
+    }
+
+    /* Unknown value falls back to default to preserve caller's intent */
+    return default_val;
 }
 
 static double get_env_double(const char *name, double default_val) {
@@ -124,8 +134,12 @@ int config_load_from_file(agent_config_t *config, const char *path) {
     
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return -1;
+    }
     fseek(f, 0, SEEK_SET);
-    
+
     char *json = malloc(size + 1);
     if (!json) {
         fclose(f);
@@ -233,35 +247,67 @@ int config_load_from_file(agent_config_t *config, const char *path) {
     }
     
     if ((item = cJSON_GetObjectItem(root, "disable_auto_update"))) {
-        config->disable_auto_update = (item->type == cJSON_True);
+        if (cJSON_IsBool(item)) {
+            config->disable_auto_update = cJSON_IsTrue(item);
+        } else if (cJSON_IsString(item)) {
+            config->disable_auto_update = (strcasecmp(item->valuestring, "true") == 0);
+        }
     }
     
     if ((item = cJSON_GetObjectItem(root, "disable_web_ssh"))) {
-        config->disable_web_ssh = (item->type == cJSON_True);
+        if (cJSON_IsBool(item)) {
+            config->disable_web_ssh = cJSON_IsTrue(item);
+        } else if (cJSON_IsString(item)) {
+            config->disable_web_ssh = (strcasecmp(item->valuestring, "true") == 0);
+        }
     }
     
     if ((item = cJSON_GetObjectItem(root, "ignore_unsafe_cert"))) {
-        config->ignore_unsafe_cert = (item->type == cJSON_True);
+        if (cJSON_IsBool(item)) {
+            config->ignore_unsafe_cert = cJSON_IsTrue(item);
+        } else if (cJSON_IsString(item)) {
+            config->ignore_unsafe_cert = (strcasecmp(item->valuestring, "true") == 0);
+        }
     }
     
     if ((item = cJSON_GetObjectItem(root, "memory_include_cache"))) {
-        config->memory_include_cache = (item->type == cJSON_True);
+        if (cJSON_IsBool(item)) {
+            config->memory_include_cache = cJSON_IsTrue(item);
+        } else if (cJSON_IsString(item)) {
+            config->memory_include_cache = (strcasecmp(item->valuestring, "true") == 0);
+        }
     }
     
     if ((item = cJSON_GetObjectItem(root, "memory_report_raw_used"))) {
-        config->memory_report_raw_used = (item->type == cJSON_True);
+        if (cJSON_IsBool(item)) {
+            config->memory_report_raw_used = cJSON_IsTrue(item);
+        } else if (cJSON_IsString(item)) {
+            config->memory_report_raw_used = (strcasecmp(item->valuestring, "true") == 0);
+        }
     }
     
     if ((item = cJSON_GetObjectItem(root, "enable_gpu"))) {
-        config->enable_gpu = (item->type == cJSON_True);
+        if (cJSON_IsBool(item)) {
+            config->enable_gpu = cJSON_IsTrue(item);
+        } else if (cJSON_IsString(item)) {
+            config->enable_gpu = (strcasecmp(item->valuestring, "true") == 0);
+        }
     }
     
     if ((item = cJSON_GetObjectItem(root, "get_ip_addr_from_nic"))) {
-        config->get_ip_addr_from_nic = (item->type == cJSON_True);
+        if (cJSON_IsBool(item)) {
+            config->get_ip_addr_from_nic = cJSON_IsTrue(item);
+        } else if (cJSON_IsString(item)) {
+            config->get_ip_addr_from_nic = (strcasecmp(item->valuestring, "true") == 0);
+        }
     }
 
     if ((item = cJSON_GetObjectItem(root, "disable_compression"))) {
-        config->disable_compression = (item->type == cJSON_True);
+        if (cJSON_IsBool(item)) {
+            config->disable_compression = cJSON_IsTrue(item);
+        } else if (cJSON_IsString(item)) {
+            config->disable_compression = (strcasecmp(item->valuestring, "true") == 0);
+        }
     }
     
     cJSON_Delete(root);
@@ -269,73 +315,106 @@ int config_load_from_file(agent_config_t *config, const char *path) {
     return 0;
 }
 
+/* Parse a single UCI output line and apply it to the config.
+ *
+ * UCI emits lines in the form: package.section.option='value'
+ * (the value may also be unquoted). The option name is the substring
+ * after the last '.' that precedes '='.
+ *
+ * Extracted as a standalone, non-static helper so it can be unit-tested
+ * without invoking `popen("uci show ...")`.
+ *
+ * Returns 0 on success, -1 on a malformed line or invalid argument.
+ */
+int config_parse_uci_line(agent_config_t *config, const char *raw_line) {
+    if (!config || !raw_line) return -1;
+
+    char line[512];
+    strncpy(line, raw_line, sizeof(line) - 1);
+    line[sizeof(line) - 1] = '\0';
+
+    /* Locate '=' first, then find the last '.' before it. Finding the last
+     * dot (rather than the first) correctly handles option names whose
+     * package or section name also contains dots, e.g. the line
+     *   komari-agent-c.komari-agent-c.token='xxx'
+     * yields key "token" instead of the buggy "komari-agent-c.token". */
+    char *eq = strchr(line, '=');
+    if (!eq) return -1;
+
+    *eq = '\0';
+    char *dot = strrchr(line, '.');
+    if (!dot) return -1;
+
+    char key[64];
+    strncpy(key, dot + 1, sizeof(key) - 1);
+    key[sizeof(key) - 1] = '\0';
+
+    /* Value: skip leading spaces/quotes, then trim trailing newline,
+     * quote and space characters. */
+    char *val = eq + 1;
+    while (*val == ' ' || *val == '\'') val++;
+
+    char value[256];
+    strncpy(value, val, sizeof(value) - 1);
+    value[sizeof(value) - 1] = '\0';
+
+    size_t vlen = strlen(value);
+    while (vlen > 0 && (value[vlen - 1] == '\n' ||
+                        value[vlen - 1] == '\'' ||
+                        value[vlen - 1] == ' ')) {
+        value[--vlen] = '\0';
+    }
+
+    if (strcmp(key, "token") == 0) {
+        strncpy(config->token, value, sizeof(config->token) - 1);
+    } else if (strcmp(key, "endpoint") == 0) {
+        strncpy(config->endpoint, value, sizeof(config->endpoint) - 1);
+    } else if (strcmp(key, "interval") == 0) {
+        config->interval = atof(value);
+    } else if (strcmp(key, "disable_web_ssh") == 0) {
+        config->disable_web_ssh = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
+    } else if (strcmp(key, "ignore_unsafe_cert") == 0) {
+        config->ignore_unsafe_cert = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
+    } else if (strcmp(key, "custom_dns") == 0) {
+        strncpy(config->custom_dns, value, sizeof(config->custom_dns) - 1);
+    } else if (strcmp(key, "language") == 0) {
+        strncpy(config->language, value, sizeof(config->language) - 1);
+    } else if (strcmp(key, "max_retries") == 0) {
+        config->max_retries = atoi(value);
+    } else if (strcmp(key, "reconnect_interval") == 0) {
+        config->reconnect_interval = atoi(value);
+    } else if (strcmp(key, "info_report_interval") == 0) {
+        config->info_report_interval = atoi(value);
+    } else if (strcmp(key, "month_rotate") == 0) {
+        config->month_rotate = atoi(value);
+    } else if (strcmp(key, "protocol_version") == 0) {
+        config->protocol_version = atoi(value);
+    } else if (strcmp(key, "enable_gpu") == 0) {
+        config->enable_gpu = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
+    } else if (strcmp(key, "disable_compression") == 0) {
+        config->disable_compression = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
+    } else if (strcmp(key, "disable_auto_update") == 0) {
+        config->disable_auto_update = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
+    } else if (strcmp(key, "auto_discovery_key") == 0) {
+        strncpy(config->auto_discovery_key, value, sizeof(config->auto_discovery_key) - 1);
+    }
+
+    return 0;
+}
+
 int config_load_from_uci(agent_config_t *config) {
     if (!config) return -1;
-    
+
     FILE *fp;
     char line[512];
-    char key[64], value[256];
-    
+
     fp = popen("uci show komari-agent-c 2>/dev/null", "r");
     if (!fp) return -1;
-    
+
     while (fgets(line, sizeof(line), fp)) {
-        char *dot = strchr(line, '.');
-        if (!dot) continue;
-        
-        char *eq = strchr(dot, '=');
-        if (!eq) continue;
-        
-        *eq = '\0';
-        strncpy(key, dot + 1, sizeof(key) - 1);
-        key[sizeof(key) - 1] = '\0';
-        
-        char *val = eq + 1;
-        while (*val == ' ' || *val == '\'') val++;
-        char *end = val + strlen(val) - 1;
-        while (end > val && (*end == '\n' || *end == '\'' || *end == ' ')) {
-            *end = '\0';
-            end--;
-        }
-        
-        strncpy(value, val, sizeof(value) - 1);
-        value[sizeof(value) - 1] = '\0';
-        
-        if (strcmp(key, "token") == 0) {
-            strncpy(config->token, value, sizeof(config->token) - 1);
-        } else if (strcmp(key, "endpoint") == 0) {
-            strncpy(config->endpoint, value, sizeof(config->endpoint) - 1);
-        } else if (strcmp(key, "interval") == 0) {
-            config->interval = atof(value);
-        } else if (strcmp(key, "disable_web_ssh") == 0) {
-            config->disable_web_ssh = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
-        } else if (strcmp(key, "ignore_unsafe_cert") == 0) {
-            config->ignore_unsafe_cert = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
-        } else if (strcmp(key, "custom_dns") == 0) {
-            strncpy(config->custom_dns, value, sizeof(config->custom_dns) - 1);
-        } else if (strcmp(key, "language") == 0) {
-            strncpy(config->language, value, sizeof(config->language) - 1);
-        } else if (strcmp(key, "max_retries") == 0) {
-            config->max_retries = atoi(value);
-        } else if (strcmp(key, "reconnect_interval") == 0) {
-            config->reconnect_interval = atoi(value);
-        } else if (strcmp(key, "info_report_interval") == 0) {
-            config->info_report_interval = atoi(value);
-        } else if (strcmp(key, "month_rotate") == 0) {
-            config->month_rotate = atoi(value);
-        } else if (strcmp(key, "protocol_version") == 0) {
-            config->protocol_version = atoi(value);
-        } else if (strcmp(key, "enable_gpu") == 0) {
-            config->enable_gpu = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
-        } else if (strcmp(key, "disable_compression") == 0) {
-            config->disable_compression = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
-        } else if (strcmp(key, "disable_auto_update") == 0) {
-            config->disable_auto_update = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
-        } else if (strcmp(key, "auto_discovery_key") == 0) {
-            strncpy(config->auto_discovery_key, value, sizeof(config->auto_discovery_key) - 1);
-        }
+        config_parse_uci_line(config, line);
     }
-    
+
     pclose(fp);
     return 0;
 }

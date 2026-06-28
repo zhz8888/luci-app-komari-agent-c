@@ -83,42 +83,58 @@ static void compute_accept_key(const char *key, char *accept_key) {
     base64_encode(hash, SHA_DIGEST_LENGTH, accept_key);
 }
 
-/* Internal helper: parse a ws:// or wss:// URL into scheme/host/port/path components. */
+/* Internal helper: parse a ws:// or wss:// URL into scheme/host/port/path components.
+ * Output buffers must be at least SCHEME_MAX/HOST_MAX/PATH_MAX bytes respectively. */
+#define WS_SCHEME_MAX 8
+#define WS_HOST_MAX 256
+#define WS_PATH_MAX 512
 static int parse_url(const char *url, char *scheme, char *host, int *port, char *path) {
     if (strncmp(url, "ws://", 5) == 0) {
-        strcpy(scheme, "ws");
+        snprintf(scheme, WS_SCHEME_MAX, "ws");
         url += 5;
         *port = 80;
     } else if (strncmp(url, "wss://", 6) == 0) {
-        strcpy(scheme, "wss");
+        snprintf(scheme, WS_SCHEME_MAX, "wss");
         url += 6;
         *port = 443;
     } else {
         return -1;
     }
-    
+
     const char *slash = strchr(url, '/');
     const char *colon = strchr(url, ':');
-    
+
     if (colon && (!slash || colon < slash)) {
         size_t host_len = colon - url;
-        strncpy(host, url, host_len);
-        host[host_len] = '\0';
-        *port = atoi(colon + 1);
+        if (host_len >= WS_HOST_MAX) return -1;
+        snprintf(host, WS_HOST_MAX, "%.*s", (int)host_len, url);
+        /* Parse port with strtol and validate range (atoi gives no error checking). */
+        char *endp = NULL;
+        long port_val = strtol(colon + 1, &endp, 10);
+        if (endp == colon + 1 || port_val < 1 || port_val > 65535) {
+            return -1;
+        }
+        /* Port may be followed by '/' (path) or end of string; reject any other suffix. */
+        if (*endp != '\0' && *endp != '/') {
+            return -1;
+        }
+        *port = (int)port_val;
         url = slash ? slash : "/";
     } else {
         if (slash) {
             size_t host_len = slash - url;
-            strncpy(host, url, host_len);
-            host[host_len] = '\0';
+            if (host_len >= WS_HOST_MAX) return -1;
+            snprintf(host, WS_HOST_MAX, "%.*s", (int)host_len, url);
             url = slash;
         } else {
-            strcpy(host, url);
+            if (strlen(url) >= WS_HOST_MAX) return -1;
+            snprintf(host, WS_HOST_MAX, "%s", url);
             url = "/";
         }
     }
-    
-    strcpy(path, url);
+
+    if (strlen(url) >= WS_PATH_MAX) return -1;
+    snprintf(path, WS_PATH_MAX, "%s", url);
     return 0;
 }
 
@@ -174,50 +190,75 @@ static int ws_handshake(ws_client_t *client, const char *host, const char *path,
             n += ret;
             total += ret;
         }
-        
+
+        /* NUL-terminate before strstr so we never scan uninitialized bytes */
+        response[total] = '\0';
         if (strstr(response, "\r\n\r\n") != NULL) {
             break;
         }
     }
-    
+
     if (n <= 0) return -1;
-    response[n] = '\0';
-    
-    if (strstr(response, "101") == NULL) return -1;
+    response[total] = '\0';
+
+    /* Validate the status line strictly rather than searching for "101" anywhere */
+    if (strncmp(response, "HTTP/1.1 101", 12) != 0) return -1;
     if (strstr(response, "Upgrade") == NULL) return -1;
     if (strstr(response, "websocket") == NULL) return -1;
-    
+
     return 0;
 }
 
-/* Internal helper: send a single WebSocket frame with the given opcode and payload. */
+/* Internal helper: send a single WebSocket frame with the given opcode and payload.
+ * Per RFC 6455 §5.1, all frames sent from a client to the server MUST be masked
+ * with a 4-byte masking key chosen by the client. */
 static int ws_send_frame(ws_client_t *client, int opcode, const char *data, size_t len) {
+    /* WS_HEADER_SIZE (14) already accounts for 2-byte basic header + 8-byte extended
+     * length + 4-byte mask key, which is the worst case. */
     unsigned char frame[WS_HEADER_SIZE + (len > 0 ? len : 0)];
     size_t frame_len = 0;
+    unsigned char mask[4];
+
+    /* Generate a 4-byte random mask key. Prefer RAND_bytes for cryptographic
+     * randomness; fall back to rand() if it fails (still satisfies RFC 6455
+     * which only requires unpredictable-to-server randomness). */
+    if (RAND_bytes(mask, 4) != 1) {
+        for (int i = 0; i < 4; i++) {
+            mask[i] = (unsigned char)rand();
+        }
+    }
 
     frame[0] = 0x80 | (opcode & 0x0F);
 
     if (len <= 125) {
-        frame[1] = len;
+        /* Set mask bit (0x80) and 7-bit payload length */
+        frame[1] = 0x80 | (unsigned char)len;
         frame_len = 2;
     } else if (len <= 65535) {
-        frame[1] = 126;
+        frame[1] = 0x80 | 126;
         frame[2] = (len >> 8) & 0xFF;
         frame[3] = len & 0xFF;
         frame_len = 4;
     } else {
-        frame[1] = 127;
+        frame[1] = 0x80 | 127;
         for (int i = 0; i < 8; i++) {
             frame[2 + i] = (len >> (56 - i * 8)) & 0xFF;
         }
         frame_len = 10;
     }
 
+    /* Append the 4-byte mask key right after the (possibly extended) length */
+    memcpy(frame + frame_len, mask, 4);
+    frame_len += 4;
+
+    /* Copy payload and apply the mask: data[i] ^= mask[i % 4] */
     if (data && len > 0) {
-        memcpy(frame + frame_len, data, len);
+        for (size_t i = 0; i < len; i++) {
+            frame[frame_len + i] = (unsigned char)data[i] ^ mask[i % 4];
+        }
         frame_len += len;
     }
-    
+
     pthread_mutex_lock(&client->send_mutex);
     ssize_t n;
     if (client->use_tls && client->ssl) {
@@ -226,75 +267,79 @@ static int ws_send_frame(ws_client_t *client, int opcode, const char *data, size
         n = send(client->fd, frame, frame_len, 0);
     }
     pthread_mutex_unlock(&client->send_mutex);
-    
+
     return (n == (ssize_t)frame_len) ? 0 : -1;
+}
+
+/* Internal helper: read exactly `len` bytes from the socket/TLS stream.
+ * Loops over recv()/SSL_read() to handle partial reads. Returns 0 on success
+ * (all bytes read), or -1 on error/connection-closed before the full length. */
+static int read_full(ws_client_t *client, void *buf, size_t len) {
+    size_t got = 0;
+    char *p = (char *)buf;
+    while (got < len) {
+        ssize_t ret;
+        if (client->use_tls && client->ssl) {
+            ret = SSL_read(client->ssl, p + got, len - got);
+        } else {
+            ret = recv(client->fd, p + got, len - got, 0);
+        }
+        if (ret <= 0) {
+            return -1;
+        }
+        got += (size_t)ret;
+    }
+    return 0;
 }
 
 /* Internal helper: receive a single WebSocket frame into `data`, returning the opcode and length. */
 static int ws_recv_frame(ws_client_t *client, int *opcode, char *data, size_t *len) {
     unsigned char header[2];
-    ssize_t n;
-    
-    if (client->use_tls && client->ssl) {
-        n = SSL_read(client->ssl, header, 2);
-    } else {
-        n = recv(client->fd, header, 2, 0);
-    }
-    if (n <= 0) return -1;
-    
+
+    if (read_full(client, header, 2) != 0) return -1;
+
+    int fin = (header[0] & 0x80) != 0;
     *opcode = header[0] & 0x0F;
+    /* Fragmentation is not supported: reject continuation frames (opcode 0x00)
+     * and non-final frames (fin=0). The caller treats this as a fatal error and
+     * reconnects, which is safer than silently dropping partial messages. */
+    if (*opcode == 0x00 || !fin) {
+        KOMARI_LOG_WARN("WebSocket fragmentation not supported (opcode=%d, fin=%d)",
+                        *opcode, fin);
+        return -1;
+    }
     int masked = (header[1] & 0x80) != 0;
     uint64_t payload_len = header[1] & 0x7F;
-    
+
     if (payload_len == 126) {
         unsigned char ext[2];
-        if (client->use_tls && client->ssl) {
-            n = SSL_read(client->ssl, ext, 2);
-        } else {
-            n = recv(client->fd, ext, 2, 0);
-        }
-        if (n <= 0) return -1;
-        payload_len = (ext[0] << 8) | ext[1];
+        if (read_full(client, ext, 2) != 0) return -1;
+        payload_len = ((uint64_t)ext[0] << 8) | ext[1];
     } else if (payload_len == 127) {
         unsigned char ext[8];
-        if (client->use_tls && client->ssl) {
-            n = SSL_read(client->ssl, ext, 8);
-        } else {
-            n = recv(client->fd, ext, 8, 0);
-        }
-        if (n <= 0) return -1;
+        if (read_full(client, ext, 8) != 0) return -1;
         payload_len = 0;
         for (int i = 0; i < 8; i++) {
             payload_len = (payload_len << 8) | ext[i];
         }
     }
-    
+
     unsigned char mask[4] = {0};
     if (masked) {
-        if (client->use_tls && client->ssl) {
-            n = SSL_read(client->ssl, mask, 4);
-        } else {
-            n = recv(client->fd, mask, 4, 0);
-        }
-        if (n <= 0) return -1;
+        if (read_full(client, mask, 4) != 0) return -1;
     }
-    
+
     if (payload_len > *len) payload_len = *len;
-    
-    if (client->use_tls && client->ssl) {
-        n = SSL_read(client->ssl, data, payload_len);
-    } else {
-        n = recv(client->fd, data, payload_len, 0);
-    }
-    if (n <= 0) return -1;
-    
+
+    if (read_full(client, data, (size_t)payload_len) != 0) return -1;
+
     if (masked) {
-        for (ssize_t i = 0; i < n; i++) {
+        for (size_t i = 0; i < (size_t)payload_len; i++) {
             data[i] ^= mask[i % 4];
         }
     }
-    
-    *len = n;
+
+    *len = (size_t)payload_len;
     return 0;
 }
 
@@ -302,19 +347,21 @@ static int ws_recv_frame(ws_client_t *client, int *opcode, char *data, size_t *l
  * close frames, and dispatches text frames to the JSON or raw handler. */
 static void *ws_recv_thread(void *arg) {
     ws_client_t *client = (ws_client_t *)arg;
-    char buffer[WS_MAX_MESSAGE_SIZE];
-    
-    while (!client->should_stop) {
+    /* +1 byte so that buffer[len] = '\0' is safe even when len == WS_MAX_MESSAGE_SIZE */
+    char buffer[WS_MAX_MESSAGE_SIZE + 1];
+
+    while (1) {
         pthread_mutex_lock(&client->state_mutex);
+        bool should_stop = client->should_stop;
         bool connected = client->connected;
         pthread_mutex_unlock(&client->state_mutex);
-        
-        if (!connected) {
+
+        if (should_stop || !connected) {
             break;
         }
-        
+
         int opcode;
-        size_t len = sizeof(buffer);
+        size_t len = WS_MAX_MESSAGE_SIZE;
         
         if (ws_recv_frame(client, &opcode, buffer, &len) == 0) {
             if (opcode == 0x08) {
@@ -447,7 +494,17 @@ void ws_client_destroy(ws_client_t *client) {
 
 int ws_client_connect(ws_client_t *client) {
     if (!client || !client->config.endpoint) return -1;
-    
+
+    /* Reset stop flag so the recv thread can run again after a reconnect */
+    pthread_mutex_lock(&client->state_mutex);
+    client->should_stop = false;
+    pthread_mutex_unlock(&client->state_mutex);
+
+    /* Close any previously open fd to avoid leaking socket descriptors across reconnects */
+    if (client->fd >= 0) {
+        ws_client_disconnect(client);
+    }
+
     char scheme[8], host[256], path[512];
     int port;
     
@@ -457,25 +514,44 @@ int ws_client_connect(ws_client_t *client) {
     
     client->use_tls = (strcmp(scheme, "wss") == 0);
     
-    struct hostent *he = gethostbyname(host);
-    if (!he) return -1;
-    
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
-    
-    client->fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (client->fd < 0) return -1;
-    
-    struct timeval tv = {.tv_sec = 15, .tv_usec = 0};
-    setsockopt(client->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(client->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    
-    if (connect(client->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(client->fd);
-        client->fd = -1;
+    /* Use getaddrinfo() instead of gethostbyname() for IPv4/IPv6 dual-stack support.
+     * gethostbyname() only returns IPv4 addresses and cannot connect to IPv6 endpoints.
+     * Iterate over all returned addrinfo entries (like Go's net.Dialer) and keep the
+     * first socket that connects successfully. */
+    struct addrinfo hints, *res, *rp;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;       /* allow IPv4 or IPv6 */
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    int gai_err = getaddrinfo(host, port_str, &hints, &res);
+    if (gai_err != 0) {
+        return -1;
+    }
+
+    client->fd = -1;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        int fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+
+        struct timeval tv = {.tv_sec = 15, .tv_usec = 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            client->fd = fd;
+            break;  /* success */
+        }
+        close(fd);
+    }
+    freeaddrinfo(res);
+
+    if (client->fd < 0) {
+        /* all connect attempts failed */
         return -1;
     }
     
@@ -564,10 +640,9 @@ int ws_client_connect(ws_client_t *client) {
 
 void ws_client_disconnect(ws_client_t *client) {
     if (!client) return;
-    
-    client->should_stop = true;
-    
+
     pthread_mutex_lock(&client->state_mutex);
+    client->should_stop = true;
     client->connected = false;
     pthread_mutex_unlock(&client->state_mutex);
     
@@ -592,12 +667,20 @@ void ws_client_disconnect(ws_client_t *client) {
 }
 
 int ws_client_send_text(ws_client_t *client, const char *data, size_t len) {
-    if (!client || !client->connected || !data) return -1;
+    if (!client || !data) return -1;
+    pthread_mutex_lock(&client->state_mutex);
+    bool connected = client->connected;
+    pthread_mutex_unlock(&client->state_mutex);
+    if (!connected) return -1;
     return ws_send_frame(client, 0x01, data, len);
 }
 
 int ws_client_send_ping(ws_client_t *client) {
-    if (!client || !client->connected) return -1;
+    if (!client) return -1;
+    pthread_mutex_lock(&client->state_mutex);
+    bool connected = client->connected;
+    pthread_mutex_unlock(&client->state_mutex);
+    if (!connected) return -1;
     return ws_send_frame(client, 0x09, NULL, 0);
 }
 
@@ -614,7 +697,10 @@ void ws_client_set_user_data(ws_client_t *client, void *data) {
 }
 
 void ws_client_stop(ws_client_t *client) {
-    if (client) client->should_stop = true;
+    if (!client) return;
+    pthread_mutex_lock(&client->state_mutex);
+    client->should_stop = true;
+    pthread_mutex_unlock(&client->state_mutex);
 }
 
 /* ================ Protocol fallback mechanism implementation ================ */

@@ -142,14 +142,6 @@ void ws_client_set_raw_handler(ws_client_t *client, ws_raw_handler_t handler);
 void ws_client_set_user_data(ws_client_t *client, void *data);
 
 /**
- * Run the client's main loop (connect with retries and maintain the connection).
- *
- * @param client Pointer to the client.
- * @return 0 on success, -1 on failure.
- */
-int ws_client_run(ws_client_t *client);
-
-/**
  * Request the client to stop its main loop.
  *
  * @param client Pointer to the client.

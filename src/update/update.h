@@ -73,4 +73,13 @@ int update_check_available(const char *current_version);
  */
 void *update_do_check_works(void *arg);
 
+/**
+ * Signal the background update checker thread to stop.
+ *
+ * Should be called from the main shutdown path so that the worker
+ * exits its loop promptly (within ~1 second) instead of waiting for
+ * the next 6-hour sleep cycle to complete.
+ */
+void update_stop(void);
+
 #endif

@@ -88,16 +88,4 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns);
  */
 int ping_resolve_ip(const char *target, char *ip_out, size_t ip_size, const char *custom_dns);
 
-/**
- * Upload a ping task result to the panel server over a socket.
- *
- * @param fd Connected socket file descriptor
- * @param token Authentication token
- * @param result Ping task result to upload
- * @param use_tls Whether to use TLS for the upload
- * @param ignore_cert Whether to ignore TLS certificate validation errors
- * @return 0 on success, -1 on failure
- */
-int ping_upload_result(int fd, const char *token, ping_task_result_t *result, bool use_tls, bool ignore_cert);
-
 #endif

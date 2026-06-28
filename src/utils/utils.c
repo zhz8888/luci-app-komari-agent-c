@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <dirent.h>
 #include <time.h>
 #include <netdb.h>
@@ -56,10 +57,10 @@ int utils_read_file_line(const char *path, char *buf, size_t buf_len) {
     return 0;
 }
 
-int utils_write_file_string(const char *path, const char *data) {
+int utils_write_file_string(const char *path, const char *data, mode_t mode) {
     if (!path || !data) return -1;
-    
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
     if (fd < 0) return -1;
     
     size_t len = strlen(data);
@@ -84,7 +85,10 @@ uint64_t utils_get_uptime_seconds(void) {
 
 int utils_get_hostname(char *buf, size_t buf_len) {
     if (!buf || buf_len == 0) return -1;
-    return gethostname(buf, buf_len);
+    int ret = gethostname(buf, buf_len);
+    /* gethostname may not NUL-terminate when the buffer is too small */
+    buf[buf_len - 1] = '\0';
+    return ret;
 }
 
 char *utils_str_trim(char *str) {
@@ -139,16 +143,17 @@ int utils_format_timestamp(uint64_t timestamp, char *buf, size_t buf_len) {
     if (!buf || buf_len == 0) return -1;
     
     time_t t = (time_t)timestamp;
-    struct tm *tm_info = localtime(&t);
-    if (!tm_info) return -1;
+    struct tm tm_info;
+    if (!localtime_r(&t, &tm_info)) return -1;
     
-    strftime(buf, buf_len, "%Y-%m-%dT%H:%M:%S", tm_info);
+    strftime(buf, buf_len, "%Y-%m-%dT%H:%M:%S", &tm_info);
     return 0;
 }
 
 int utils_exec_command(const char *cmd, char *output, size_t output_len, int *exit_code) {
+    /* WARNING: cmd is executed via the shell. Never pass untrusted input here. */
     if (!cmd) return -1;
-    
+
     FILE *fp = popen(cmd, "r");
     if (!fp) return -1;
     
@@ -176,6 +181,67 @@ int utils_exec_command(const char *cmd, char *output, size_t output_len, int *ex
     return 0;
 }
 
+int utils_exec_command_argv(char *const argv[], char *output, size_t output_size, int *exit_code) {
+    if (!argv || !argv[0]) return -1;
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* Child: redirect stdout and stderr to the pipe write end */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+
+        execvp(argv[0], argv);
+        /* execvp only returns on failure */
+        _exit(127);
+    }
+
+    /* Parent: close write end and read child output */
+    close(pipefd[1]);
+
+    size_t total = 0;
+    if (output && output_size > 0) {
+        output[0] = '\0';
+        while (total < output_size - 1) {
+            ssize_t n = read(pipefd[0], output + total, output_size - 1 - total);
+            if (n > 0) {
+                total += (size_t)n;
+            } else {
+                break;
+            }
+        }
+        output[total] = '\0';
+    } else {
+        char buf[1024];
+        while (read(pipefd[0], buf, sizeof(buf)) > 0) {
+            /* drain */
+        }
+    }
+    close(pipefd[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (exit_code) {
+        if (WIFEXITED(status)) {
+            *exit_code = WEXITSTATUS(status);
+        } else {
+            *exit_code = -1;
+        }
+    }
+
+    return 0;
+}
+
 int utils_mkdir_p(const char *path) {
     if (!path) return -1;
     
@@ -184,6 +250,7 @@ int utils_mkdir_p(const char *path) {
     tmp[sizeof(tmp) - 1] = '\0';
     
     size_t len = strlen(tmp);
+    if (len == 0) return -1;
     if (tmp[len - 1] == '/') {
         tmp[len - 1] = '\0';
     }
@@ -191,12 +258,25 @@ int utils_mkdir_p(const char *path) {
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
-            mkdir(tmp, 0755);
+            if (mkdir(tmp, 0755) < 0) {
+                if (errno != EEXIST) {
+                    /* real error */
+                    return -1;
+                }
+                /* EEXIST is ok, directory already exists */
+            }
             *p = '/';
         }
     }
-    
-    return mkdir(tmp, 0755);
+
+    if (mkdir(tmp, 0755) < 0) {
+        if (errno != EEXIST) {
+            /* real error */
+            return -1;
+        }
+        /* EEXIST is ok, directory already exists */
+    }
+    return 0;
 }
 
 int utils_file_exists(const char *path) {
@@ -207,60 +287,65 @@ int utils_file_exists(const char *path) {
 
 char *utils_json_escape(const char *str) {
     if (!str) return NULL;
-    
+
     size_t len = strlen(str);
-    size_t escaped_len = len * 2 + 1;
+    /* Worst case: each char becomes \u00XX (6 bytes) plus NUL */
+    size_t escaped_len = len * 6 + 1;
     char *escaped = malloc(escaped_len);
     if (!escaped) return NULL;
-    
+
     size_t j = 0;
-    for (size_t i = 0; i < len && j < escaped_len - 1; i++) {
-        switch (str[i]) {
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)str[i];
+        switch (c) {
             case '"':
-                if (j + 2 < escaped_len) {
-                    escaped[j++] = '\\';
-                    escaped[j++] = '"';
-                }
+                escaped[j++] = '\\';
+                escaped[j++] = '"';
                 break;
             case '\\':
-                if (j + 2 < escaped_len) {
-                    escaped[j++] = '\\';
-                    escaped[j++] = '\\';
-                }
+                escaped[j++] = '\\';
+                escaped[j++] = '\\';
+                break;
+            case '\b':
+                escaped[j++] = '\\';
+                escaped[j++] = 'b';
+                break;
+            case '\f':
+                escaped[j++] = '\\';
+                escaped[j++] = 'f';
                 break;
             case '\n':
-                if (j + 2 < escaped_len) {
-                    escaped[j++] = '\\';
-                    escaped[j++] = 'n';
-                }
+                escaped[j++] = '\\';
+                escaped[j++] = 'n';
                 break;
             case '\r':
-                if (j + 2 < escaped_len) {
-                    escaped[j++] = '\\';
-                    escaped[j++] = 'r';
-                }
+                escaped[j++] = '\\';
+                escaped[j++] = 'r';
                 break;
             case '\t':
-                if (j + 2 < escaped_len) {
-                    escaped[j++] = '\\';
-                    escaped[j++] = 't';
-                }
+                escaped[j++] = '\\';
+                escaped[j++] = 't';
                 break;
             default:
-                if ((unsigned char)str[i] >= 0x20) {
-                    escaped[j++] = str[i];
+                if (c < 0x20) {
+                    /* Other control characters: \u00XX per RFC 8259 */
+                    int n = snprintf(escaped + j, escaped_len - j, "\\u%04X", c);
+                    if (n > 0) j += (size_t)n;
+                } else {
+                    escaped[j++] = c;
                 }
                 break;
         }
     }
     escaped[j] = '\0';
-    
+
     return escaped;
 }
 
 int utils_json_unescape(const char *json, char *out, size_t out_len) {
     if (!json || !out || out_len == 0) return -1;
-    
+
+    size_t len = strlen(json);
     size_t j = 0;
     for (size_t i = 0; json[i] && j < out_len - 1; i++) {
         if (json[i] == '\\' && json[i + 1]) {
@@ -271,6 +356,33 @@ int utils_json_unescape(const char *json, char *out, size_t out_len) {
                 case 'n': out[j++] = '\n'; break;
                 case 'r': out[j++] = '\r'; break;
                 case 't': out[j++] = '\t'; break;
+                case 'u':
+                    /* Parse \uXXXX as a Unicode code point and encode as UTF-8.
+                     * Surrogate pairs are not handled (simplified). */
+                    if (i + 4 < len) {
+                        char hex[5] = {0};
+                        memcpy(hex, json + i + 1, 4);
+                        unsigned int cp = (unsigned int)strtoul(hex, NULL, 16);
+                        if (cp < 0x80) {
+                            if (j < out_len - 1) out[j++] = (char)cp;
+                        } else if (cp < 0x800) {
+                            if (j + 1 < out_len - 1) {
+                                out[j++] = (char)(0xC0 | (cp >> 6));
+                                out[j++] = (char)(0x80 | (cp & 0x3F));
+                            }
+                        } else {
+                            if (j + 2 < out_len - 1) {
+                                out[j++] = (char)(0xE0 | (cp >> 12));
+                                out[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                                out[j++] = (char)(0x80 | (cp & 0x3F));
+                            }
+                        }
+                        i += 4;
+                    } else {
+                        /* Malformed \u escape: output 'u' literally */
+                        out[j++] = 'u';
+                    }
+                    break;
                 default: out[j++] = json[i]; break;
             }
         } else {
@@ -278,6 +390,6 @@ int utils_json_unescape(const char *json, char *out, size_t out_len) {
         }
     }
     out[j] = '\0';
-    
+
     return 0;
 }

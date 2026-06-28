@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <dirent.h>
 
 #include "gpu.h"
@@ -220,38 +221,46 @@ static int detect_soc_gpu(const char *card_path, char *name, size_t name_len) {
     snprintf(compatible_path, sizeof(compatible_path),
              "%s/device/of_node/compatible", card_path);
 
-    /* Read device tree compatible file */
-    if (utils_read_file_string(compatible_path, buf, sizeof(buf)) != 0) {
-        return -1;
-    }
+    /* Read device tree compatible file directly to obtain the raw byte count,
+     * since the content may contain multiple NUL-separated strings */
+    int fd = open(compatible_path, O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t len = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (len < 0) return -1;
+    buf[len] = '\0';
 
-    /* The device tree compatible field may contain multiple strings separated by \0.
-     * utils_read_file_string reads the full content, but strstr only searches up to the first \0.
-     * The first compatible field is sufficient to identify common SoC GPUs. */
-    if (strstr(buf, "adreno") != NULL || strstr(buf, "qcom,") != NULL) {
-        strncpy(name, "Qualcomm Adreno", name_len - 1);
-        name[name_len - 1] = '\0';
-        return 0;
-    }
-    if (strstr(buf, "mali") != NULL) {
-        strncpy(name, "ARM Mali", name_len - 1);
-        name[name_len - 1] = '\0';
-        return 0;
-    }
-    if (strstr(buf, "brcm,bcm") != NULL || strstr(buf, "vc4") != NULL) {
-        strncpy(name, "Broadcom VideoCore", name_len - 1);
-        name[name_len - 1] = '\0';
-        return 0;
-    }
-    if (strstr(buf, "allwinner") != NULL) {
-        strncpy(name, "Allwinner GPU", name_len - 1);
-        name[name_len - 1] = '\0';
-        return 0;
-    }
-    if (strstr(buf, "nvidia,tegra") != NULL || strstr(buf, "tegra") != NULL) {
-        strncpy(name, "NVIDIA Tegra", name_len - 1);
-        name[name_len - 1] = '\0';
-        return 0;
+    /* The device tree compatible field contains multiple strings separated by NUL.
+     * Iterate through all strings to find a matching SoC GPU. */
+    char *p = buf;
+    char *end = buf + len;
+    while (p < end) {
+        if (strstr(p, "adreno") != NULL || strstr(p, "qcom,") != NULL) {
+            strncpy(name, "Qualcomm Adreno", name_len - 1);
+            name[name_len - 1] = '\0';
+            return 0;
+        }
+        if (strstr(p, "mali") != NULL) {
+            strncpy(name, "ARM Mali", name_len - 1);
+            name[name_len - 1] = '\0';
+            return 0;
+        }
+        if (strstr(p, "brcm,bcm") != NULL || strstr(p, "vc4") != NULL) {
+            strncpy(name, "Broadcom VideoCore", name_len - 1);
+            name[name_len - 1] = '\0';
+            return 0;
+        }
+        if (strstr(p, "allwinner") != NULL) {
+            strncpy(name, "Allwinner GPU", name_len - 1);
+            name[name_len - 1] = '\0';
+            return 0;
+        }
+        if (strstr(p, "nvidia,tegra") != NULL || strstr(p, "tegra") != NULL) {
+            strncpy(name, "NVIDIA Tegra", name_len - 1);
+            name[name_len - 1] = '\0';
+            return 0;
+        }
+        p += strlen(p) + 1;
     }
 
     return -1;
@@ -355,8 +364,12 @@ int gpu_get_info(gpu_info_t *info) {
         info->name[sizeof(info->name) - 1] = '\0';
     }
 
-    /* Basic mode does not count in detail, fixed to 1 */
-    info->count = 1;
+    /* Set count based on whether a real GPU was detected */
+    if (strcmp(info->name, "None") == 0) {
+        info->count = 0;
+    } else {
+        info->count = 1;
+    }
 
     /* Try to get driver name from sysfs */
     DIR *dir = opendir("/sys/class/drm");
