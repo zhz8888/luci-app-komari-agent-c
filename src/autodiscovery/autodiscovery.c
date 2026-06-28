@@ -439,6 +439,17 @@ int autodiscovery_register(const char *endpoint,
         return -1;
     }
 
+    /*
+     * Design note: Unlike the authenticated endpoints (which pass the agent
+     * token via URL query string, see websocket.c and report.c), the
+     * registration endpoint uses the Authorization: Bearer header with the
+     * auto-discovery key. This is intentional and matches the Go reference
+     * implementation (see .komari-agent-main/cmd/autodiscovery.go): the
+     * registration endpoint is a bootstrap path that issues a new agent
+     * token, so the agent does not yet have a token to put in the query
+     * string. The "?name=" query parameter carries the hostname, not
+     * authentication material.
+     */
     /* Build registration URL: {endpoint}/api/clients/register?name={hostname} */
     char url[768];
     int n = snprintf(url, sizeof(url), "%s/api/clients/register?name=%s",

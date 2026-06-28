@@ -26,6 +26,9 @@
 #include "utils.h"
 #include "virtual.h"
 #include "gpu.h"
+#include "cJSON.h"
+#include "v2.h"
+#include "jsonrpc.h"
 
 /* Escape special characters in a string for safe inclusion in a JSON string literal.
  * Conforms to RFC 8259: escapes ", \, and control characters (0x00-0x1F). */
@@ -134,6 +137,107 @@ int report_generate(const agent_config_t *config, char *buf, size_t buf_len) {
     return len;
 }
 
+/* Internal helper: wrap a pre-serialized v1 JSON payload as a v2 JSON-RPC 2.0
+ * notification using the provided builder function, then copy the result into
+ * the caller-provided buffer.
+ *
+ * @param v1_json   NUL-terminated v1 JSON string (will be parsed).
+ * @param buf       Output buffer for the v2 JSON-RPC payload.
+ * @param buf_len   Size of buf.
+ * @param builder   Function that wraps a cJSON object as a JSON-RPC payload;
+ *                  takes ownership of the cJSON object on input.
+ * @return Number of bytes written on success, -1 on failure.
+ */
+static int report_wrap_v2(const char *v1_json, char *buf, size_t buf_len,
+                           int (*builder)(cJSON *, char **)) {
+    if (!v1_json || !buf || buf_len == 0 || !builder) return -1;
+
+    /* Parse the v1 JSON into a cJSON object so the v2 builder can attach it
+     * under params.report / params.info. cJSON_Parse is thread-safe. */
+    cJSON *data = cJSON_Parse(v1_json);
+    if (!data) return -1;
+
+    char *v2_str = NULL;
+    if (builder(data, &v2_str) != 0) {
+        /* v2_build_*_payload transfers ownership of data on input; on the
+         * failure path the underlying jsonrpc_build_*_payload may have
+         * leaked data when cJSON_CreateObject() failed, so free it here to
+         * avoid a leak. On the success path data is owned by the root
+         * object and freed internally. */
+        cJSON_Delete(data);
+        return -1;
+    }
+
+    size_t v2_len = strlen(v2_str);
+    if (v2_len >= buf_len) {
+        /* Buffer too small for the wrapped payload. */
+        free(v2_str);
+        return -1;
+    }
+    memcpy(buf, v2_str, v2_len + 1);
+    free(v2_str);
+
+    return (int)v2_len;
+}
+
+int report_generate_v2(const agent_config_t *config, char *buf, size_t buf_len) {
+    if (!config || !buf || buf_len == 0) return -1;
+
+    /* Generate the v1-style report JSON first. Use a local buffer so the
+     * caller's buffer is left untouched on failure. */
+    char v1_buf[4096];
+    int v1_len = report_generate(config, v1_buf, sizeof(v1_buf));
+    if (v1_len <= 0) return -1;
+    v1_buf[sizeof(v1_buf) - 1] = '\0';
+
+    return report_wrap_v2(v1_buf, buf, buf_len, v2_build_report_payload);
+}
+
+int report_generate_v2_with_acks(const agent_config_t *config, char *buf,
+                                 size_t buf_len, const int *ack_ids,
+                                 int ack_count) {
+    if (!config || !buf || buf_len == 0) return -1;
+    if (ack_count < 0) ack_count = 0;
+
+    /* Generate the v1-style report JSON first. */
+    char v1_buf[4096];
+    int v1_len = report_generate(config, v1_buf, sizeof(v1_buf));
+    if (v1_len <= 0) return -1;
+    v1_buf[sizeof(v1_buf) - 1] = '\0';
+
+    /* Parse the v1 JSON into a cJSON object so jsonrpc_build_report_request
+     * can attach it under params.report. cJSON_Parse is thread-safe. */
+    cJSON *data = cJSON_Parse(v1_buf);
+    if (!data) return -1;
+
+    /* Build a v2 JSON-RPC request with the ACK IDs. The request id is derived
+     * from the current time so each report cycle uses a distinct value (the
+     * server uses it only for request/response correlation, not for dedup).
+     * jsonrpc_build_report_request takes ownership of `data` on input. */
+    int request_id = (int)time(NULL);
+    cJSON *root = jsonrpc_build_report_request(request_id, data, ack_ids, ack_count);
+    if (!root) {
+        /* On failure, jsonrpc_build_report_request may have leaked data when
+         * cJSON_CreateObject() failed; free it here to avoid a leak. */
+        cJSON_Delete(data);
+        return -1;
+    }
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json_str) return -1;
+
+    size_t json_len = strlen(json_str);
+    if (json_len >= buf_len) {
+        free(json_str);
+        return -1;
+    }
+    memcpy(buf, json_str, json_len + 1);
+    free(json_str);
+
+    return (int)json_len;
+}
+
 int report_generate_basic_info(const agent_config_t *config, char *buf, size_t buf_len) {
     if (!config || !buf || buf_len == 0) return -1;
     
@@ -201,6 +305,19 @@ int report_generate_basic_info(const agent_config_t *config, char *buf, size_t b
     );
 
     return len;
+}
+
+int report_generate_basic_info_v2(const agent_config_t *config, char *buf, size_t buf_len) {
+    if (!config || !buf || buf_len == 0) return -1;
+
+    /* Generate the v1-style basic info JSON first. Use a local buffer so the
+     * caller's buffer is left untouched on failure. */
+    char v1_buf[4096];
+    int v1_len = report_generate_basic_info(config, v1_buf, sizeof(v1_buf));
+    if (v1_len <= 0) return -1;
+    v1_buf[sizeof(v1_buf) - 1] = '\0';
+
+    return report_wrap_v2(v1_buf, buf, buf_len, v2_build_basic_info_payload);
 }
 
 /* Perform an HTTP POST request with optional extra headers, supporting HTTPS.
@@ -451,12 +568,16 @@ int report_upload_task_result(const agent_config_t *config,
         return -1;
     }
 
-    /* The token is passed as a URL query parameter for server-side
-     * compatibility. Using an Authorization: Bearer header would be safer
-     * (avoids token leakage via access logs and intermediary caches), but
-     * the server endpoint expects the token in the query string and does not
-     * accept the Authorization header. Switching would break authentication,
-     * so the current approach is retained. */
+    /*
+     * Design note: The token is passed via URL query string (e.g., "?token=xxx")
+     * rather than an Authorization header. This is intentional and matches the
+     * Go reference implementation (see .komari-agent-main/server/task.go and
+     * basicInfo.go), where all HTTP reporting endpoints
+     * (/api/clients/task/result, /api/clients/ping/result,
+     * /api/clients/uploadBasicInfo) accept the token as a query parameter.
+     * The server side already supports this auth scheme, so changing to a
+     * header-based approach would break compatibility.
+     */
     char url[512];
     snprintf(url, sizeof(url), "%s/api/clients/task/result?token=%s",
              config->endpoint, config->token);
@@ -494,6 +615,7 @@ int report_upload_ping_result(const agent_config_t *config,
                                uint64_t finished_at) {
     if (!config || !ping_type) return -1;
     
+    /* Token passed via URL query string by design; see design note above. */
     char url[512];
     snprintf(url, sizeof(url), "%s/api/clients/ping/result?token=%s",
              config->endpoint, config->token);

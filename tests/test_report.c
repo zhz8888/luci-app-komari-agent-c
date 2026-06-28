@@ -16,6 +16,8 @@
 #include "monitoring.h"
 #include "config.h"
 #include "cJSON.h"
+#include "v2.h"
+#include "jsonrpc.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -399,10 +401,233 @@ void test_report_generate_basic_info_custom_ip(void) {
     cJSON_Delete(root);
 }
 
+/* ====== report_generate_v2 tests ====== */
+
+/* Test report_generate_v2: verify return value and JSON-RPC 2.0 structure. */
+void test_report_generate_v2_jsonrpc_structure(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    char buf[REPORT_BUF_SIZE];
+    int len = report_generate_v2(&config, buf, sizeof(buf));
+
+    TEST_ASSERT_TRUE(len > 0);
+
+    cJSON *root = cJSON_Parse(buf);
+    TEST_ASSERT_NOT_NULL(root);
+    TEST_ASSERT_TRUE(cJSON_IsObject(root));
+
+    /* jsonrpc field must be "2.0" */
+    cJSON *jsonrpc = cJSON_GetObjectItem(root, "jsonrpc");
+    TEST_ASSERT_NOT_NULL(jsonrpc);
+    TEST_ASSERT_TRUE(cJSON_IsString(jsonrpc));
+    TEST_ASSERT_EQUAL_STRING(JSONRPC_VERSION, jsonrpc->valuestring);
+
+    /* method field must be AGENT_REPORT ("agent.report") */
+    cJSON *method = cJSON_GetObjectItem(root, "method");
+    TEST_ASSERT_NOT_NULL(method);
+    TEST_ASSERT_TRUE(cJSON_IsString(method));
+    TEST_ASSERT_EQUAL_STRING(AGENT_REPORT, method->valuestring);
+
+    /* v2 notification must not carry an id field */
+    cJSON *id = cJSON_GetObjectItem(root, "id");
+    TEST_ASSERT_NULL(id);
+
+    cJSON_Delete(root);
+}
+
+/* Test report_generate_v2: params.report contains the original report fields. */
+void test_report_generate_v2_params_contains_report(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    char buf[REPORT_BUF_SIZE];
+    int len = report_generate_v2(&config, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(len > 0);
+
+    cJSON *root = cJSON_Parse(buf);
+    TEST_ASSERT_NOT_NULL(root);
+
+    /* params must exist and be an object */
+    cJSON *params = cJSON_GetObjectItem(root, "params");
+    TEST_ASSERT_NOT_NULL(params);
+    TEST_ASSERT_TRUE(cJSON_IsObject(params));
+
+    /* params.report must exist and be an object */
+    cJSON *report = cJSON_GetObjectItem(params, "report");
+    TEST_ASSERT_NOT_NULL(report);
+    TEST_ASSERT_TRUE(cJSON_IsObject(report));
+
+    /* Verify report contains the key v1 report fields */
+    cJSON *cpu = cJSON_GetObjectItem(report, "cpu");
+    TEST_ASSERT_NOT_NULL(cpu);
+    TEST_ASSERT_TRUE(cJSON_IsObject(cpu));
+
+    cJSON *cpu_usage = cJSON_GetObjectItem(cpu, "usage");
+    TEST_ASSERT_NOT_NULL(cpu_usage);
+    TEST_ASSERT_TRUE(cJSON_IsNumber(cpu_usage));
+
+    cJSON *ram = cJSON_GetObjectItem(report, "ram");
+    TEST_ASSERT_NOT_NULL(ram);
+    TEST_ASSERT_TRUE(cJSON_IsObject(ram));
+
+    cJSON *uptime = cJSON_GetObjectItem(report, "uptime");
+    TEST_ASSERT_NOT_NULL(uptime);
+    TEST_ASSERT_TRUE(cJSON_IsNumber(uptime));
+
+    cJSON *process = cJSON_GetObjectItem(report, "process");
+    TEST_ASSERT_NOT_NULL(process);
+    TEST_ASSERT_TRUE(cJSON_IsNumber(process));
+
+    cJSON_Delete(root);
+}
+
+/* Test report_generate_v2: params.report is structurally isomorphic with
+ * the v1 report.
+ *
+ * Note: report_generate internally invokes sampling functions such as
+ * monitoring_get_cpu_info; two consecutive calls may return different
+ * cpu.usage / network.up values because the sampling window advances.
+ * Therefore this test only compares the field structure (field names
+ * present), not the numeric values. */
+void test_report_generate_v2_report_matches_v1(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    /* Generate the v1 report. */
+    char v1_buf[REPORT_BUF_SIZE];
+    int v1_len = report_generate(&config, v1_buf, sizeof(v1_buf));
+    TEST_ASSERT_TRUE(v1_len > 0);
+
+    cJSON *v1_root = cJSON_Parse(v1_buf);
+    TEST_ASSERT_NOT_NULL(v1_root);
+
+    /* Generate the v2 report (which internally calls report_generate). */
+    char v2_buf[REPORT_BUF_SIZE];
+    int v2_len = report_generate_v2(&config, v2_buf, sizeof(v2_buf));
+    TEST_ASSERT_TRUE(v2_len > 0);
+
+    cJSON *v2_root = cJSON_Parse(v2_buf);
+    TEST_ASSERT_NOT_NULL(v2_root);
+
+    /* Verify v2.params.report is structurally isomorphic with the v1 root. */
+    cJSON *params = cJSON_GetObjectItem(v2_root, "params");
+    TEST_ASSERT_NOT_NULL(params);
+    cJSON *report = cJSON_GetObjectItem(params, "report");
+    TEST_ASSERT_NOT_NULL(report);
+
+    /* Compare field-name presence only (skip values to avoid flakiness from
+     * sampling jitter between the two calls). */
+    const char *top_fields[] = {"cpu", "ram", "swap", "load", "disk",
+                                "network", "connections", "uptime",
+                                "process", "message"};
+    for (size_t i = 0; i < sizeof(top_fields) / sizeof(top_fields[0]); i++) {
+        TEST_ASSERT_NOT_NULL(cJSON_GetObjectItem(v1_root, top_fields[i]));
+        TEST_ASSERT_NOT_NULL(cJSON_GetObjectItem(report, top_fields[i]));
+    }
+
+    /* uptime is the system uptime in seconds; both calls happen within the
+     * same second so the values should match. Only assert numeric type here
+     * to avoid spurious failures when the call straddles a second boundary. */
+    cJSON *v1_uptime = cJSON_GetObjectItem(v1_root, "uptime");
+    cJSON *v2_uptime = cJSON_GetObjectItem(report, "uptime");
+    TEST_ASSERT_NOT_NULL(v1_uptime);
+    TEST_ASSERT_NOT_NULL(v2_uptime);
+    TEST_ASSERT_TRUE(cJSON_IsNumber(v1_uptime));
+    TEST_ASSERT_TRUE(cJSON_IsNumber(v2_uptime));
+
+    cJSON_Delete(v1_root);
+    cJSON_Delete(v2_root);
+}
+
+/* Test report_generate_v2 with NULL arguments. */
+void test_report_generate_v2_null_args(void) {
+    agent_config_t config;
+    config_init(&config);
+    char buf[REPORT_BUF_SIZE];
+
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_v2(NULL, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_v2(&config, NULL, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_v2(&config, buf, 0));
+}
+
+/* Test report_generate_v2: returns -1 when the buffer is too small. */
+void test_report_generate_v2_buffer_too_small(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    /* A 1-byte buffer can only hold a NUL terminator, no JSON. */
+    char tiny_buf[1];
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_v2(&config, tiny_buf, sizeof(tiny_buf)));
+}
+
+/* ====== report_generate_basic_info_v2 tests ====== */
+
+/* Test report_generate_basic_info_v2: JSON-RPC 2.0 structure correctness. */
+void test_report_generate_basic_info_v2_jsonrpc_structure(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    char buf[REPORT_BUF_SIZE];
+    int len = report_generate_basic_info_v2(&config, buf, sizeof(buf));
+
+    TEST_ASSERT_TRUE(len > 0);
+
+    cJSON *root = cJSON_Parse(buf);
+    TEST_ASSERT_NOT_NULL(root);
+
+    /* jsonrpc field must be "2.0" */
+    cJSON *jsonrpc = cJSON_GetObjectItem(root, "jsonrpc");
+    TEST_ASSERT_NOT_NULL(jsonrpc);
+    TEST_ASSERT_TRUE(cJSON_IsString(jsonrpc));
+    TEST_ASSERT_EQUAL_STRING(JSONRPC_VERSION, jsonrpc->valuestring);
+
+    /* method field must be AGENT_BASIC_INFO ("agent.basicInfo") */
+    cJSON *method = cJSON_GetObjectItem(root, "method");
+    TEST_ASSERT_NOT_NULL(method);
+    TEST_ASSERT_TRUE(cJSON_IsString(method));
+    TEST_ASSERT_EQUAL_STRING(AGENT_BASIC_INFO, method->valuestring);
+
+    /* v2 notification must not carry an id field */
+    cJSON *id = cJSON_GetObjectItem(root, "id");
+    TEST_ASSERT_NULL(id);
+
+    /* params.info must exist and be an object */
+    cJSON *params = cJSON_GetObjectItem(root, "params");
+    TEST_ASSERT_NOT_NULL(params);
+    TEST_ASSERT_TRUE(cJSON_IsObject(params));
+
+    cJSON *info = cJSON_GetObjectItem(params, "info");
+    TEST_ASSERT_NOT_NULL(info);
+    TEST_ASSERT_TRUE(cJSON_IsObject(info));
+
+    /* Verify info contains the basic info fields */
+    cJSON *cpu_name = cJSON_GetObjectItem(info, "cpu_name");
+    TEST_ASSERT_NOT_NULL(cpu_name);
+    TEST_ASSERT_TRUE(cJSON_IsString(cpu_name));
+
+    cJSON *version = cJSON_GetObjectItem(info, "version");
+    TEST_ASSERT_NOT_NULL(version);
+    TEST_ASSERT_TRUE(cJSON_IsString(version));
+
+    cJSON_Delete(root);
+}
+
+/* Test report_generate_basic_info_v2 with NULL arguments. */
+void test_report_generate_basic_info_v2_null_args(void) {
+    agent_config_t config;
+    config_init(&config);
+    char buf[REPORT_BUF_SIZE];
+
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_basic_info_v2(NULL, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_basic_info_v2(&config, NULL, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_basic_info_v2(&config, buf, 0));
+}
+
 int main(void) {
     UNITY_BEGIN();
 
-    /* report_generate 测试 */
+    /* report_generate tests */
     RUN_TEST(test_report_generate_valid_json);
     RUN_TEST(test_report_generate_required_fields);
     RUN_TEST(test_report_generate_field_values);
@@ -411,12 +636,23 @@ int main(void) {
     RUN_TEST(test_report_generate_connections_fields);
     RUN_TEST(test_report_generate_load_fields);
 
-    /* report_generate_basic_info 测试 */
+    /* report_generate_basic_info tests */
     RUN_TEST(test_report_generate_basic_info_valid_json);
     RUN_TEST(test_report_generate_basic_info_required_fields);
     RUN_TEST(test_report_generate_basic_info_field_values);
     RUN_TEST(test_report_generate_basic_info_null_args);
     RUN_TEST(test_report_generate_basic_info_custom_ip);
+
+    /* report_generate_v2 tests */
+    RUN_TEST(test_report_generate_v2_jsonrpc_structure);
+    RUN_TEST(test_report_generate_v2_params_contains_report);
+    RUN_TEST(test_report_generate_v2_report_matches_v1);
+    RUN_TEST(test_report_generate_v2_null_args);
+    RUN_TEST(test_report_generate_v2_buffer_too_small);
+
+    /* report_generate_basic_info_v2 tests */
+    RUN_TEST(test_report_generate_basic_info_v2_jsonrpc_structure);
+    RUN_TEST(test_report_generate_basic_info_v2_null_args);
 
     return UNITY_END();
 }

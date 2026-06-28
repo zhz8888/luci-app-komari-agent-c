@@ -187,8 +187,36 @@ target_compile_options(test_jsonrpc PRIVATE ${KOMARI_TEST_C_FLAGS_LIST})
 
 add_test(NAME test_jsonrpc COMMAND test_jsonrpc)
 
+# ====== Test target: test_v2 ======
+# Links v2.c, jsonrpc.c, cJSON.c; depends on Threads (v2 state uses pthread mutex)
+add_executable(test_v2
+    ${UNITY_SOURCES}
+    "${CMAKE_CURRENT_SOURCE_DIR}/test_v2.c"
+    "${CMAKE_SOURCE_DIR}/src/protocol/v2.c"
+    "${CMAKE_SOURCE_DIR}/src/protocol/jsonrpc.c"
+    "${CMAKE_SOURCE_DIR}/src/vendor/cJSON.c"
+)
+
+target_include_directories(test_v2 PRIVATE
+    ${UNITY_INCLUDE_DIRS}
+    "${CMAKE_SOURCE_DIR}/src/protocol"
+    "${CMAKE_SOURCE_DIR}/src/vendor"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/include/komari-agent-c"
+)
+
+target_link_libraries(test_v2 PRIVATE
+    m
+    Threads::Threads
+)
+
+target_compile_options(test_v2 PRIVATE ${KOMARI_TEST_C_FLAGS_LIST})
+
+add_test(NAME test_v2 COMMAND test_v2)
+
 # ====== Test target: test_report ======
-# Links report.c, monitoring.c, cJSON.c, utils.c, virtual.c, logger.c, config.c, gpu.c; depends on OpenSSL
+# Links report.c, monitoring.c, cJSON.c, utils.c, virtual.c, logger.c, config.c, gpu.c,
+# v2.c, jsonrpc.c (for report_generate_v2 / report_generate_basic_info_v2); depends on OpenSSL, Threads
 add_executable(test_report
     ${UNITY_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/test_report.c"
@@ -200,6 +228,8 @@ add_executable(test_report
     "${CMAKE_SOURCE_DIR}/src/utils/virtual.c"
     "${CMAKE_SOURCE_DIR}/src/utils/logger.c"
     "${CMAKE_SOURCE_DIR}/src/config/config.c"
+    "${CMAKE_SOURCE_DIR}/src/protocol/v2.c"
+    "${CMAKE_SOURCE_DIR}/src/protocol/jsonrpc.c"
 )
 
 target_include_directories(test_report PRIVATE
@@ -207,6 +237,7 @@ target_include_directories(test_report PRIVATE
     "${CMAKE_SOURCE_DIR}/src/report"
     "${CMAKE_SOURCE_DIR}/src/monitoring"
     "${CMAKE_SOURCE_DIR}/src/config"
+    "${CMAKE_SOURCE_DIR}/src/protocol"
     "${CMAKE_SOURCE_DIR}/src/vendor"
     "${CMAKE_SOURCE_DIR}/src/utils"
     "${CMAKE_SOURCE_DIR}/include"

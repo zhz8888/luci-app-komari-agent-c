@@ -32,6 +32,7 @@
 #include "logger.h"
 #include "v2.h"
 #include "v1.h"
+#include "jsonrpc.h"
 
 #define WS_BUFFER_SIZE 4096
 #define WS_HEADER_SIZE 14
@@ -149,6 +150,15 @@ static int ws_handshake(ws_client_t *client, const char *host, const char *path,
         return -1;
     }
 
+    /*
+     * Design note: The token is passed via URL query string (e.g., "?token=xxx")
+     * rather than an Authorization header. This is intentional and matches the
+     * Go reference implementation (see .komari-agent-main/server/websocket.go),
+     * where all client-facing WebSocket endpoints (/api/clients/report,
+     * /api/clients/v2/rpc, /api/clients/terminal) accept the token as a query
+     * parameter. The server side already supports this auth scheme, so changing
+     * to a header-based approach would break compatibility.
+     */
     /* Build query string, supporting additional parameters (e.g., terminal session id) */
     char query[256];
     if (extra_query && *extra_query) {
@@ -292,22 +302,17 @@ static int read_full(ws_client_t *client, void *buf, size_t len) {
     return 0;
 }
 
-/* Internal helper: receive a single WebSocket frame into `data`, returning the opcode and length. */
-static int ws_recv_frame(ws_client_t *client, int *opcode, char *data, size_t *len) {
+/* Internal helper: receive a single WebSocket frame into `data`, returning the
+ * opcode, FIN flag and length. Per RFC 6455 §5.4 the caller is responsible for
+ * assembling fragmented messages; this function does not reject continuation
+ * frames (opcode 0x00) or non-final frames (fin=0). */
+static int ws_recv_frame(ws_client_t *client, int *opcode, int *fin, char *data, size_t *len) {
     unsigned char header[2];
 
     if (read_full(client, header, 2) != 0) return -1;
 
-    int fin = (header[0] & 0x80) != 0;
+    *fin = (header[0] & 0x80) != 0;
     *opcode = header[0] & 0x0F;
-    /* Fragmentation is not supported: reject continuation frames (opcode 0x00)
-     * and non-final frames (fin=0). The caller treats this as a fatal error and
-     * reconnects, which is safer than silently dropping partial messages. */
-    if (*opcode == 0x00 || !fin) {
-        KOMARI_LOG_WARN("WebSocket fragmentation not supported (opcode=%d, fin=%d)",
-                        *opcode, fin);
-        return -1;
-    }
     int masked = (header[1] & 0x80) != 0;
     uint64_t payload_len = header[1] & 0x7F;
 
@@ -350,6 +355,15 @@ static void *ws_recv_thread(void *arg) {
     /* +1 byte so that buffer[len] = '\0' is safe even when len == WS_MAX_MESSAGE_SIZE */
     char buffer[WS_MAX_MESSAGE_SIZE + 1];
 
+    /* Reset any leftover fragment state from a previous connection so the
+     * first frame of this session is treated as a fresh message. Both
+     * fragment_len and fragment_opcode must be cleared: fragment_opcode
+     * doubles as the "fragment in progress" flag (0 = idle, 0x01/0x02 =
+     * accumulating) so it must be reset to handle empty-payload first
+     * fragments correctly. */
+    client->fragment_len = 0;
+    client->fragment_opcode = 0;
+
     while (1) {
         pthread_mutex_lock(&client->state_mutex);
         bool should_stop = client->should_stop;
@@ -361,29 +375,93 @@ static void *ws_recv_thread(void *arg) {
         }
 
         int opcode;
+        int fin;
         size_t len = WS_MAX_MESSAGE_SIZE;
-        
-        if (ws_recv_frame(client, &opcode, buffer, &len) == 0) {
-            if (opcode == 0x08) {
-                pthread_mutex_lock(&client->state_mutex);
-                client->connected = false;
-                pthread_mutex_unlock(&client->state_mutex);
-                break;
-            } else if (opcode == 0x09) {
-                ws_send_frame(client, 0x0A, buffer, len);
-            } else if (opcode == 0x01) {
-                buffer[len] = '\0';
 
-                if (client->raw_handler) {
-                    /* Raw data mode: pass data directly without JSON parsing (used for terminal sessions) */
-                    client->raw_handler(client, buffer, len);
-                } else if (client->handler) {
-                    /* JSON mode: parse JSON and invoke message handler */
-                    ws_message_t msg = {0};
+        if (ws_recv_frame(client, &opcode, &fin, buffer, &len) != 0) {
+            /* Receive failure: record protocol result so repeated v2 failures
+             * trigger fallback to v1 (M-8). This must be called before the
+             * thread exits, as the recv thread is the only consumer of
+             * incoming frames. */
+            ws_client_note_protocol_result(client, false);
+            pthread_mutex_lock(&client->state_mutex);
+            client->connected = false;
+            pthread_mutex_unlock(&client->state_mutex);
+            break;
+        }
 
-                    /* Parse message with cJSON, correctly handling escape characters and nested JSON */
-                    cJSON *root = cJSON_Parse(buffer);
-                    if (root) {
+        /* Control frames may be interleaved with fragments (RFC 6455 §5.4).
+         * Handle them directly without touching the fragment accumulation
+         * state so a ping/pong/close mid-message does not corrupt assembly. */
+        if (opcode == 0x08) {
+            /* Close frame: mark connection as closed and exit the loop */
+            pthread_mutex_lock(&client->state_mutex);
+            client->connected = false;
+            pthread_mutex_unlock(&client->state_mutex);
+            break;
+        } else if (opcode == 0x09) {
+            /* Ping frame: reply with a pong carrying the same payload */
+            ws_send_frame(client, 0x0A, buffer, len);
+            continue;
+        } else if (opcode == 0x0A) {
+            /* Pong frame: ignore */
+            continue;
+        }
+
+        /* Non-control frame: feed into the fragment accumulation state machine */
+        char *msg_data = NULL;
+        size_t msg_len = 0;
+        int msg_opcode = 0;
+        int r = ws_fragment_accumulate(client, opcode, fin, buffer, len,
+                                       &msg_data, &msg_len, &msg_opcode);
+        if (r < 0) {
+            /* Oversize, allocation failure or protocol error: close the
+             * connection so the caller can reconnect with a clean state. */
+            pthread_mutex_lock(&client->state_mutex);
+            client->connected = false;
+            pthread_mutex_unlock(&client->state_mutex);
+            break;
+        }
+        if (r == 0) {
+            /* Fragment accumulated, waiting for more frames */
+            continue;
+        }
+
+        /* Message complete: dispatch to the appropriate handler */
+        if (msg_opcode == 0x01) {
+            /* Text frame: NUL-terminate so cJSON_Parse sees a proper C string.
+             * Both `buffer` and `fragment_buf` have at least one extra byte
+             * reserved for the terminator (see buffer declaration above and
+             * the +1 capacity guarantee in ws_fragment_accumulate). */
+            msg_data[msg_len] = '\0';
+
+            if (client->raw_handler) {
+                /* Raw data mode: pass data directly without JSON parsing
+                 * (used for terminal sessions) */
+                client->raw_handler(client, msg_data, msg_len);
+            } else if (client->handler) {
+                /* JSON mode: parse JSON and dispatch to the appropriate handler.
+                 * v2 JSON-RPC events (jsonrpc == "2.0" with a method field) are
+                 * routed to ws_handle_v2_event for dedup + method dispatch + ACK
+                 * accumulation; v1 messages fall through to the legacy field
+                 * extraction path. */
+                cJSON *root = cJSON_Parse(msg_data);
+                if (root) {
+                    cJSON *jsonrpc = cJSON_GetObjectItem(root, "jsonrpc");
+                    cJSON *method = cJSON_GetObjectItem(root, "method");
+                    if (jsonrpc && cJSON_IsString(jsonrpc) &&
+                        strcmp(jsonrpc->valuestring, JSONRPC_VERSION) == 0 &&
+                        method && cJSON_IsString(method)) {
+                        /* v2 JSON-RPC event: dispatch to the v2 handler which
+                         * handles dedup, method-based dispatch and ACK
+                         * accumulation. ws_handle_v2_event re-parses the JSON
+                         * internally via jsonrpc_parse_event, so free root
+                         * here to avoid a leak. */
+                        cJSON_Delete(root);
+                        ws_handle_v2_event(client, msg_data);
+                    } else {
+                        /* v1 message: extract fields and invoke handler */
+                        ws_message_t msg = {0};
                         cJSON *item = NULL;
 
                         /* Extract message field */
@@ -428,22 +506,299 @@ static void *ws_recv_thread(void *arg) {
                         }
 
                         cJSON_Delete(root);
-                    } else {
-                        KOMARI_LOG_WARN("Failed to parse WebSocket JSON message");
+                        client->handler(client, &msg);
                     }
-
+                } else {
+                    KOMARI_LOG_WARN("Failed to parse WebSocket JSON message");
+                    /* Preserve original behavior: call handler with an empty
+                     * message so the handler can still run its default path. */
+                    ws_message_t msg = {0};
                     client->handler(client, &msg);
                 }
             }
-        } else {
-            pthread_mutex_lock(&client->state_mutex);
-            client->connected = false;
-            pthread_mutex_unlock(&client->state_mutex);
-            break;
+        } else if (msg_opcode == 0x02) {
+            /* Binary frame: dispatch to raw handler if registered */
+            if (client->raw_handler) {
+                client->raw_handler(client, msg_data, msg_len);
+            }
         }
     }
-    
+
     return NULL;
+}
+
+/* Accumulate a WebSocket fragment into the client's fragment buffer.
+ * Implements RFC 6455 §5.4 message fragmentation:
+ *   - Unfragmented message (FIN=1, opcode 0x01/0x02): returned directly.
+ *   - First fragment (FIN=0, opcode 0x01/0x02): starts a new accumulation.
+ *   - Continuation (opcode 0x00): appends to the running buffer.
+ *   - Final continuation (FIN=1, opcode 0x00): completes the message.
+ * Returns 0 when more fragments are needed, 1 when the message is complete
+ * (out/out_len/out_opcode are populated), or -1 on error. */
+int ws_fragment_accumulate(ws_client_t *client, int opcode, int fin,
+                           char *data, size_t len,
+                           char **out, size_t *out_len, int *out_opcode) {
+    if (!client || !data || !out || !out_len || !out_opcode) {
+        return -1;
+    }
+
+    /* Unfragmented message: FIN=1 with a non-continuation opcode. If a
+     * fragment was in progress, this is a protocol error (RFC 6455 §5.4).
+     * fragment_opcode (non-zero) is the authoritative "in progress" flag so
+     * that empty-payload first fragments are detected correctly. */
+    if (fin && opcode != 0x00) {
+        if (client->fragment_opcode != 0) {
+            KOMARI_LOG_WARN("WebSocket protocol error: non-continuation frame "
+                            "(opcode=%d) received while fragment in progress", opcode);
+            client->fragment_len = 0;
+            client->fragment_opcode = 0;
+            return -1;
+        }
+        *out = data;
+        *out_len = len;
+        *out_opcode = opcode;
+        return 1;
+    }
+
+    /* First fragment: FIN=0 with a text/binary opcode starts a new message */
+    if (!fin && (opcode == 0x01 || opcode == 0x02)) {
+        if (client->fragment_opcode != 0) {
+            KOMARI_LOG_WARN("WebSocket protocol error: new fragment (opcode=%d) "
+                            "started while previous fragment in progress", opcode);
+            client->fragment_len = 0;
+            client->fragment_opcode = 0;
+            return -1;
+        }
+
+        /* Enforce the maximum accumulated size even on the first fragment to
+         * avoid allocating oversized buffers. */
+        if (len > WS_FRAGMENT_MAX_SIZE) {
+            KOMARI_LOG_WARN("WebSocket fragment first frame exceeds %d bytes",
+                            WS_FRAGMENT_MAX_SIZE);
+            return -1;
+        }
+
+        /* Allocate (or reuse) the accumulation buffer. Use a 4 KB initial
+         * capacity to avoid frequent reallocs for small messages. Always
+         * reserve +1 byte for a NUL terminator that the caller may write. */
+        size_t needed = len + 1;
+        size_t cap = needed > 4096 ? needed : 4096;
+        if (client->fragment_buf == NULL || client->fragment_capacity < cap) {
+            char *new_buf = realloc(client->fragment_buf, cap);
+            if (!new_buf) {
+                return -1;
+            }
+            client->fragment_buf = new_buf;
+            client->fragment_capacity = cap;
+        }
+        memcpy(client->fragment_buf, data, len);
+        client->fragment_len = len;
+        client->fragment_opcode = opcode;
+        return 0;
+    }
+
+    /* Continuation frame: opcode == 0x00 */
+    if (opcode == 0x00) {
+        if (client->fragment_opcode == 0) {
+            KOMARI_LOG_WARN("WebSocket protocol error: continuation frame "
+                            "received without a starting fragment");
+            return -1;
+        }
+
+        /* Reject oversized accumulated messages before appending. This keeps
+         * memory usage bounded by WS_FRAGMENT_MAX_SIZE. */
+        if (client->fragment_len + len > WS_FRAGMENT_MAX_SIZE) {
+            KOMARI_LOG_WARN("WebSocket fragment accumulation exceeded %d bytes, "
+                            "closing connection", WS_FRAGMENT_MAX_SIZE);
+            client->fragment_len = 0;
+            client->fragment_opcode = 0;
+            return -1;
+        }
+
+        /* Grow the buffer if necessary. Geometric growth (doubling) keeps
+         * amortized realloc cost O(1) while still bounding peak usage. */
+        size_t needed = client->fragment_len + len + 1;
+        if (client->fragment_capacity < needed) {
+            size_t new_cap = client->fragment_capacity * 2;
+            if (new_cap < needed) new_cap = needed;
+            char *new_buf = realloc(client->fragment_buf, new_cap);
+            if (!new_buf) {
+                client->fragment_len = 0;
+                client->fragment_opcode = 0;
+                return -1;
+            }
+            client->fragment_buf = new_buf;
+            client->fragment_capacity = new_cap;
+        }
+        memcpy(client->fragment_buf + client->fragment_len, data, len);
+        client->fragment_len += len;
+
+        if (fin) {
+            /* Final fragment: hand the assembled message back to the caller.
+             * Both fragment_len and fragment_opcode are reset so the buffer
+             * can be reused for the next message; fragment_buf itself stays
+             * allocated to avoid a malloc/free churn on the next message. */
+            *out = client->fragment_buf;
+            *out_len = client->fragment_len;
+            *out_opcode = client->fragment_opcode;
+            client->fragment_len = 0;
+            client->fragment_opcode = 0;
+            return 1;
+        }
+        return 0;
+    }
+
+    /* Unknown opcode or invalid fin/opcode combination */
+    KOMARI_LOG_WARN("WebSocket protocol error: unexpected opcode=%d fin=%d",
+                    opcode, fin);
+    return -1;
+}
+
+/* Internal helper: extract a string field from a cJSON object into a fixed-size
+ * buffer. Silently truncates if the value is longer than the buffer. */
+static void v2_extract_string(const cJSON *obj, const char *field,
+                              char *dst, size_t dst_size) {
+    if (!obj || !field || !dst || dst_size == 0) return;
+    cJSON *item = cJSON_GetObjectItem(obj, field);
+    if (item && cJSON_IsString(item)) {
+        strncpy(dst, item->valuestring, dst_size - 1);
+        dst[dst_size - 1] = '\0';
+    }
+}
+
+/* Internal helper: extract a numeric field from a cJSON object as uint32. */
+static uint32_t v2_extract_uint32(const cJSON *obj, const char *field) {
+    if (!obj || !field) return 0;
+    cJSON *item = cJSON_GetObjectItem(obj, field);
+    if (item && cJSON_IsNumber(item)) {
+        return (uint32_t)item->valuedouble;
+    }
+    return 0;
+}
+
+/* Handle a v2 JSON-RPC event: dedup by event ID, dispatch by method to the
+ * registered ws_message_handler_t, and accumulate the ACK ID for the next
+ * report. Mirrors the Go reference implementation (server/websocket.go,
+ * processV2Event) while adapting to the C v2 interface which uses int ACK IDs.
+ *
+ * Returns 0 on success (event processed or duplicate skipped), -1 on parse
+ * failure or invalid arguments. */
+int ws_handle_v2_event(ws_client_t *client, const char *json_str) {
+    if (!client || !json_str) return -1;
+
+    jsonrpc_event_t event;
+    if (jsonrpc_parse_event(json_str, &event) != 0) {
+        return -1;
+    }
+
+    /* Determine the event ID for dedup and ACK.
+     * jsonrpc_parse_event only captures string IDs; when event.id is NULL we
+     * re-parse the raw JSON to check for a numeric ID, so ACK accumulation
+     * works for both string and numeric event IDs (per SubTask 7.4). */
+    const char *id_str = NULL;       /* String form of ID, used for dedup */
+    char id_buf[32] = {0};           /* Buffer for numeric ID rendered as string */
+    int ack_id = 0;                  /* Numeric ID for ACK (0 = skip ACK) */
+
+    if (event.id && event.id[0] != '\0') {
+        id_str = event.id;
+        /* Try to convert string ID to int for ACK accumulation */
+        char *endp = NULL;
+        long val = strtol(event.id, &endp, 10);
+        if (endp != event.id && val > 0) {
+            ack_id = (int)val;
+        }
+    } else {
+        /* Fall back to checking the raw JSON for a numeric id field */
+        cJSON *root = cJSON_Parse(json_str);
+        if (root) {
+            cJSON *id_node = cJSON_GetObjectItem(root, "id");
+            if (id_node && cJSON_IsNumber(id_node)) {
+                long val = (long)id_node->valuedouble;
+                if (val > 0) {
+                    ack_id = (int)val;
+                    snprintf(id_buf, sizeof(id_buf), "%ld", val);
+                    id_str = id_buf;
+                }
+            }
+            cJSON_Delete(root);
+        }
+    }
+
+    /* Dedup by event ID (string form). Events without an ID are always
+     * dispatched (matching Go's markV2EventSeen which returns true for ""). */
+    int is_duplicate = 0;
+    if (id_str) {
+        if (v2_is_event_seen(&client->v2_state, id_str)) {
+            is_duplicate = 1;
+        } else if (v2_add_seen_event(&client->v2_state, id_str) != 0) {
+            KOMARI_LOG_WARN("[v2] Failed to record seen event id: %s", id_str);
+        }
+    }
+
+    /* Dispatch based on method. Duplicate events are not dispatched (to avoid
+     * re-executing commands) but are still ACKed below so the server stops
+     * retransmitting. */
+    int processed = 0;
+    if (!is_duplicate && event.method) {
+        ws_message_t msg = {0};
+
+        if (strcmp(event.method, AGENT_EXEC) == 0) {
+            /* agent.exec: params = { task_id, command } */
+            strncpy(msg.message, "exec", sizeof(msg.message) - 1);
+            if (event.params) {
+                v2_extract_string(event.params, "task_id",
+                                  msg.exec_task_id, sizeof(msg.exec_task_id));
+                v2_extract_string(event.params, "command",
+                                  msg.exec_command, sizeof(msg.exec_command));
+            }
+            if (client->handler) client->handler(client, &msg);
+            processed = 1;
+        } else if (strcmp(event.method, AGENT_PING) == 0) {
+            /* agent.ping: params = { ping_task_id, ping_type, ping_target } */
+            strncpy(msg.message, "ping", sizeof(msg.message) - 1);
+            if (event.params) {
+                msg.ping_task_id = v2_extract_uint32(event.params, "ping_task_id");
+                v2_extract_string(event.params, "ping_type",
+                                  msg.ping_type, sizeof(msg.ping_type));
+                v2_extract_string(event.params, "ping_target",
+                                  msg.ping_target, sizeof(msg.ping_target));
+            }
+            if (client->handler) client->handler(client, &msg);
+            processed = 1;
+        } else if (strcmp(event.method, AGENT_TERMINAL_REQUEST) == 0) {
+            /* agent.terminal.request: params = { request_id }
+             * The v1 handler dispatches terminal requests when terminal_id is
+             * non-empty, so we populate terminal_id and leave message empty. */
+            if (event.params) {
+                v2_extract_string(event.params, "request_id",
+                                  msg.terminal_id, sizeof(msg.terminal_id));
+            }
+            if (client->handler) client->handler(client, &msg);
+            processed = 1;
+        } else if (strcmp(event.method, AGENT_MESSAGE) == 0 ||
+                   strcmp(event.method, AGENT_EVENT) == 0) {
+            /* agent.message / agent.event: log only, no handler dispatch.
+             * These carry informational payloads that do not map to ws_message_t. */
+            KOMARI_LOG_INFO("[v2] Received %s event", event.method);
+            processed = 1;
+        } else {
+            KOMARI_LOG_WARN("[v2] Unknown event method: %s", event.method);
+        }
+    }
+
+    /* ACK accumulation: record the event ID so the next report cycle carries
+     * it in ack_event_ids. Both duplicates (to stop server retransmission)
+     * and successfully processed events are ACKed, matching the Go behavior.
+     * Skip ACK if the ID is missing, empty, or non-numeric (the C v2
+     * interface uses int ACK IDs). */
+    if (ack_id > 0 && (is_duplicate || processed)) {
+        if (v2_add_ack_event(&client->v2_state, ack_id) != 0) {
+            KOMARI_LOG_WARN("[v2] Failed to accumulate ACK id: %d", ack_id);
+        }
+    }
+
+    jsonrpc_free_event(&event);
+    return 0;
 }
 
 ws_client_t *ws_client_create(const ws_client_config_t *config) {
@@ -487,6 +842,14 @@ void ws_client_destroy(ws_client_t *client) {
     /* Clean up v2 protocol state */
     v2_state_cleanup(&client->v2_state);
 
+    /* Free the fragment accumulation buffer to avoid leaking memory across
+     * reconnects or when the client is destroyed mid-message. */
+    free(client->fragment_buf);
+    client->fragment_buf = NULL;
+    client->fragment_len = 0;
+    client->fragment_capacity = 0;
+    client->fragment_opcode = 0;
+
     pthread_mutex_destroy(&client->send_mutex);
     pthread_mutex_destroy(&client->state_mutex);
     free(client);
@@ -507,11 +870,26 @@ int ws_client_connect(ws_client_t *client) {
 
     char scheme[8], host[256], path[512];
     int port;
-    
+
     if (parse_url(client->config.endpoint, scheme, host, &port, path) != 0) {
+        /* Record protocol failure so repeated v2 endpoint failures trigger
+         * fallback to v1 (M-8). */
+        ws_client_note_protocol_result(client, false);
         return -1;
     }
-    
+
+    /* Override the request path based on the negotiated protocol version.
+     * The v2 protocol uses a JSON-RPC endpoint, while v1 uses the legacy
+     * report endpoint. The token query string is appended separately in
+     * ws_handshake, so only the path component is selected here. This
+     * mirrors the Go reference implementation (server/websocket.go,
+     * buildWebSocketEndpoint) which picks the path by protocol version. */
+    if (ws_client_should_use_v2(client)) {
+        snprintf(path, WS_PATH_MAX, "%s", V2_RPC_ENDPOINT);
+    } else {
+        snprintf(path, WS_PATH_MAX, "%s", "/api/clients/report");
+    }
+
     client->use_tls = (strcmp(scheme, "wss") == 0);
     
     /* Use getaddrinfo() instead of gethostbyname() for IPv4/IPv6 dual-stack support.
@@ -528,6 +906,7 @@ int ws_client_connect(ws_client_t *client) {
 
     int gai_err = getaddrinfo(host, port_str, &hints, &res);
     if (gai_err != 0) {
+        ws_client_note_protocol_result(client, false);
         return -1;
     }
 
@@ -552,6 +931,7 @@ int ws_client_connect(ws_client_t *client) {
 
     if (client->fd < 0) {
         /* all connect attempts failed */
+        ws_client_note_protocol_result(client, false);
         return -1;
     }
     
@@ -565,6 +945,7 @@ int ws_client_connect(ws_client_t *client) {
         if (!client->ssl_ctx) {
             close(client->fd);
             client->fd = -1;
+            ws_client_note_protocol_result(client, false);
             return -1;
         }
         
@@ -578,6 +959,7 @@ int ws_client_connect(ws_client_t *client) {
             client->ssl_ctx = NULL;
             close(client->fd);
             client->fd = -1;
+            ws_client_note_protocol_result(client, false);
             return -1;
         }
         
@@ -591,6 +973,7 @@ int ws_client_connect(ws_client_t *client) {
             client->ssl_ctx = NULL;
             close(client->fd);
             client->fd = -1;
+            ws_client_note_protocol_result(client, false);
             return -1;
         }
     }
@@ -607,6 +990,7 @@ int ws_client_connect(ws_client_t *client) {
         }
         close(client->fd);
         client->fd = -1;
+        ws_client_note_protocol_result(client, false);
         return -1;
     }
     
@@ -629,6 +1013,7 @@ int ws_client_connect(ws_client_t *client) {
         pthread_mutex_lock(&client->state_mutex);
         client->connected = false;
         pthread_mutex_unlock(&client->state_mutex);
+        ws_client_note_protocol_result(client, false);
         return -1;
     }
 
@@ -672,7 +1057,13 @@ int ws_client_send_text(ws_client_t *client, const char *data, size_t len) {
     bool connected = client->connected;
     pthread_mutex_unlock(&client->state_mutex);
     if (!connected) return -1;
-    return ws_send_frame(client, 0x01, data, len);
+    int ret = ws_send_frame(client, 0x01, data, len);
+    if (ret != 0) {
+        /* Send failure: record protocol result so repeated v2 failures
+         * trigger fallback to v1 (M-8). */
+        ws_client_note_protocol_result(client, false);
+    }
+    return ret;
 }
 
 int ws_client_send_ping(ws_client_t *client) {

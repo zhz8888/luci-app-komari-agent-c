@@ -236,6 +236,19 @@ int v2_add_seen_event(v2_state_t *state, const char *event_id)
         return 0;
     }
 
+    /* When the limit is reached, remove the oldest one first. This avoids a
+     * wasted realloc when seen_count == V2_SEEN_EVENTS_MAX == seen_capacity:
+     * the old code expanded first, then dropped the oldest entry, leaving
+     * the extra capacity forever unused. Checking the limit first keeps
+     * seen_count < V2_SEEN_EVENTS_MAX <= seen_capacity, so the expansion
+     * branch below is skipped. */
+    if (state->seen_count >= V2_SEEN_EVENTS_MAX) {
+        free(state->seen_events[0]);
+        memmove(&state->seen_events[0], &state->seen_events[1],
+                (state->seen_count - 1) * sizeof(char *));
+        state->seen_count--;
+    }
+
     /* Expand capacity when insufficient */
     if (state->seen_count >= state->seen_capacity) {
         int new_capacity;
@@ -253,14 +266,6 @@ int v2_add_seen_event(v2_state_t *state, const char *event_id)
         }
         state->seen_events = new_events;
         state->seen_capacity = new_capacity;
-    }
-
-    /* When the limit is reached, remove the oldest one */
-    if (state->seen_count >= V2_SEEN_EVENTS_MAX) {
-        free(state->seen_events[0]);
-        memmove(&state->seen_events[0], &state->seen_events[1],
-                (state->seen_count - 1) * sizeof(char *));
-        state->seen_count--;
     }
 
     /* Add the new event */
@@ -333,6 +338,27 @@ int v2_get_ack_ids(v2_state_t *state, int **ids, int *count)
 
     *ids = state->ack_ids;
     *count = state->ack_count;
+
+    pthread_mutex_unlock(&state->mutex);
+    return 0;
+}
+
+int v2_snapshot_ack_ids(v2_state_t *state, int *buf, int max, int *count)
+{
+    if (!state || !buf || !count || max < 0) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&state->mutex);
+
+    int to_copy = state->ack_count;
+    if (to_copy > max) {
+        to_copy = max;
+    }
+    if (to_copy > 0) {
+        memcpy(buf, state->ack_ids, (size_t)to_copy * sizeof(int));
+    }
+    *count = to_copy;
 
     pthread_mutex_unlock(&state->mutex);
     return 0;

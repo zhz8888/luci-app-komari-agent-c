@@ -145,6 +145,12 @@ int v2_add_ack_event(v2_state_t *state, int event_id);
 /**
  * Get the list of pending ACK event IDs.
  *
+ * @deprecated This function returns a pointer to the internal buffer; the
+ *             pointer becomes dangling if another thread calls
+ *             v2_add_ack_event (which may realloc the buffer) or
+ *             v2_clear_acks. Use v2_snapshot_ack_ids instead, which copies
+ *             the data into a caller-provided buffer under the lock.
+ *
  * @param state Pointer to the v2 state.
  * @param ids   Outputs an array pointer pointing to an internal buffer; the
  *              caller must not free it.
@@ -152,6 +158,24 @@ int v2_add_ack_event(v2_state_t *state, int event_id);
  * @return 0 on success, -1 on failure.
  */
 int v2_get_ack_ids(v2_state_t *state, int **ids, int *count);
+
+/**
+ * Snapshot the pending ACK event IDs into a caller-provided buffer.
+ *
+ * Copies up to `max` ACK IDs into `buf` under the state mutex, so the
+ * caller never holds a pointer into internal state. This is safe to call
+ * concurrently with v2_add_ack_event / v2_clear_acks.
+ *
+ * @param state Pointer to the v2 state.
+ * @param buf   Caller-provided buffer that receives the ACK IDs. Must not be
+ *              NULL. If the internal state holds more than `max` IDs, only
+ *              the first `max` are copied.
+ * @param max   Maximum number of IDs that `buf` can hold.
+ * @param count Outputs the number of IDs actually copied (0..max). Must not
+ *              be NULL.
+ * @return 0 on success, -1 on invalid arguments.
+ */
+int v2_snapshot_ack_ids(v2_state_t *state, int *buf, int max, int *count);
 
 /**
  * Clear the list of pending ACK events.

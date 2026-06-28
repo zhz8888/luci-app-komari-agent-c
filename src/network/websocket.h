@@ -21,6 +21,11 @@
 #define WS_PING_INTERVAL 30
 #define WS_KEY_LEN 24
 
+/* Maximum accumulated size for a fragmented WebSocket message (RFC 6455 §5.4).
+ * When the total payload of a fragmented message exceeds this limit, the
+ * connection is closed to prevent unbounded memory growth. */
+#define WS_FRAGMENT_MAX_SIZE (1024 * 1024)
+
 typedef struct {
     char *endpoint;
     char *token;
@@ -64,6 +69,14 @@ struct ws_client {
     void *user_data;
     v2_state_t v2_state;   /* v2 protocol runtime state, used for protocol fallback mechanism */
     int protocol_version;  /* Currently used protocol version (1 or 2) */
+    /* Fragmented message accumulation state (RFC 6455 §5.4).
+     * fragment_buf accumulates continuation frame payloads until a final
+     * frame (FIN=1) is received. Only the recv thread reads/writes these
+     * fields, so no extra locking is required. */
+    char *fragment_buf;
+    size_t fragment_len;
+    size_t fragment_capacity;
+    int fragment_opcode;
 };
 
 /**
@@ -174,5 +187,69 @@ bool ws_client_should_use_v2(ws_client_t *client);
  *                false indicates failure.
  */
 void ws_client_note_protocol_result(ws_client_t *client, bool success);
+
+/* ====== Fragment accumulation (RFC 6455 §5.4) ======
+ * The following helper is an internal function exposed for unit testing.
+ * Application code should not call it directly; it is invoked by the
+ * recv thread to assemble fragmented WebSocket messages. */
+
+/**
+ * Accumulate a WebSocket fragment into the client's fragment buffer.
+ *
+ * Handles RFC 6455 §5.4 message fragmentation. For unfragmented messages
+ * (FIN=1 with a non-continuation opcode), returns the input buffer directly.
+ * For fragmented messages, accumulates payload into the client's fragment_buf
+ * until the final fragment is received.
+ *
+ * @param client     Pointer to the client.
+ * @param opcode     Frame opcode (0x00 continuation, 0x01 text, 0x02 binary).
+ * @param fin        FIN bit (1 = final frame, 0 = more fragments to follow).
+ * @param data       Frame payload buffer (mutable; may be returned via `out`
+ *                   for unfragmented messages).
+ * @param len        Frame payload length.
+ * @param out        On return value 1, points to the complete message
+ *                   (either `data` for unfragmented messages or
+ *                   `client->fragment_buf` for fragmented ones). The caller
+ *                   may safely write a NUL terminator at `out[*out_len]`.
+ * @param out_len    On return value 1, length of the complete message.
+ * @param out_opcode On return value 1, opcode of the complete message
+ *                   (0x01 text or 0x02 binary).
+ * @return 0 = fragment accumulated, waiting for more data;
+ *         1 = message complete (`out`/`out_len`/`out_opcode` set);
+ *        -1 = error (oversize, allocation failure, or protocol error).
+ */
+int ws_fragment_accumulate(ws_client_t *client, int opcode, int fin,
+                           char *data, size_t len,
+                           char **out, size_t *out_len, int *out_opcode);
+
+/* ====== v2 JSON-RPC event handling ======
+ * The following helper is an internal function exposed for unit testing.
+ * Application code should not call it directly; it is invoked by the
+ * recv thread to dispatch v2 JSON-RPC events received from the server. */
+
+/**
+ * Handle a v2 JSON-RPC event message.
+ *
+ * Parses the JSON-RPC 2.0 event, deduplicates by event ID (using the
+ * client's v2 state), dispatches to the registered message handler based
+ * on the method field (agent.exec / agent.ping / agent.terminal.request /
+ * agent.message / agent.event), and accumulates the event ID into the
+ * pending ACK list for the next report cycle.
+ *
+ * Deduplication: if the event ID (string form) has been seen before, the
+ * event is not dispatched to the handler but is still ACKed (so the server
+ * stops retransmitting). Events without an ID are always dispatched.
+ *
+ * ACK accumulation: the event ID is converted to an int (via strtol for
+ * string IDs, or directly for numeric IDs). If the ID is missing, empty,
+ * or non-numeric, ACK accumulation is skipped (the C v2 interface uses
+ * int ACK IDs, matching v2_add_ack_event).
+ *
+ * @param client   Pointer to the WebSocket client.
+ * @param json_str NUL-terminated JSON-RPC event string.
+ * @return 0 on success (event processed or duplicate skipped),
+ *         -1 on parse failure or invalid arguments.
+ */
+int ws_handle_v2_event(ws_client_t *client, const char *json_str);
 
 #endif

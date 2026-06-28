@@ -7,15 +7,21 @@
  *   - ws_message_t JSON 消息解析（验证字段提取逻辑）
  *   - WebSocket 握手验证（Sec-WebSocket-Accept 计算，基于 RFC 6455）
  *   - 掩码计算验证
+ *   - RFC 6455 §5.4 分片消息累积逻辑（ws_fragment_accumulate）
+ *   - v2 JSON-RPC 事件处理（ws_handle_v2_event）：去重、method 分发、ACK 累积
  *
  * 注意：帧解析（ws_recv_frame）、握手（ws_handshake）等内部函数为 static，
  * 无法直接单元测试。实际网络连接不在测试范围内。
  * JSON 消息解析逻辑在 ws_recv_thread 中实现，此处通过复现解析逻辑验证正确性。
+ * 分片累积逻辑（ws_fragment_accumulate）通过头文件公开声明，可直接测试。
+ * v2 事件处理逻辑（ws_handle_v2_event）同样通过头文件公开声明，可直接测试。
  */
 
 #include "unity.h"
 #include "websocket.h"
 #include "cJSON.h"
+#include "v2.h"
+#include "jsonrpc.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -571,6 +577,662 @@ void test_ws_message_struct_size(void) {
     TEST_ASSERT_TRUE(sizeof(ws_message_t) >= 32 + 64 + 1024 + 64 + 4 + 16 + 256);
 }
 
+/* ====== RFC 6455 §5.4 分片消息累积逻辑测试 ====== */
+
+/* 测试 ws_fragment_accumulate：单帧（未分片）文本消息直接返回 */
+void test_ws_fragment_unfragmented_text(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    char data[] = "{\"message\":\"hello\"}";
+    size_t len = strlen(data);
+    char *out = NULL;
+    size_t out_len = 0;
+    int out_opcode = 0;
+
+    /* FIN=1, opcode=0x01 (text): unfragmented message returns immediately */
+    int r = ws_fragment_accumulate(client, 0x01, 1, data, len, &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(1, r);
+    TEST_ASSERT_EQUAL_PTR(data, out);
+    TEST_ASSERT_EQUAL_size_t(len, out_len);
+    TEST_ASSERT_EQUAL_INT(0x01, out_opcode);
+
+    /* No fragment buffer should have been allocated for unfragmented messages */
+    TEST_ASSERT_NULL(client->fragment_buf);
+    TEST_ASSERT_EQUAL_size_t(0, client->fragment_len);
+
+    ws_client_destroy(client);
+}
+
+/* 测试 ws_fragment_accumulate：单帧（未分片）二进制消息直接返回 */
+void test_ws_fragment_unfragmented_binary(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    char data[] = {0x01, 0x02, 0x03, 0x04};
+    size_t len = sizeof(data);
+    char *out = NULL;
+    size_t out_len = 0;
+    int out_opcode = 0;
+
+    /* FIN=1, opcode=0x02 (binary): unfragmented message returns immediately */
+    int r = ws_fragment_accumulate(client, 0x02, 1, data, len, &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(1, r);
+    TEST_ASSERT_EQUAL_PTR(data, out);
+    TEST_ASSERT_EQUAL_size_t(len, out_len);
+    TEST_ASSERT_EQUAL_INT(0x02, out_opcode);
+
+    ws_client_destroy(client);
+}
+
+/* 测试 ws_fragment_accumulate：多分片文本消息累积
+ * 模拟服务端发送 3 个分片：首片 (FIN=0, opcode=0x01)、
+ * 中间片 (FIN=0, opcode=0x00)、末片 (FIN=1, opcode=0x00)
+ */
+void test_ws_fragment_multi_text(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    char part1[] = "{\"message\":\"";
+    char part2[] = "hello ";
+    char part3[] = "world\"}";
+    char expected[64];
+    snprintf(expected, sizeof(expected), "%s%s%s", part1, part2, part3);
+
+    char *out = NULL;
+    size_t out_len = 0;
+    int out_opcode = 0;
+
+    /* First fragment: FIN=0, opcode=0x01 (text) */
+    int r = ws_fragment_accumulate(client, 0x01, 0, part1, strlen(part1),
+                                   &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(0, r);
+    TEST_ASSERT_NOT_NULL(client->fragment_buf);
+    TEST_ASSERT_EQUAL_size_t(strlen(part1), client->fragment_len);
+    TEST_ASSERT_EQUAL_INT(0x01, client->fragment_opcode);
+
+    /* Middle fragment: FIN=0, opcode=0x00 (continuation) */
+    r = ws_fragment_accumulate(client, 0x00, 0, part2, strlen(part2),
+                               &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(0, r);
+    TEST_ASSERT_EQUAL_size_t(strlen(part1) + strlen(part2), client->fragment_len);
+
+    /* Final fragment: FIN=1, opcode=0x00 (continuation) */
+    r = ws_fragment_accumulate(client, 0x00, 1, part3, strlen(part3),
+                               &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(1, r);
+    TEST_ASSERT_EQUAL_PTR(client->fragment_buf, out);
+    TEST_ASSERT_EQUAL_size_t(strlen(expected), out_len);
+    TEST_ASSERT_EQUAL_INT(0x01, out_opcode);
+    /* Verify accumulated content matches the complete message */
+    TEST_ASSERT_EQUAL_MEMORY(expected, out, out_len);
+
+    /* After completion, fragment_len should be reset to 0 (buffer reused) */
+    TEST_ASSERT_EQUAL_size_t(0, client->fragment_len);
+
+    ws_client_destroy(client);
+}
+
+/* 测试 ws_fragment_accumulate：多分片二进制消息累积 */
+void test_ws_fragment_multi_binary(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    unsigned char part1[] = {0x00, 0x01, 0x02};
+    unsigned char part2[] = {0x03, 0x04};
+    unsigned char part3[] = {0x05};
+    unsigned char expected[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05};
+
+    char *out = NULL;
+    size_t out_len = 0;
+    int out_opcode = 0;
+
+    /* First fragment: FIN=0, opcode=0x02 (binary) */
+    int r = ws_fragment_accumulate(client, 0x02, 0, (char *)part1, sizeof(part1),
+                                   &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(0, r);
+    TEST_ASSERT_EQUAL_INT(0x02, client->fragment_opcode);
+
+    /* Middle fragment */
+    r = ws_fragment_accumulate(client, 0x00, 0, (char *)part2, sizeof(part2),
+                               &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(0, r);
+
+    /* Final fragment */
+    r = ws_fragment_accumulate(client, 0x00, 1, (char *)part3, sizeof(part3),
+                               &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(1, r);
+    TEST_ASSERT_EQUAL_size_t(sizeof(expected), out_len);
+    TEST_ASSERT_EQUAL_INT(0x02, out_opcode);
+    TEST_ASSERT_EQUAL_MEMORY(expected, out, out_len);
+
+    ws_client_destroy(client);
+}
+
+/* 测试 ws_fragment_accumulate：分片累积超过 WS_FRAGMENT_MAX_SIZE 时返回错误 */
+void test_ws_fragment_oversize(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    /* Use a 64KB chunk (matches WS_MAX_MESSAGE_SIZE, the largest single frame
+     * the recv thread can deliver). Reuse the same buffer for every fragment. */
+    size_t chunk = 65536;
+    char *data = (char *)malloc(chunk);
+    TEST_ASSERT_NOT_NULL(data);
+    memset(data, 'A', chunk);
+
+    char *out = NULL;
+    size_t out_len = 0;
+    int out_opcode = 0;
+
+    /* Start a new fragment with FIN=0, opcode=0x01 */
+    int r = ws_fragment_accumulate(client, 0x01, 0, data, chunk, &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(0, r);
+
+    /* Keep appending continuation frames until we exceed WS_FRAGMENT_MAX_SIZE.
+     * WS_FRAGMENT_MAX_SIZE (1MB) / 64KB = 16 chunks; the 17th chunk pushes the
+     * total to 17*64KB = 1.0625 MB > 1 MB, which must be rejected. */
+    int saw_error = 0;
+    for (int i = 0; i < 20; i++) {
+        r = ws_fragment_accumulate(client, 0x00, 0, data, chunk,
+                                   &out, &out_len, &out_opcode);
+        if (r < 0) {
+            saw_error = 1;
+            break;
+        }
+    }
+    TEST_ASSERT_TRUE(saw_error);
+
+    free(data);
+    ws_client_destroy(client);
+}
+
+/* 测试 ws_fragment_accumulate：无起始分片时收到 continuation 帧返回错误 */
+void test_ws_fragment_continuation_without_start(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    char data[] = "orphan";
+    char *out = NULL;
+    size_t out_len = 0;
+    int out_opcode = 0;
+
+    /* Continuation frame without a preceding first fragment: protocol error */
+    int r = ws_fragment_accumulate(client, 0x00, 1, data, strlen(data),
+                                   &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(-1, r);
+
+    ws_client_destroy(client);
+}
+
+/* 测试 ws_fragment_accumulate：分片进行中收到新的非 continuation 帧返回错误 */
+void test_ws_fragment_new_opcode_during_fragment(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    char part1[] = "start ";
+    char part2[] = "interrupt";
+    char *out = NULL;
+    size_t out_len = 0;
+    int out_opcode = 0;
+
+    /* Start a fragment */
+    int r = ws_fragment_accumulate(client, 0x01, 0, part1, strlen(part1),
+                                   &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(0, r);
+
+    /* Receive a new text frame (FIN=1, opcode=0x01) while fragment in progress:
+     * RFC 6455 §5.4 forbids this; the accumulator must report a protocol error. */
+    r = ws_fragment_accumulate(client, 0x01, 1, part2, strlen(part2),
+                               &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(-1, r);
+
+    ws_client_destroy(client);
+}
+
+/* 测试 ws_fragment_accumulate：完成一条分片消息后可立即开始下一条（缓冲区复用） */
+void test_ws_fragment_reset_after_complete(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    char *out = NULL;
+    size_t out_len = 0;
+    int out_opcode = 0;
+
+    /* First message: 2-fragment text */
+    char part1[] = "hello ";
+    char part2[] = "world";
+    int r = ws_fragment_accumulate(client, 0x01, 0, part1, strlen(part1),
+                                   &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(0, r);
+    r = ws_fragment_accumulate(client, 0x00, 1, part2, strlen(part2),
+                               &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(1, r);
+    TEST_ASSERT_EQUAL_size_t(11, out_len);
+    TEST_ASSERT_EQUAL_INT(0x01, out_opcode);
+
+    /* Second message: unfragmented text after a completed fragmented message */
+    char msg2[] = "{\"ok\":true}";
+    r = ws_fragment_accumulate(client, 0x01, 1, msg2, strlen(msg2),
+                               &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(1, r);
+    TEST_ASSERT_EQUAL_PTR(msg2, out);
+    TEST_ASSERT_EQUAL_size_t(strlen(msg2), out_len);
+
+    /* Third message: another fragmented text, verifying buffer reuse */
+    char part3[] = "second ";
+    char part4[] = "message";
+    r = ws_fragment_accumulate(client, 0x01, 0, part3, strlen(part3),
+                               &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(0, r);
+    r = ws_fragment_accumulate(client, 0x00, 1, part4, strlen(part4),
+                               &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(1, r);
+    TEST_ASSERT_EQUAL_size_t(strlen(part3) + strlen(part4), out_len);
+    TEST_ASSERT_EQUAL_INT(0x01, out_opcode);
+
+    char expected[] = "second message";
+    TEST_ASSERT_EQUAL_MEMORY(expected, out, out_len);
+
+    ws_client_destroy(client);
+}
+
+/* 测试 ws_fragment_accumulate：空分片（零长度 payload）正确累积 */
+void test_ws_fragment_empty_payloads(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    char *out = NULL;
+    size_t out_len = 0;
+    int out_opcode = 0;
+    char empty[] = "";
+    char tail[] = "X";
+
+    /* First fragment with empty payload */
+    int r = ws_fragment_accumulate(client, 0x01, 0, empty, 0, &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(0, r);
+    TEST_ASSERT_EQUAL_size_t(0, client->fragment_len);
+
+    /* Middle fragment with empty payload */
+    r = ws_fragment_accumulate(client, 0x00, 0, empty, 0, &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(0, r);
+    TEST_ASSERT_EQUAL_size_t(0, client->fragment_len);
+
+    /* Final fragment with one byte */
+    r = ws_fragment_accumulate(client, 0x00, 1, tail, 1, &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(1, r);
+    TEST_ASSERT_EQUAL_size_t(1, out_len);
+    TEST_ASSERT_EQUAL_INT(0x01, out_opcode);
+    TEST_ASSERT_EQUAL_UINT8('X', (unsigned char)out[0]);
+
+    ws_client_destroy(client);
+}
+
+/* 测试 ws_fragment_accumulate：NULL 参数返回错误 */
+void test_ws_fragment_null_args(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    char data[] = "x";
+    char *out = NULL;
+    size_t out_len = 0;
+    int out_opcode = 0;
+
+    TEST_ASSERT_EQUAL_INT(-1, ws_fragment_accumulate(NULL, 0x01, 1, data, 1, &out, &out_len, &out_opcode));
+    TEST_ASSERT_EQUAL_INT(-1, ws_fragment_accumulate(client, 0x01, 1, NULL, 1, &out, &out_len, &out_opcode));
+    TEST_ASSERT_EQUAL_INT(-1, ws_fragment_accumulate(client, 0x01, 1, data, 1, NULL, &out_len, &out_opcode));
+    TEST_ASSERT_EQUAL_INT(-1, ws_fragment_accumulate(client, 0x01, 1, data, 1, &out, NULL, &out_opcode));
+    TEST_ASSERT_EQUAL_INT(-1, ws_fragment_accumulate(client, 0x01, 1, data, 1, &out, &out_len, NULL));
+
+    ws_client_destroy(client);
+}
+
+/* 测试 ws_fragment_accumulate：单分片二进制消息（首片即为末片，FIN=0+1 不可能）。
+ * 此测试验证 FIN=0 + opcode=0x00（continuation 但 fin=0）在无前序分片时返回错误 */
+void test_ws_fragment_invalid_continuation_fin0(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    char data[] = "x";
+    char *out = NULL;
+    size_t out_len = 0;
+    int out_opcode = 0;
+
+    /* FIN=0, opcode=0x00 without prior start: protocol error */
+    int r = ws_fragment_accumulate(client, 0x00, 0, data, 1, &out, &out_len, &out_opcode);
+    TEST_ASSERT_EQUAL_INT(-1, r);
+
+    ws_client_destroy(client);
+}
+
+/* ====== v2 JSON-RPC event handling tests (ws_handle_v2_event) ====== */
+
+/* Test handler: records the last received message and a call counter so tests
+ * can verify that ws_handle_v2_event dispatched to the handler with the right
+ * fields. The handler intentionally does not depend on global state beyond
+ * these static variables; each test resets them before use. */
+static ws_message_t g_v2_last_msg;
+static int g_v2_handler_calls = 0;
+
+static void test_v2_message_handler(ws_client_t *client, const ws_message_t *msg) {
+    (void)client;
+    g_v2_last_msg = *msg;
+    g_v2_handler_calls++;
+}
+
+static void reset_v2_handler_state(void) {
+    memset(&g_v2_last_msg, 0, sizeof(g_v2_last_msg));
+    g_v2_handler_calls = 0;
+}
+
+/* Test ws_handle_v2_event with NULL arguments returns -1. */
+void test_ws_handle_v2_event_null_args(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    TEST_ASSERT_EQUAL_INT(-1, ws_handle_v2_event(NULL, "{}"));
+    TEST_ASSERT_EQUAL_INT(-1, ws_handle_v2_event(client, NULL));
+
+    ws_client_destroy(client);
+}
+
+/* Test ws_handle_v2_event with invalid JSON returns -1. */
+void test_ws_handle_v2_event_invalid_json(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+
+    TEST_ASSERT_EQUAL_INT(-1, ws_handle_v2_event(client, "not json"));
+
+    ws_client_destroy(client);
+}
+
+/* Test agent.exec dispatch: handler receives msg.message="exec" with
+ * exec_command and exec_task_id extracted from params. */
+void test_ws_handle_v2_event_dispatch_exec(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+    ws_client_set_handler(client, test_v2_message_handler);
+    reset_v2_handler_state();
+
+    const char *event_json =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"42\","
+        "\"method\":\"agent.exec\","
+        "\"params\":{\"task_id\":\"task-001\",\"command\":\"uname -a\"}}";
+
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+
+    /* Handler must have been called once with exec fields populated */
+    TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);
+    TEST_ASSERT_EQUAL_STRING("exec", g_v2_last_msg.message);
+    TEST_ASSERT_EQUAL_STRING("task-001", g_v2_last_msg.exec_task_id);
+    TEST_ASSERT_EQUAL_STRING("uname -a", g_v2_last_msg.exec_command);
+
+    /* ACK must be accumulated (id="42" -> ack_id=42) */
+    TEST_ASSERT_EQUAL_INT(1, client->v2_state.ack_count);
+    TEST_ASSERT_EQUAL_INT(42, client->v2_state.ack_ids[0]);
+
+    ws_client_destroy(client);
+}
+
+/* Test agent.ping dispatch: handler receives msg.message="ping" with ping
+ * fields extracted from params. */
+void test_ws_handle_v2_event_dispatch_ping(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+    ws_client_set_handler(client, test_v2_message_handler);
+    reset_v2_handler_state();
+
+    const char *event_json =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"100\","
+        "\"method\":\"agent.ping\","
+        "\"params\":{\"ping_task_id\":99,\"ping_type\":\"icmp\","
+        "\"ping_target\":\"8.8.8.8\"}}";
+
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+
+    TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);
+    TEST_ASSERT_EQUAL_STRING("ping", g_v2_last_msg.message);
+    TEST_ASSERT_EQUAL_UINT32(99, g_v2_last_msg.ping_task_id);
+    TEST_ASSERT_EQUAL_STRING("icmp", g_v2_last_msg.ping_type);
+    TEST_ASSERT_EQUAL_STRING("8.8.8.8", g_v2_last_msg.ping_target);
+
+    /* ACK accumulated with id=100 */
+    TEST_ASSERT_EQUAL_INT(1, client->v2_state.ack_count);
+    TEST_ASSERT_EQUAL_INT(100, client->v2_state.ack_ids[0]);
+
+    ws_client_destroy(client);
+}
+
+/* Test agent.terminal.request dispatch: handler receives msg with terminal_id
+ * populated from params.request_id. */
+void test_ws_handle_v2_event_dispatch_terminal(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+    ws_client_set_handler(client, test_v2_message_handler);
+    reset_v2_handler_state();
+
+    const char *event_json =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"7\","
+        "\"method\":\"agent.terminal.request\","
+        "\"params\":{\"request_id\":\"term-abc-123\"}}";
+
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+
+    TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);
+    TEST_ASSERT_EQUAL_STRING("term-abc-123", g_v2_last_msg.terminal_id);
+
+    /* ACK accumulated with id=7 */
+    TEST_ASSERT_EQUAL_INT(1, client->v2_state.ack_count);
+    TEST_ASSERT_EQUAL_INT(7, client->v2_state.ack_ids[0]);
+
+    ws_client_destroy(client);
+}
+
+/* Test agent.message and agent.event: handler is NOT called (informational
+ * only) but ACK is still accumulated. */
+void test_ws_handle_v2_event_dispatch_message_event(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+    ws_client_set_handler(client, test_v2_message_handler);
+    reset_v2_handler_state();
+
+    /* agent.message */
+    const char *msg_json =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"55\","
+        "\"method\":\"agent.message\","
+        "\"params\":{\"text\":\"hello\"}}";
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, msg_json));
+    TEST_ASSERT_EQUAL_INT(0, g_v2_handler_calls);
+    TEST_ASSERT_EQUAL_INT(1, client->v2_state.ack_count);
+    TEST_ASSERT_EQUAL_INT(55, client->v2_state.ack_ids[0]);
+
+    /* agent.event */
+    const char *evt_json =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"56\","
+        "\"method\":\"agent.event\","
+        "\"params\":{\"type\":\"custom\"}}";
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, evt_json));
+    TEST_ASSERT_EQUAL_INT(0, g_v2_handler_calls);
+    TEST_ASSERT_EQUAL_INT(2, client->v2_state.ack_count);
+    TEST_ASSERT_EQUAL_INT(56, client->v2_state.ack_ids[1]);
+
+    ws_client_destroy(client);
+}
+
+/* Test unknown method: handler is NOT called and no ACK is accumulated. */
+void test_ws_handle_v2_event_unknown_method(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+    ws_client_set_handler(client, test_v2_message_handler);
+    reset_v2_handler_state();
+
+    const char *event_json =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"99\","
+        "\"method\":\"agent.unknown\","
+        "\"params\":{}}";
+
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, g_v2_handler_calls);
+    /* Unknown method: not processed, no ACK */
+    TEST_ASSERT_EQUAL_INT(0, client->v2_state.ack_count);
+
+    ws_client_destroy(client);
+}
+
+/* Test event deduplication: the same event ID is processed only once.
+ * The second call must skip handler dispatch but still accumulate ACK. */
+void test_ws_handle_v2_event_dedup(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+    ws_client_set_handler(client, test_v2_message_handler);
+    reset_v2_handler_state();
+
+    const char *event_json =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"200\","
+        "\"method\":\"agent.exec\","
+        "\"params\":{\"task_id\":\"t1\",\"command\":\"echo hi\"}}";
+
+    /* First call: dispatched + ACKed */
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);
+    TEST_ASSERT_EQUAL_INT(1, client->v2_state.ack_count);
+    TEST_ASSERT_EQUAL_INT(200, client->v2_state.ack_ids[0]);
+
+    /* Second call with the same id: dedup skips dispatch but still ACKs */
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);  /* still 1, not 2 */
+    TEST_ASSERT_EQUAL_INT(2, client->v2_state.ack_count);
+    TEST_ASSERT_EQUAL_INT(200, client->v2_state.ack_ids[1]);
+
+    ws_client_destroy(client);
+}
+
+/* Test ACK accumulation with numeric event ID (JSON number, not string).
+ * jsonrpc_parse_event only captures string IDs, so ws_handle_v2_event falls
+ * back to re-parsing the JSON for numeric IDs. */
+void test_ws_handle_v2_event_numeric_id_ack(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+    ws_client_set_handler(client, test_v2_message_handler);
+    reset_v2_handler_state();
+
+    /* id is a JSON number (333), not a string */
+    const char *event_json =
+        "{\"jsonrpc\":\"2.0\",\"id\":333,"
+        "\"method\":\"agent.exec\","
+        "\"params\":{\"task_id\":\"t2\",\"command\":\"echo num\"}}";
+
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);
+    TEST_ASSERT_EQUAL_STRING("t2", g_v2_last_msg.exec_task_id);
+
+    /* ACK accumulated with numeric id=333 */
+    TEST_ASSERT_EQUAL_INT(1, client->v2_state.ack_count);
+    TEST_ASSERT_EQUAL_INT(333, client->v2_state.ack_ids[0]);
+
+    /* Dedup also works for numeric IDs (string form "333") */
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);  /* deduped */
+    TEST_ASSERT_EQUAL_INT(2, client->v2_state.ack_count);
+
+    ws_client_destroy(client);
+}
+
+/* Test that non-numeric string IDs are deduplicated but not ACKed (the C v2
+ * interface uses int ACK IDs, so non-numeric strings cannot be ACKed). */
+void test_ws_handle_v2_event_non_numeric_id_no_ack(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+    ws_client_set_handler(client, test_v2_message_handler);
+    reset_v2_handler_state();
+
+    const char *event_json =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"uuid-abc-123\","
+        "\"method\":\"agent.message\","
+        "\"params\":{}}";
+
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    /* agent.message: processed=true (logged), but ID is non-numeric -> no ACK */
+    TEST_ASSERT_EQUAL_INT(0, client->v2_state.ack_count);
+
+    /* Dedup still works for non-numeric IDs */
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, client->v2_state.ack_count);
+
+    ws_client_destroy(client);
+}
+
+/* Test event without an ID: always dispatched, never deduped, never ACKed. */
+void test_ws_handle_v2_event_no_id(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+    ws_client_set_handler(client, test_v2_message_handler);
+    reset_v2_handler_state();
+
+    const char *event_json =
+        "{\"jsonrpc\":\"2.0\","
+        "\"method\":\"agent.exec\","
+        "\"params\":{\"task_id\":\"t3\",\"command\":\"echo noid\"}}";
+
+    /* First call: dispatched, no ACK (no id) */
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);
+    TEST_ASSERT_EQUAL_INT(0, client->v2_state.ack_count);
+
+    /* Second call: also dispatched (no dedup without id), still no ACK */
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(2, g_v2_handler_calls);
+    TEST_ASSERT_EQUAL_INT(0, client->v2_state.ack_count);
+
+    ws_client_destroy(client);
+}
+
+/* Test ACK snapshot + clear integration with ws_handle_v2_event:
+ * process several events, snapshot the ACK IDs, then clear and verify. */
+void test_ws_handle_v2_event_ack_snapshot_clear(void) {
+    ws_client_t *client = ws_client_create(NULL);
+    TEST_ASSERT_NOT_NULL(client);
+    ws_client_set_handler(client, test_v2_message_handler);
+    reset_v2_handler_state();
+
+    /* Process three events with IDs 10, 20, 30 */
+    const char *events[] = {
+        "{\"jsonrpc\":\"2.0\",\"id\":\"10\",\"method\":\"agent.message\",\"params\":{}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":\"20\",\"method\":\"agent.message\",\"params\":{}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":\"30\",\"method\":\"agent.message\",\"params\":{}}"
+    };
+
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, events[i]));
+    }
+    TEST_ASSERT_EQUAL_INT(3, client->v2_state.ack_count);
+
+    /* Snapshot the ACK IDs into a local buffer */
+    int snap[16];
+    int snap_count = 0;
+    TEST_ASSERT_EQUAL_INT(0, v2_snapshot_ack_ids(&client->v2_state,
+                                                  snap, 16, &snap_count));
+    TEST_ASSERT_EQUAL_INT(3, snap_count);
+    TEST_ASSERT_EQUAL_INT(10, snap[0]);
+    TEST_ASSERT_EQUAL_INT(20, snap[1]);
+    TEST_ASSERT_EQUAL_INT(30, snap[2]);
+
+    /* Internal state still holds all 3 ACKs */
+    TEST_ASSERT_EQUAL_INT(3, client->v2_state.ack_count);
+
+    /* Clear all ACKs */
+    v2_clear_acks(&client->v2_state);
+    TEST_ASSERT_EQUAL_INT(0, client->v2_state.ack_count);
+
+    /* Snapshot after clear returns 0 items */
+    snap_count = -1;
+    TEST_ASSERT_EQUAL_INT(0, v2_snapshot_ack_ids(&client->v2_state,
+                                                  snap, 16, &snap_count));
+    TEST_ASSERT_EQUAL_INT(0, snap_count);
+
+    ws_client_destroy(client);
+}
+
 int main(void) {
     UNITY_BEGIN();
 
@@ -613,6 +1275,33 @@ int main(void) {
     RUN_TEST(test_ws_message_parse_full_message);
     RUN_TEST(test_ws_message_parse_invalid_json);
     RUN_TEST(test_ws_message_struct_size);
+
+    /* RFC 6455 §5.4 分片消息累积测试 */
+    RUN_TEST(test_ws_fragment_unfragmented_text);
+    RUN_TEST(test_ws_fragment_unfragmented_binary);
+    RUN_TEST(test_ws_fragment_multi_text);
+    RUN_TEST(test_ws_fragment_multi_binary);
+    RUN_TEST(test_ws_fragment_oversize);
+    RUN_TEST(test_ws_fragment_continuation_without_start);
+    RUN_TEST(test_ws_fragment_new_opcode_during_fragment);
+    RUN_TEST(test_ws_fragment_reset_after_complete);
+    RUN_TEST(test_ws_fragment_empty_payloads);
+    RUN_TEST(test_ws_fragment_null_args);
+    RUN_TEST(test_ws_fragment_invalid_continuation_fin0);
+
+    /* v2 JSON-RPC event handling tests */
+    RUN_TEST(test_ws_handle_v2_event_null_args);
+    RUN_TEST(test_ws_handle_v2_event_invalid_json);
+    RUN_TEST(test_ws_handle_v2_event_dispatch_exec);
+    RUN_TEST(test_ws_handle_v2_event_dispatch_ping);
+    RUN_TEST(test_ws_handle_v2_event_dispatch_terminal);
+    RUN_TEST(test_ws_handle_v2_event_dispatch_message_event);
+    RUN_TEST(test_ws_handle_v2_event_unknown_method);
+    RUN_TEST(test_ws_handle_v2_event_dedup);
+    RUN_TEST(test_ws_handle_v2_event_numeric_id_ack);
+    RUN_TEST(test_ws_handle_v2_event_non_numeric_id_no_ack);
+    RUN_TEST(test_ws_handle_v2_event_no_id);
+    RUN_TEST(test_ws_handle_v2_event_ack_snapshot_clear);
 
     return UNITY_END();
 }
