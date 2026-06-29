@@ -35,6 +35,36 @@
 
 #define TERMINAL_BUFFER_SIZE 4096
 
+/* Active terminal session counter and its protecting mutex. The mutex is
+ * statically initialised so no explicit init call is required at startup. */
+static volatile int active_sessions = 0;
+static pthread_mutex_t sessions_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+int terminal_acquire_session(void) {
+    pthread_mutex_lock(&sessions_mutex);
+    if (active_sessions >= MAX_TERMINAL_SESSIONS) {
+        pthread_mutex_unlock(&sessions_mutex);
+        KOMARI_LOG_WARN("Terminal session limit reached (%d), rejecting new session",
+                        MAX_TERMINAL_SESSIONS);
+        return -1;
+    }
+    active_sessions++;
+    int count = active_sessions;
+    pthread_mutex_unlock(&sessions_mutex);
+    KOMARI_LOG_DEBUG("Terminal session acquired (%d/%d active)", count, MAX_TERMINAL_SESSIONS);
+    return 0;
+}
+
+void terminal_release_session(void) {
+    pthread_mutex_lock(&sessions_mutex);
+    if (active_sessions > 0) {
+        active_sessions--;
+    }
+    int count = active_sessions;
+    pthread_mutex_unlock(&sessions_mutex);
+    KOMARI_LOG_DEBUG("Terminal session released (%d/%d active)", count, MAX_TERMINAL_SESSIONS);
+}
+
 /* Terminal read thread function */
 static void *terminal_read_thread(void *arg) {
     terminal_t *term = (terminal_t *)arg;
@@ -289,9 +319,17 @@ void terminal_terminate(terminal_t *term) {
     }
 }
 
-void terminal_destroy(terminal_t *term) {
-    if (!term) return;
-    
-    terminal_terminate(term);
-    free(term);
+void terminal_destroy(terminal_t **term) {
+    if (!term || !*term) return;
+
+    /* NULL the caller's pointer BEFORE freeing the underlying memory so that
+     * other threads polling the pointer cannot observe a freed address. The
+     * local copy is used for the actual teardown. This mirrors the Go
+     * ws.SafeConn.Close pattern of signalling (NULLing) first, then cleaning
+     * up resources. */
+    terminal_t *t = *term;
+    *term = NULL;
+
+    terminal_terminate(t);
+    free(t);
 }

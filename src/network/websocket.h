@@ -26,6 +26,14 @@
  * connection is closed to prevent unbounded memory growth. */
 #define WS_FRAGMENT_MAX_SIZE (1024 * 1024)
 
+/* Size of the buffer used to hold bytes read past the HTTP handshake response
+ * (MAJ-24). The server may send the first WebSocket frame immediately after
+ * the 101 Switching Protocols response; those bytes are read into the same
+ * buffer as the headers during ws_handshake and must be preserved for the
+ * recv thread to consume via read_full. Matches the 2048-byte handshake
+ * response buffer so no data is ever lost. */
+#define WS_PENDING_BUF_SIZE 2048
+
 typedef struct {
     char *endpoint;
     char *token;
@@ -77,6 +85,17 @@ struct ws_client {
     size_t fragment_len;
     size_t fragment_capacity;
     int fragment_opcode;
+
+    /* Bytes read past the HTTP handshake response (MAJ-24). The server may
+     * start sending WebSocket frames immediately after the 101 Switching
+     * Protocols response; ws_handshake reads them into the same buffer as
+     * the headers and stores any overflow here so the recv thread can
+     * consume them via read_full before issuing recv()/SSL_read().
+     * pending_off tracks the next byte to consume; pending_len is the total
+     * bytes stored. Only the recv thread touches these after ws_handshake. */
+    unsigned char pending_buf[WS_PENDING_BUF_SIZE];
+    size_t pending_len;
+    size_t pending_off;
 };
 
 /**

@@ -15,6 +15,7 @@
 
 #include "netstatic.h"
 #include "utils.h"
+#include "logger.h"
 #include "cJSON.h"
 
 /* Collect per-interface traffic deltas from /proc/net/dev for tracked interfaces. */
@@ -142,6 +143,8 @@ netstatic_t *netstatic_create(const char *save_path) {
     
     if (save_path) {
         strncpy(ns->save_path, save_path, sizeof(ns->save_path) - 1);
+        /* Explicit NUL termination in case save_path fills the buffer. */
+        ns->save_path[sizeof(ns->save_path) - 1] = '\0';
     } else {
         strcpy(ns->save_path, "/tmp/komari-netstatic.json");
     }
@@ -194,43 +197,58 @@ void netstatic_stop(netstatic_t *ns) {
 
 int netstatic_add_interface(netstatic_t *ns, const char *name) {
     if (!ns || !name || ns->interface_count >= NETSTATIC_MAX_INTERFACES) return -1;
-    
+
+    /* Hold the mutex while mutating the shared interface list so the
+       worker thread cannot observe a half-initialized entry (MIN-16). */
+    pthread_mutex_lock(&ns->mutex);
+
     for (size_t i = 0; i < ns->interface_count; i++) {
         if (strcmp(ns->interfaces[i].name, name) == 0) {
+            pthread_mutex_unlock(&ns->mutex);
             return 0;
         }
     }
-    
+
     interface_stats_t *is = &ns->interfaces[ns->interface_count];
     memset(is, 0, sizeof(interface_stats_t));
     strncpy(is->name, name, NETSTATIC_MAX_NAME_LEN - 1);
+    /* Explicit NUL termination in case the interface name fills the buffer. */
+    is->name[NETSTATIC_MAX_NAME_LEN - 1] = '\0';
     is->data_capacity = 1024;
     is->data = calloc(is->data_capacity, sizeof(traffic_data_t));
     if (!is->data) {
+        pthread_mutex_unlock(&ns->mutex);
         fprintf(stderr, "Error: Failed to allocate memory for interface stats\n");
         return -1;
     }
-    
+
     ns->interface_count++;
+    pthread_mutex_unlock(&ns->mutex);
     return 0;
 }
 
 int netstatic_remove_interface(netstatic_t *ns, const char *name) {
     if (!ns || !name) return -1;
-    
+
+    /* Hold the mutex while removing from the shared interface list so
+       the worker thread cannot dereference a freed data pointer (MIN-16). */
+    pthread_mutex_lock(&ns->mutex);
+
     for (size_t i = 0; i < ns->interface_count; i++) {
         if (strcmp(ns->interfaces[i].name, name) == 0) {
             free(ns->interfaces[i].data);
-            
+
             for (size_t j = i; j < ns->interface_count - 1; j++) {
                 ns->interfaces[j] = ns->interfaces[j + 1];
             }
-            
+
             ns->interface_count--;
+            pthread_mutex_unlock(&ns->mutex);
             return 0;
         }
     }
-    
+
+    pthread_mutex_unlock(&ns->mutex);
     return -1;
 }
 
@@ -255,10 +273,21 @@ int netstatic_get_monthly_traffic(netstatic_t *ns, const char *iface,
             for (size_t j = 0; j < is->data_count; j++) {
                 time_t t = (time_t)is->data[j].timestamp;
                 struct tm *tm_data = localtime(&t);
-                
+
                 if (tm_data->tm_mon == current_month && tm_data->tm_year == current_year) {
-                    *tx += is->data[j].tx;
-                    *rx += is->data[j].rx;
+                    /* Guard against uint64_t accumulation overflow so a
+                       long-running counter cannot wrap back to a small
+                       value (MIN-19). Clamp at UINT64_MAX instead. */
+                    if (is->data[j].tx > UINT64_MAX - *tx) {
+                        *tx = UINT64_MAX;
+                    } else {
+                        *tx += is->data[j].tx;
+                    }
+                    if (is->data[j].rx > UINT64_MAX - *rx) {
+                        *rx = UINT64_MAX;
+                    } else {
+                        *rx += is->data[j].rx;
+                    }
                 }
             }
             
@@ -309,10 +338,10 @@ int netstatic_save(netstatic_t *ns) {
         free(escaped_name);
 
         for (size_t j = 0; j < is->data_count; j++) {
-            if (fprintf(fp, "      {\"timestamp\": %lu, \"tx\": %lu, \"rx\": %lu}%s\n",
-                        (unsigned long)is->data[j].timestamp,
-                        (unsigned long)is->data[j].tx,
-                        (unsigned long)is->data[j].rx,
+            if (fprintf(fp, "      {\"timestamp\": %" PRIu64 ", \"tx\": %" PRIu64 ", \"rx\": %" PRIu64 "}%s\n",
+                        is->data[j].timestamp,
+                        is->data[j].tx,
+                        is->data[j].rx,
                         (j < is->data_count - 1) ? "," : "") < 0) {
                 rc = -1;
                 goto done;
@@ -378,6 +407,28 @@ int netstatic_load(netstatic_t *ns) {
         if ((item = cJSON_GetObjectItem(config, "save_interval")) && cJSON_IsNumber(item)) {
             ns->save_interval = item->valuedouble;
         }
+    }
+
+    /* MAJ-22 / T12.3: validate parsed config values. A non-positive
+     * detect_interval would make the worker loop spin as fast as possible
+     * (useconds_t cast of 0 yields no sleep), and a non-positive
+     * data_preserve_days would purge all historical samples immediately.
+     * Fall back to the defaults set by netstatic_create() and log the
+     * problem so the operator can fix the persisted file. */
+    if (ns->data_preserve_days <= 0) {
+        KOMARI_LOG_ERROR("netstatic: data_preserve_days (%.2f) must be > 0, using default 31.0",
+                         ns->data_preserve_days);
+        ns->data_preserve_days = 31.0;
+    }
+    if (ns->detect_interval <= 0) {
+        KOMARI_LOG_ERROR("netstatic: detect_interval (%.2f) must be > 0, using default 2.0",
+                         ns->detect_interval);
+        ns->detect_interval = 2.0;
+    }
+    if (ns->save_interval <= 0) {
+        KOMARI_LOG_ERROR("netstatic: save_interval (%.2f) must be > 0, using default 600.0",
+                         ns->save_interval);
+        ns->save_interval = 600.0;
     }
 
     /* Parse interfaces section: each key is an interface name mapped to an array of records */

@@ -99,6 +99,56 @@ cmake -B build && cmake --build build
 2. 使用 `cppcheck` 进行静态代码分析
 3. 使用 WSL（Windows Subsystem for Linux）或 GitHub Actions 进行完整构建验证
 
+### Windows 开发环境说明
+
+#### 系统要求
+
+- Windows 10 版本 2004 或更高版本（内部版本 19041 或更高）
+- WSL 2（Windows Subsystem for Linux）
+- Linux 发行版（推荐 Ubuntu 20.04 LTS 或更高版本）
+
+#### WSL 环境检查
+
+**强制要求**：在 Windows 环境下进行任何编译或测试操作前，必须首先检查 WSL 是否已正确安装并配置。
+
+检查步骤：
+1. 运行 `wsl --list --verbose` 验证 WSL 已安装且为版本 2
+2. 确认至少有一个 Linux 发行版已安装并可用
+3. 验证 Linux 发行版状态为 "Running" 或 "Stopped"（非 "Installing" 或 "Uninstalling"）
+
+#### 构建流程说明
+
+**重要**：在 Windows 操作系统环境中进行开发时，必须使用 WSL（Windows Subsystem for Linux）对项目进行编译和测试。若检测到 WSL 未安装或未正确配置，必须立即终止所有正在进行的编译和测试流程，且不执行任何回退操作。
+
+具体要求：
+- 所有编译和测试命令必须在 WSL 环境中执行
+- 不允许在 Windows 原生环境下执行任何构建或测试操作
+- 若 WSL 环境检查失败，立即停止所有操作，不提供替代方案
+
+WSL 环境下的标准构建流程：
+
+```bash
+# 在 WSL 中执行（假设项目路径已挂载到 /mnt/ 下）
+cd /mnt/对应路径/luci-app-komari-agent-c
+
+# 安装依赖（Ubuntu/Debian）
+sudo apt update && sudo apt install -y cmake build-essential libssl-dev zlib1g-dev cppcheck
+
+# 配置并构建
+cmake -B build && cmake --build build
+
+# 运行测试
+cmake -B build -DBUILD_TESTING=ON && cmake --build build && ctest --test-dir build --output-on-failure
+```
+
+#### Windows 上的推荐工作流
+
+1. 安装并配置 WSL 2（参考 [官方文档](https://docs.microsoft.com/zh-cn/windows/wsl/install)）
+2. 在 WSL 中安装 Linux 发行版（推荐 Ubuntu 20.04 LTS 或更高版本）
+3. 在 WSL 中安装必要的开发工具和依赖
+4. 在 WSL 环境中执行所有编译和测试操作
+5. 使用 GitHub Actions 进行跨平台构建验证
+
 ## 版本历史
 
 ### 版本记录规范

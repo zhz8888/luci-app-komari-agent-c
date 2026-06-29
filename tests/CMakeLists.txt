@@ -29,11 +29,12 @@ endif()
 # ====== Test target definitions ======
 
 # Test target: test_utils
-# Links ../src/utils/utils.c and ../src/vendor/cJSON.c
+# Links ../src/utils/utils.c, ../src/utils/logger.c and ../src/vendor/cJSON.c
 add_executable(test_utils
     ${UNITY_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/test_utils.c"
     "${CMAKE_SOURCE_DIR}/src/utils/utils.c"
+    "${CMAKE_SOURCE_DIR}/src/utils/logger.c"
     "${CMAKE_SOURCE_DIR}/src/vendor/cJSON.c"
 )
 
@@ -52,13 +53,14 @@ target_compile_options(test_utils PRIVATE ${KOMARI_TEST_C_FLAGS_LIST})
 add_test(NAME test_utils COMMAND test_utils)
 
 # ====== Test target: test_config ======
-# Links config.c, cJSON.c, utils.c
+# Links config.c, cJSON.c, utils.c, logger.c
 add_executable(test_config
     ${UNITY_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/test_config.c"
     "${CMAKE_SOURCE_DIR}/src/config/config.c"
     "${CMAKE_SOURCE_DIR}/src/vendor/cJSON.c"
     "${CMAKE_SOURCE_DIR}/src/utils/utils.c"
+    "${CMAKE_SOURCE_DIR}/src/utils/logger.c"
 )
 
 target_include_directories(test_config PRIVATE
@@ -99,13 +101,14 @@ target_compile_options(test_idn PRIVATE ${KOMARI_TEST_C_FLAGS_LIST})
 add_test(NAME test_idn COMMAND test_idn)
 
 # ====== Test target: test_monitoring ======
-# Links monitoring.c, cJSON.c, utils.c, config.c
+# Links monitoring.c, cJSON.c, utils.c, logger.c, config.c
 add_executable(test_monitoring
     ${UNITY_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/test_monitoring.c"
     "${CMAKE_SOURCE_DIR}/src/monitoring/monitoring.c"
     "${CMAKE_SOURCE_DIR}/src/vendor/cJSON.c"
     "${CMAKE_SOURCE_DIR}/src/utils/utils.c"
+    "${CMAKE_SOURCE_DIR}/src/utils/logger.c"
     "${CMAKE_SOURCE_DIR}/src/config/config.c"
 )
 

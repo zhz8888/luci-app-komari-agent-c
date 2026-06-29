@@ -92,6 +92,9 @@ typedef struct {
     terminal_t *term;          /* Pseudo-terminal */
     volatile bool active;      /* Whether the session is active */
     pthread_t monitor_thread;  /* Monitor thread for cleanup */
+    pthread_mutex_t term_mutex; /* Protects reads/writes of the term pointer
+                                 * across the WS receive thread and the monitor
+                                 * thread to prevent use-after-free. */
     char ws_endpoint[512];     /* WebSocket endpoint URL (must match ws lifetime) */
     char extra_query[80];      /* Extra query parameters (must match ws lifetime) */
 } terminal_session_t;
@@ -109,7 +112,18 @@ static void on_terminal_output(terminal_t *term, const char *data, size_t len) {
 /* Terminal WebSocket raw data callback: handle terminal input and resize messages (WS→terminal input thread) */
 static void on_terminal_ws_data(ws_client_t *client, const char *data, size_t len) {
     terminal_session_t *session = (terminal_session_t *)client->user_data;
-    if (!session || !session->active || !session->term) return;
+    if (!session || !session->active) return;
+
+    /* Snapshot the term pointer under the mutex. The monitor thread NULLs
+     * session->term before tearing the terminal down, so once we hold a
+     * non-NULL local copy the terminal remains valid for the duration of
+     * this callback: the monitor thread joins the WS receive thread (which
+     * invokes this callback) inside ws_client_disconnect() before calling
+     * terminal_destroy(). */
+    pthread_mutex_lock(&session->term_mutex);
+    terminal_t *term = session->term;
+    pthread_mutex_unlock(&session->term_mutex);
+    if (!term) return;
 
     /* Detect and handle resize JSON messages */
     if (len > 0 && data[0] == '{') {
@@ -120,7 +134,7 @@ static void on_terminal_ws_data(ws_client_t *client, const char *data, size_t le
                 cJSON *cols = cJSON_GetObjectItem(root, "cols");
                 cJSON *rows = cJSON_GetObjectItem(root, "rows");
                 if (cols && rows && cJSON_IsNumber(cols) && cJSON_IsNumber(rows)) {
-                    terminal_resize(session->term, cols->valueint, rows->valueint);
+                    terminal_resize(term, cols->valueint, rows->valueint);
                     KOMARI_LOG_DEBUG("[Terminal] Resized to cols=%d rows=%d",
                                      cols->valueint, rows->valueint);
                 }
@@ -132,7 +146,7 @@ static void on_terminal_ws_data(ws_client_t *client, const char *data, size_t le
     }
 
     /* Normal terminal input: write to pseudo-terminal */
-    terminal_write(session->term, data, len);
+    terminal_write(term, data, len);
 }
 
 /* Terminal session monitor thread: detect exit and cleanup resources */
@@ -142,8 +156,13 @@ static void *terminal_monitor_thread(void *arg) {
     while (session->active) {
         sleep(1);
 
-        /* Check if terminal has exited (shell closed) */
-        if (session->term && !session->term->running) {
+        /* Check if terminal has exited (shell closed). Snapshot term under
+         * the mutex because the cleanup path below may NULL it. */
+        pthread_mutex_lock(&session->term_mutex);
+        terminal_t *term = session->term;
+        bool exited = term && !term->running;
+        pthread_mutex_unlock(&session->term_mutex);
+        if (exited) {
             KOMARI_LOG_INFO("[Terminal] Shell exited, closing session");
             break;
         }
@@ -162,33 +181,66 @@ static void *terminal_monitor_thread(void *arg) {
 
     session->active = false;
 
-    /* Destroy terminal first (join read thread, ensure output callback no longer accesses ws) */
+    /* Teardown order (fixes MAJ-13 use-after-free):
+     * 1. terminal_terminate() joins the terminal read thread so it stops
+     *    calling ws_client_send_text() via on_terminal_output. This must
+     *    happen before ws_client_disconnect() frees the SSL/fd resources,
+     *    otherwise the read thread could race on client->ssl.
+     * 2. ws_client_disconnect() joins the WS receive thread so
+     *    on_terminal_ws_data() can no longer touch session->term.
+     * 3. terminal_destroy() frees the terminal. Both threads are now joined,
+     *    so there is no concurrent access to the terminal struct. Passing
+     *    &session->term NULLs the pointer before the free.
+     * 4. ws_client_destroy() frees the WS handle. The read thread is already
+     *    joined, so it can no longer touch the WS client. */
     if (session->term) {
-        terminal_destroy(session->term);
-        session->term = NULL;
+        terminal_terminate(session->term);
     }
 
-    /* Then disconnect and destroy WebSocket (join receive thread, ensure raw data callback no longer accesses term) */
     if (session->ws) {
         ws_client_stop(session->ws);
         ws_client_disconnect(session->ws);
+    }
+
+    pthread_mutex_lock(&session->term_mutex);
+    terminal_destroy(&session->term);
+    pthread_mutex_unlock(&session->term_mutex);
+
+    if (session->ws) {
         ws_client_destroy(session->ws);
         session->ws = NULL;
     }
 
+    pthread_mutex_destroy(&session->term_mutex);
+    terminal_release_session();
     free(session);
     return NULL;
 }
 
 /* Establish dedicated WebSocket connection for terminal and start pseudo-terminal session */
 static int establish_terminal_connection(const char *token, const char *request_id, const char *endpoint) {
+    /* Enforce the concurrent session limit before allocating any resources so
+     * that rejected requests do not leak memory or file descriptors. */
+    if (terminal_acquire_session() != 0) {
+        /* Warning already logged by terminal_acquire_session */
+        return -1;
+    }
+
     /* Allocate terminal session context */
     terminal_session_t *session = calloc(1, sizeof(terminal_session_t));
     if (!session) {
         KOMARI_LOG_ERROR("[Terminal] Failed to allocate terminal session");
+        terminal_release_session();
         return -1;
     }
     session->active = false;
+
+    if (pthread_mutex_init(&session->term_mutex, NULL) != 0) {
+        KOMARI_LOG_ERROR("[Terminal] Failed to init term mutex");
+        terminal_release_session();
+        free(session);
+        return -1;
+    }
 
     /* Build WebSocket endpoint URL: convert http(s):// to ws(s):// and append /api/clients/terminal */
     const char *ep = endpoint;
@@ -233,6 +285,8 @@ static int establish_terminal_connection(const char *token, const char *request_
     session->ws = ws_client_create(&ws_config);
     if (!session->ws) {
         KOMARI_LOG_ERROR("[Terminal] Failed to create WebSocket client");
+        pthread_mutex_destroy(&session->term_mutex);
+        terminal_release_session();
         free(session);
         return -1;
     }
@@ -245,6 +299,8 @@ static int establish_terminal_connection(const char *token, const char *request_
     if (ws_client_connect(session->ws) != 0) {
         KOMARI_LOG_ERROR("[Terminal] Failed to connect WebSocket for %s", request_id);
         ws_client_destroy(session->ws);
+        pthread_mutex_destroy(&session->term_mutex);
+        terminal_release_session();
         free(session);
         return -1;
     }
@@ -253,8 +309,11 @@ static int establish_terminal_connection(const char *token, const char *request_
     session->term = terminal_create(80, 24);
     if (!session->term) {
         KOMARI_LOG_ERROR("[Terminal] Failed to create terminal");
+        ws_client_stop(session->ws);
         ws_client_disconnect(session->ws);
         ws_client_destroy(session->ws);
+        pthread_mutex_destroy(&session->term_mutex);
+        terminal_release_session();
         free(session);
         return -1;
     }
@@ -266,9 +325,14 @@ static int establish_terminal_connection(const char *token, const char *request_
     /* Start terminal (forkpty + shell + read thread) */
     if (terminal_start(session->term, NULL) != 0) {
         KOMARI_LOG_ERROR("[Terminal] Failed to start terminal");
-        terminal_destroy(session->term);
+        /* Disconnect WS first (joins recv thread) so on_terminal_ws_data
+         * cannot race with terminal_destroy. */
+        ws_client_stop(session->ws);
         ws_client_disconnect(session->ws);
+        terminal_destroy(&session->term);
         ws_client_destroy(session->ws);
+        pthread_mutex_destroy(&session->term_mutex);
+        terminal_release_session();
         free(session);
         return -1;
     }
@@ -279,9 +343,16 @@ static int establish_terminal_connection(const char *token, const char *request_
     if (pthread_create(&session->monitor_thread, NULL, terminal_monitor_thread, session) != 0) {
         KOMARI_LOG_ERROR("[Terminal] Failed to create monitor thread");
         session->active = false;
-        terminal_destroy(session->term);
+        /* Same teardown order as the monitor thread: terminate terminal first
+         * (joins read thread so it stops touching ws), then disconnect WS
+         * (joins recv thread so it stops touching term), then free both. */
+        terminal_terminate(session->term);
+        ws_client_stop(session->ws);
         ws_client_disconnect(session->ws);
+        terminal_destroy(&session->term);
         ws_client_destroy(session->ws);
+        pthread_mutex_destroy(&session->term_mutex);
+        terminal_release_session();
         free(session);
         return -1;
     }
@@ -557,9 +628,15 @@ static void *report_thread(void *arg) {
             last_basic_info = now;
         }
         
-        sleep((unsigned int)g_config.interval);
+        /* Sleep in 1-second slices so the thread observes g_running
+         * promptly during shutdown. Without this, a large interval
+         * (e.g. 60s) would delay pthread_join in the cleanup path for
+         * up to that full duration. */
+        for (int i = 0; i < (int)g_config.interval && g_running; i++) {
+            sleep(1);
+        }
     }
-    
+
     return NULL;
 }
 
@@ -586,7 +663,13 @@ static void *heartbeat_thread(void *arg) {
                 printf("[WebSocket] Heartbeat failed\n");
             }
         }
-        sleep(30);
+        /* Sleep in 1-second slices so the thread observes g_running
+         * promptly during shutdown instead of blocking for the full
+         * 30-second heartbeat interval. This ensures pthread_join in
+         * the cleanup path returns within ~1 second rather than 30. */
+        for (int i = 0; i < 30 && g_running; i++) {
+            sleep(1);
+        }
     }
 
     return NULL;
@@ -745,6 +828,18 @@ int main(int argc, char *argv[]) {
         g_config.config_file[sizeof(g_config.config_file) - 1] = '\0';
     }
 
+    /* Validate the merged configuration before any subsystem consumes it.
+     * config_validate repairs out-of-range numeric fields (interval,
+     * reconnect_interval, etc.), strips CR/LF from the endpoint to prevent
+     * HTTP header injection, and logs missing required fields (token,
+     * endpoint). It never aborts the process; the explicit checks below
+     * still decide whether the agent can start. */
+    config_validate(&g_config);
+
+    /* Ignore SIGPIPE to prevent process termination on broken pipe (mirrors Go runtime default).
+     * Network write operations (send/SSL_write) will return EPIPE/EPIPE error instead. */
+    signal(SIGPIPE, SIG_IGN);
+
     /* Auto-discovery: if auto_discovery_key is configured and token is empty, attempt auto-registration */
     if (g_config.auto_discovery_key[0] != '\0') {
         KOMARI_LOG_INFO("[AutoDiscovery] Auto-discovery key detected, attempting registration");
@@ -766,11 +861,13 @@ int main(int argc, char *argv[]) {
         print_usage(argv[0]);
         return 1;
     }
-    
+
+    /* interval is already guaranteed > 0 by config_validate() above; keep
+     * a defensive fallback in case a future code path bypasses validation. */
     if (g_config.interval <= 0) {
         g_config.interval = DEFAULT_INTERVAL;
     }
-    
+
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
@@ -874,23 +971,59 @@ int main(int argc, char *argv[]) {
     /* Signal the detached update checker thread to exit its loop promptly
      * (within ~1 second). It cannot be joined because it was created with
      * pthread_detach, so we just flip its running flag and let it wind down
-     * on its own while we tear down the rest of the resources below. */
+     * on its own while we tear down the rest of the resources below.
+     */
     update_stop();
 
+    /* Set the WebSocket client stop flag so its internal recv thread and
+     * the report thread's retry loop can wind down. ws_client_stop only
+     * sets a flag under state_mutex; it does NOT destroy the mutex or free
+     * memory, so it is safe to call while report/heartbeat threads are
+     * still accessing g_ws_client.
+     *
+     * We intentionally do NOT call ws_client_disconnect/ws_client_destroy
+     * here: ws_client_disconnect closes the underlying fd/SSL outside the
+     * mutex (racing with any in-progress ws_client_connect in the report
+     * thread), and ws_client_destroy calls pthread_mutex_destroy + free,
+     * which would turn the report/heartbeat threads' mutex reads into
+     * use-after-free. Both are deferred until after the worker threads
+     * have been joined below. */
+    if (g_ws_client) {
+        ws_client_stop(g_ws_client);
+    }
+
+    /* Join worker threads BEFORE destroying any shared resources they
+     * access. Both report_thread and heartbeat_thread read
+     * g_ws_client->state_mutex and g_ws_client->connected on every loop
+     * iteration; destroying g_ws_client first would turn those reads into
+     * use-after-free (MAJ-09). The threads check g_running every second
+     * in their sleep loops, so join returns within ~1 second.
+     *
+     * This mirrors the Go reference implementation's cleanup pattern
+     * (.komari-agent-main/server/websocket.go, EstablishWebSocketConnection)
+     * where defer conn.Close() and defer heartbeatTicker.Stop() only run
+     * after the surrounding goroutine has stopped using them. */
+    pthread_join(report_tid, NULL);
+    pthread_join(heartbeat_tid, NULL);
+
+    /* All worker threads have exited; it is now safe to free shared
+     * resources. netstatic_stop joins its own internal worker thread, so
+     * by the time netstatic_destroy returns, all netstatic threads have
+     * exited and its mutex can be destroyed safely. */
     if (g_netstatic) {
         netstatic_stop(g_netstatic);
         netstatic_destroy(g_netstatic);
     }
-    
+
+    /* ws_client_disconnect closes the fd/SSL and joins the recv thread;
+     * ws_client_destroy frees the SSL_CTX, destroys the send_mutex and
+     * state_mutex, and frees the client struct. Both are safe now that
+     * no worker thread can access g_ws_client. */
     if (g_ws_client) {
-        ws_client_stop(g_ws_client);
         ws_client_disconnect(g_ws_client);
         ws_client_destroy(g_ws_client);
     }
-    
-    pthread_join(report_tid, NULL);
-    pthread_join(heartbeat_tid, NULL);
-    
+
     logger_cleanup();
 
     printf("Service stopped\n");

@@ -1,4 +1,4 @@
-# 编译产物
+# Build artifacts
 build*/
 obj/
 /komari-agent-c
@@ -6,7 +6,7 @@ obj/
 *.a
 *.so
 
-# IDE 配置
+# IDE configuration
 .vscode/
 .idea/
 *.swp
@@ -14,25 +14,25 @@ obj/
 *~
 .DS_Store
 
-# 日志文件
+# Log files
 *.log
 
-# 临时文件
+# Temporary files
 *.tmp
 *.bak
 
-# 调试文件
+# Debug files
 *.dSYM/
 core.*
 
-# Claude 配置
+# Claude configuration
 .claude/
 
-# Trae 辅助目录
+# Trae auxiliary directory
 .trae/
 .komari-agent-main/
 
-# 测试覆盖率
+# Test coverage
 coverage/
 *.gcda
 *.gcno

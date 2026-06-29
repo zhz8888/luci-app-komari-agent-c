@@ -23,32 +23,32 @@
 
 /* Comparison function used to sort by file name */
 static int compare_strings(const void *a, const void *b) {
-    return strcmp(*(const char **)a, *(const char **)b);
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
 /* Execute all executable scripts under /etc/update-motd.d/ */
 int motd_execute_scripts(char *output, size_t output_size) {
     if (!output || output_size == 0) return -1;
-    
+
     output[0] = '\0';
-    
+
     DIR *dir = opendir(MOTD_SCRIPT_PATH);
     if (!dir) {
         KOMARI_LOG_DEBUG("MOTD scripts directory %s not found", MOTD_SCRIPT_PATH);
         return 0;
     }
-    
+
     /* Collect all script file names */
     char *scripts[MOTD_MAX_SCRIPTS];
     int script_count = 0;
-    
+
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL && script_count < MOTD_MAX_SCRIPTS) {
         if (entry->d_name[0] == '.') continue;
-        
+
         char path[512];
         snprintf(path, sizeof(path), "%s/%s", MOTD_SCRIPT_PATH, entry->d_name);
-        
+
         struct stat st;
         if (stat(path, &st) == 0 && (st.st_mode & S_IXUSR)) {
             scripts[script_count] = strdup(entry->d_name);
@@ -58,24 +58,32 @@ int motd_execute_scripts(char *output, size_t output_size) {
         }
     }
     closedir(dir);
-    
+
     if (script_count == 0) {
         return 0;
     }
-    
-    /* Sort by file name */
-    qsort(scripts, script_count, sizeof(char *), compare_strings);
 
-    /* Execute each script */
+    /* Sort by file name */
+    qsort(scripts, (size_t)script_count, sizeof(scripts[0]), compare_strings);
+
+    KOMARI_LOG_DEBUG("MOTD: executing %d script(s) from %s",
+                     script_count, MOTD_SCRIPT_PATH);
+
+    /* Execute each script directly via fork() + execvp() (MIN-53). Unlike
+     * utils_exec_command() which routes through "sh -c", this passes the
+     * absolute script path straight to execvp(), avoiding any shell
+     * interpretation of the file name. */
     size_t total_len = 0;
     for (int i = 0; i < script_count; i++) {
         char path[512];
         snprintf(path, sizeof(path), "%s/%s", MOTD_SCRIPT_PATH, scripts[i]);
-        
+
         char script_output[4096];
         int exit_code = 0;
-        
-        if (utils_exec_command(path, script_output, sizeof(script_output), &exit_code) == 0) {
+
+        char *argv[] = {path, NULL};
+        if (utils_exec_command_argv(argv, script_output, sizeof(script_output),
+                                    &exit_code) == 0) {
             if (exit_code == 0 && script_output[0] != '\0') {
                 size_t len = strlen(script_output);
                 if (total_len + len < output_size - 1) {
@@ -83,12 +91,17 @@ int motd_execute_scripts(char *output, size_t output_size) {
                     total_len += len;
                     output[total_len] = '\0';
                 }
+            } else if (exit_code != 0) {
+                KOMARI_LOG_DEBUG("MOTD script %s exited with code %d",
+                                 scripts[i], exit_code);
             }
+        } else {
+            KOMARI_LOG_DEBUG("MOTD script %s failed to launch", scripts[i]);
         }
-        
+
         free(scripts[i]);
     }
-    
+
     return 0;
 }
 

@@ -102,4 +102,20 @@ int config_load_from_uci(agent_config_t *config);
  */
 void config_print(const agent_config_t *config);
 
+/**
+ * Validate the configuration and apply fallback defaults for any field
+ * that fails sanity checks (empty required strings, out-of-range numeric
+ * values, URL format issues, CR/LF injection in endpoint, etc.).
+ *
+ * Validation failures are logged at KOMARI_LOG_ERROR level but do not
+ * abort the program; the offending field is reset to a safe default
+ * (or emptied when no default makes sense, e.g. token/endpoint) so the
+ * caller can decide how to react.
+ *
+ * @param config Configuration structure to validate (modified in place)
+ * @return 0 on success (including when fallbacks were applied), -1 on
+ *         invalid argument
+ */
+int config_validate(agent_config_t *config);
+
 #endif

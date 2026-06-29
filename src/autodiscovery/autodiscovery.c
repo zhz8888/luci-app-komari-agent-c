@@ -33,6 +33,9 @@
 #define URL_HOST_LEN    256
 #define URL_PATH_LEN    768
 
+/* Connect/send/recv timeout for HTTP requests (MIN-34: extracted magic number). */
+#define HTTP_CONNECT_TIMEOUT_SEC 10
+
 /**
  * Extract the body from an HTTP response (skip headers)
  *
@@ -55,6 +58,69 @@ static const char *find_http_body(const char *response) {
     }
 
     return NULL;
+}
+
+/* URL-encode a string for safe inclusion in a URL query parameter value.
+ * Encodes all characters except unreserved characters (A-Z, a-z, 0-9, -_~.)
+ * as %XX hex sequences. Mirrors Go url.QueryEscape semantics for the
+ * unreserved set; spaces are encoded as %20 (well-behaved servers accept
+ * both %20 and + in query values).
+ *
+ * @param src Input string to encode (NUL-terminated)
+ * @param dst Output buffer
+ * @param dst_len Size of dst
+ * @return Number of bytes written (excluding NUL) on success, -1 on
+ *         failure (NULL argument or dst too small) */
+static int url_encode(const char *src, char *dst, size_t dst_len) {
+    if (!src || !dst || dst_len == 0) return -1;
+    static const char hex[] = "0123456789ABCDEF";
+    size_t j = 0;
+    for (size_t i = 0; src[i]; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if ((c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            if (j + 1 >= dst_len) return -1;
+            dst[j++] = (char)c;
+        } else {
+            if (j + 3 >= dst_len) return -1;
+            dst[j++] = '%';
+            dst[j++] = hex[(c >> 4) & 0xF];
+            dst[j++] = hex[c & 0xF];
+        }
+    }
+    dst[j] = '\0';
+    return (int)j;
+}
+
+/* Send the entire buffer over the connected socket or TLS stream.
+ * send(2) and SSL_write may return fewer bytes than requested (partial
+ * write), so loop until all bytes are flushed. Retries on EINTR for
+ * plain TCP sockets; SSL failures are treated as fatal since SSL_get_error
+ * based retry logic is handled by OpenSSL internals for non-blocking mode.
+ *
+ * @param ssl  SSL object (NULL for plain TCP)
+ * @param fd   Socket file descriptor (used when ssl is NULL)
+ * @param data Buffer to send
+ * @param len  Number of bytes to send
+ * @return 0 on success, -1 on failure */
+static int send_full(SSL *ssl, int fd, const char *data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        int n;
+        if (ssl) {
+            n = SSL_write(ssl, data + sent, (int)(len - sent));
+        } else {
+            n = send(fd, data + sent, len - sent, 0);
+        }
+        if (n <= 0) {
+            if (errno == EINTR) continue;  /* Retry on signal interruption */
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+    return 0;
 }
 
 /**
@@ -120,7 +186,11 @@ static int http_post_get_body(const char *url,
 
     /* DNS resolution: iterate through all addresses for IPv4/IPv6 support */
     char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
+    int port_n = snprintf(port_str, sizeof(port_str), "%d", port);
+    if (port_n < 0 || (size_t)port_n >= sizeof(port_str)) {
+        KOMARI_LOG_ERROR("Auto-discovery: Port string truncation");
+        return -1;
+    }
 
     struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof(hints));
@@ -139,7 +209,7 @@ static int http_post_get_body(const char *url,
 
         /* Set timeout */
         struct timeval tv;
-        tv.tv_sec = 10;
+        tv.tv_sec = HTTP_CONNECT_TIMEOUT_SEC;
         tv.tv_usec = 0;
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -176,8 +246,21 @@ static int http_post_get_body(const char *url,
             return -1;
         }
 
+        /*
+         * Mirror the Go reference implementation (see .komari-agent-main/
+         * server/websocket.go newWSDialer): a tls.Config verifies the
+         * peer by default; only set InsecureSkipVerify when ignore_cert
+         * is explicitly requested. Without this, MITM attackers can
+         * present any certificate and the handshake still succeeds.
+         */
         if (ignore_cert) {
             SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
+        } else {
+            /* Enable certificate verification by default (mirrors Go
+             * tls.Config default). Load the system CA store so chain
+             * verification can succeed, then require peer verification. */
+            SSL_CTX_set_default_verify_paths(ssl_ctx);
+            SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
         }
 
         ssl = SSL_new(ssl_ctx);
@@ -190,6 +273,19 @@ static int http_post_get_body(const char *url,
 
         SSL_set_fd(ssl, fd);
         SSL_set_tlsext_host_name(ssl, host);
+        /*
+         * Verify hostname against certificate (mirrors Go
+         * tls.Config.ServerName). SSL_set1_host is available in
+         * OpenSSL 1.0.2+; for older builds we fall back to
+         * SSL_VERIFY_PEER chain-only verification.
+         */
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+        if (!ignore_cert) {
+            SSL_set1_host(ssl, host);
+        }
+#else
+        /* Fallback: rely on SSL_CTX_set_verify with SSL_VERIFY_PEER only */
+#endif
 
         if (SSL_connect(ssl) <= 0) {
             SSL_free(ssl);
@@ -234,15 +330,10 @@ static int http_post_get_body(const char *url,
         return -1;
     }
 
-    /* Send request */
-    int sent = 0;
-    if (ssl) {
-        sent = SSL_write(ssl, request, req_len);
-    } else {
-        sent = send(fd, request, req_len, 0);
-    }
-
-    if (sent < 0) {
+    /* Send the entire request, handling partial writes and EINTR.
+     * send(2) and SSL_write may return fewer bytes than requested, so loop
+     * until all bytes are flushed. */
+    if (send_full(ssl, fd, request, (size_t)req_len) != 0) {
         if (ssl) SSL_free(ssl);
         if (ssl_ctx) SSL_CTX_free(ssl_ctx);
         close(fd);
@@ -450,10 +541,20 @@ int autodiscovery_register(const char *endpoint,
      * string. The "?name=" query parameter carries the hostname, not
      * authentication material.
      */
+    /* URL-encode the hostname for the ?name= query parameter to handle any
+     * special characters safely (mirrors Go url.QueryEscape). Hostnames
+     * normally only contain unreserved characters, but encoding is applied
+     * as defense in depth. The encoded form may be up to 3x the original. */
+    char encoded_name[256 * 3 + 1];
+    if (url_encode(hostname, encoded_name, sizeof(encoded_name)) < 0) {
+        KOMARI_LOG_ERROR("Auto-discovery: Hostname URL encoding failed");
+        return -1;
+    }
+
     /* Build registration URL: {endpoint}/api/clients/register?name={hostname} */
-    char url[768];
+    char url[768 + 256 * 3 + 1];
     int n = snprintf(url, sizeof(url), "%s/api/clients/register?name=%s",
-                     endpoint, hostname);
+                     endpoint, encoded_name);
     if (n < 0 || (size_t)n >= sizeof(url)) {
         KOMARI_LOG_ERROR("Auto-discovery: Registration URL too long");
         return -1;

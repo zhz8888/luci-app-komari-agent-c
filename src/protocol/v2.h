@@ -23,6 +23,10 @@
 /* Maximum number of seen event IDs; the oldest is removed when full */
 #define V2_SEEN_EVENTS_MAX 1000
 
+/* Maximum number of pending ACK event IDs; the oldest is dropped when full
+ * to prevent a malicious peer from exhausting memory by flooding events. */
+#define V2_ACK_IDS_MAX 1024
+
 /* v2 protocol runtime state */
 typedef struct {
     int fail_count;             /* Number of consecutive v2 failures */

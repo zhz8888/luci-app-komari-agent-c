@@ -30,9 +30,10 @@ typedef struct {
 /**
  * Initialize the logger with the given configuration.
  *
- * @param config Logger configuration (level, outputs, tag)
+ * @param config Logger configuration (level, outputs, tag). The contents are
+ *               deep-copied; the caller may free or reuse @p config afterwards.
  */
-void logger_init(logger_config_t *config);
+void logger_init(const logger_config_t *config);
 
 /**
  * Release logger resources, closing syslog if enabled.

@@ -71,6 +71,9 @@ cJSON *jsonrpc_build_report_payload(cJSON *report_data)
 {
     cJSON *params = cJSON_CreateObject();
     if (!params) {
+        /* MIN-43: ensure report_data is freed on every failure path so the
+         * caller never has to guess whether ownership was consumed. */
+        cJSON_Delete(report_data);
         return NULL;
     }
 
@@ -92,6 +95,8 @@ cJSON *jsonrpc_build_basic_info_payload(cJSON *info_data)
 {
     cJSON *params = cJSON_CreateObject();
     if (!params) {
+        /* MIN-43: consistent ownership transfer - free info_data on failure. */
+        cJSON_Delete(info_data);
         return NULL;
     }
 
@@ -110,8 +115,15 @@ cJSON *jsonrpc_build_basic_info_payload(cJSON *info_data)
 
 cJSON *jsonrpc_build_ping_result_payload(int id, cJSON *ping_result)
 {
-    /* ping_result is passed directly as params; ownership is transferred to the request object */
-    return jsonrpc_new_request(id, AGENT_PING_RESULT, ping_result);
+    /* ping_result is passed directly as params; ownership is transferred to
+     * the request object. On failure jsonrpc_new_request does not free
+     * ping_result, so free it here for consistent ownership semantics. */
+    cJSON *root = jsonrpc_new_request(id, AGENT_PING_RESULT, ping_result);
+    if (!root) {
+        cJSON_Delete(ping_result);
+        return NULL;
+    }
+    return root;
 }
 
 cJSON *jsonrpc_build_report_request(int id, cJSON *report_data,
@@ -119,6 +131,8 @@ cJSON *jsonrpc_build_report_request(int id, cJSON *report_data,
 {
     cJSON *params = cJSON_CreateObject();
     if (!params) {
+        /* MIN-43: consistent ownership transfer - free report_data on failure. */
+        cJSON_Delete(report_data);
         return NULL;
     }
 

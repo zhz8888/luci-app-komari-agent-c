@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
@@ -37,6 +38,15 @@
 #define WS_BUFFER_SIZE 4096
 #define WS_HEADER_SIZE 14
 #define WS_MAGIC_KEY "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+/* Maximum length of a raw (unencoded) authentication token. The URL-encoded
+ * form may be up to 3x this size (every byte becomes "%XX"), so query buffer
+ * sizing must account for that expansion. */
+#define TOKEN_MAX_LEN 256
+
+/* Connect/send/recv timeout for the WebSocket transport (MIN-34: extracted
+ * magic number). Slightly longer than the HTTP timeout so a slow TLS handshake
+ * does not abort before the server has a chance to respond. */
+#define WS_CONNECT_TIMEOUT_SEC 15
 
 static const char base64_table[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -48,7 +58,7 @@ static void base64_encode(const unsigned char *data, size_t len, char *out) {
         unsigned int n = ((unsigned int)data[i]) << 16;
         if (i + 1 < len) n |= ((unsigned int)data[i + 1]) << 8;
         if (i + 2 < len) n |= data[i + 2];
-        
+
         out[j] = base64_table[(n >> 18) & 0x3F];
         out[j + 1] = base64_table[(n >> 12) & 0x3F];
         out[j + 2] = (i + 1 < len) ? base64_table[(n >> 6) & 0x3F] : '=';
@@ -57,31 +67,83 @@ static void base64_encode(const unsigned char *data, size_t len, char *out) {
     out[j] = '\0';
 }
 
+/* Internal helper: percent-encode a string for safe inclusion in a URL query
+ * component (MAJ-08). Mirrors the behavior of the url_encode helpers in
+ * src/autodiscovery/autodiscovery.c and src/report/report.c for consistency.
+ *
+ * Unreserved characters per RFC 3986 (A-Z, a-z, 0-9, '-', '_', '.', '~') are
+ * copied as-is. All other bytes (including space, '&', '=', '+') are encoded
+ * as "%XX" with uppercase hex digits. This prevents special characters in a
+ * token from breaking out of the query parameter or injecting additional
+ * parameters.
+ *
+ * Returns the number of bytes written (excluding NUL) on success, -1 if the
+ * output buffer is too small or arguments are invalid. */
+static int url_encode(const char *in, char *out, size_t out_size) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t i, j;
+
+    if (!in || !out || out_size == 0) return -1;
+
+    for (i = 0, j = 0; in[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if ((c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            if (j + 1 >= out_size) return -1;
+            out[j++] = (char)c;
+        } else {
+            if (j + 3 >= out_size) return -1;
+            out[j++] = '%';
+            out[j++] = hex[(c >> 4) & 0x0F];
+            out[j++] = hex[c & 0x0F];
+        }
+    }
+    out[j] = '\0';
+    return (int)j;
+}
+
 /* Internal helper: generate a random 16-byte WebSocket key, Base64-encoded. */
 static int generate_ws_key(char *key, size_t key_len) {
     unsigned char random_bytes[16];
-    
+
     if (RAND_bytes(random_bytes, 16) != 1) {
         return -1;
     }
-    
+
     if (key_len < WS_KEY_LEN) {
         return -1;
     }
-    
+
     base64_encode(random_bytes, 16, key);
     return 0;
 }
 
-/* Internal helper: compute the Sec-WebSocket-Accept value from the client key. */
-static void compute_accept_key(const char *key, char *accept_key) {
+/* Internal helper: compute the Sec-WebSocket-Accept value from the client key.
+ *
+ * Per RFC 6455 §4.2.2, the server must return Base64(SHA1(key || GUID)). This
+ * helper computes that value so ws_handshake can verify the server's response
+ * (MAJ-07). Returns 0 on success, -1 on snprintf truncation or if the output
+ * buffer is too small to hold the Base64-encoded SHA1 (28 chars + NUL). */
+static int compute_accept_key(const char *key, char *accept_key, size_t accept_key_size) {
     unsigned char hash[SHA_DIGEST_LENGTH];
     char combined[256];
-    
-    snprintf(combined, sizeof(combined), "%s%s", key, WS_MAGIC_KEY);
-    
+    int ret;
+
+    /* Base64 of SHA1 (20 bytes) is 28 chars; require room for NUL as well. */
+    if (accept_key_size < 29) return -1;
+
+    ret = snprintf(combined, sizeof(combined), "%s%s", key, WS_MAGIC_KEY);
+    if (ret < 0 || (size_t)ret >= sizeof(combined)) {
+        /* Truncation would produce a wrong SHA1 and break the handshake
+         * verification (MAJ-11). */
+        return -1;
+    }
+
     SHA1((unsigned char *)combined, strlen(combined), hash);
     base64_encode(hash, SHA_DIGEST_LENGTH, accept_key);
+    return 0;
 }
 
 /* Internal helper: parse a ws:// or wss:// URL into scheme/host/port/path components.
@@ -90,12 +152,15 @@ static void compute_accept_key(const char *key, char *accept_key) {
 #define WS_HOST_MAX 256
 #define WS_PATH_MAX 512
 static int parse_url(const char *url, char *scheme, char *host, int *port, char *path) {
+    int sn_ret;
     if (strncmp(url, "ws://", 5) == 0) {
-        snprintf(scheme, WS_SCHEME_MAX, "ws");
+        sn_ret = snprintf(scheme, WS_SCHEME_MAX, "ws");
+        if (sn_ret < 0 || (size_t)sn_ret >= WS_SCHEME_MAX) return -1;
         url += 5;
         *port = 80;
     } else if (strncmp(url, "wss://", 6) == 0) {
-        snprintf(scheme, WS_SCHEME_MAX, "wss");
+        sn_ret = snprintf(scheme, WS_SCHEME_MAX, "wss");
+        if (sn_ret < 0 || (size_t)sn_ret >= WS_SCHEME_MAX) return -1;
         url += 6;
         *port = 443;
     } else {
@@ -108,7 +173,8 @@ static int parse_url(const char *url, char *scheme, char *host, int *port, char 
     if (colon && (!slash || colon < slash)) {
         size_t host_len = colon - url;
         if (host_len >= WS_HOST_MAX) return -1;
-        snprintf(host, WS_HOST_MAX, "%.*s", (int)host_len, url);
+        sn_ret = snprintf(host, WS_HOST_MAX, "%.*s", (int)host_len, url);
+        if (sn_ret < 0 || (size_t)sn_ret >= WS_HOST_MAX) return -1;
         /* Parse port with strtol and validate range (atoi gives no error checking). */
         char *endp = NULL;
         long port_val = strtol(colon + 1, &endp, 10);
@@ -125,28 +191,107 @@ static int parse_url(const char *url, char *scheme, char *host, int *port, char 
         if (slash) {
             size_t host_len = slash - url;
             if (host_len >= WS_HOST_MAX) return -1;
-            snprintf(host, WS_HOST_MAX, "%.*s", (int)host_len, url);
+            sn_ret = snprintf(host, WS_HOST_MAX, "%.*s", (int)host_len, url);
+            if (sn_ret < 0 || (size_t)sn_ret >= WS_HOST_MAX) return -1;
             url = slash;
         } else {
             if (strlen(url) >= WS_HOST_MAX) return -1;
-            snprintf(host, WS_HOST_MAX, "%s", url);
+            sn_ret = snprintf(host, WS_HOST_MAX, "%s", url);
+            if (sn_ret < 0 || (size_t)sn_ret >= WS_HOST_MAX) return -1;
             url = "/";
         }
     }
 
     if (strlen(url) >= WS_PATH_MAX) return -1;
-    snprintf(path, WS_PATH_MAX, "%s", url);
+    sn_ret = snprintf(path, WS_PATH_MAX, "%s", url);
+    if (sn_ret < 0 || (size_t)sn_ret >= WS_PATH_MAX) return -1;
     return 0;
+}
+
+/* Internal helper: extract the value of an HTTP header from a response buffer.
+ * Performs a case-insensitive match on the header name (RFC 7230 §3.2). The
+ * value is trimmed of leading/trailing inline whitespace and copied into `out`
+ * (NUL-terminated). Used by ws_handshake to read Sec-WebSocket-Accept (MAJ-07).
+ * Returns 0 on success, -1 if the header is not found, the buffer is too small,
+ * or the response is malformed. */
+static int ws_extract_header(const char *response, const char *header_name,
+                             char *out, size_t out_size) {
+    const char *line;
+    const char *first_eol;
+    const char *eol;
+    const char *v;
+    size_t name_len;
+    size_t i;
+    size_t vlen;
+
+    if (!response || !header_name || !out || out_size == 0) return -1;
+    name_len = strlen(header_name);
+    if (name_len == 0) return -1;
+
+    /* Skip the status line so we only scan headers. */
+    first_eol = strstr(response, "\r\n");
+    if (!first_eol) return -1;
+    line = first_eol + 2;
+
+    while (*line) {
+        /* End of headers: blank line. */
+        if (line[0] == '\r' && line[1] == '\n') return -1;
+        if (line[0] == '\n') return -1;
+
+        /* Compare header name case-insensitively. */
+        for (i = 0; i < name_len; i++) {
+            if (line[i] == '\0' || line[i] == '\r' || line[i] == '\n') break;
+            if (tolower((unsigned char)line[i]) != tolower((unsigned char)header_name[i])) {
+                break;
+            }
+        }
+
+        if (i == name_len && line[name_len] == ':') {
+            /* Found the header; locate and trim the value. */
+            v = line + name_len + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            eol = strstr(v, "\r\n");
+            if (!eol) eol = v + strlen(v);
+            while (eol > v && (eol[-1] == ' ' || eol[-1] == '\t')) eol--;
+            vlen = (size_t)(eol - v);
+            if (vlen + 1 > out_size) return -1;
+            memcpy(out, v, vlen);
+            out[vlen] = '\0';
+            return 0;
+        }
+
+        /* Move to next line. */
+        eol = strstr(line, "\r\n");
+        if (!eol) return -1;
+        line = eol + 2;
+    }
+    return -1;
 }
 
 /* Internal helper: perform the WebSocket opening handshake over the connected socket/TLS stream. */
 static int ws_handshake(ws_client_t *client, const char *host, const char *path, const char *token, const char *extra_query) {
     char key[32];
-    char accept_key[64];
+    char expected_accept[64];
+    char encoded_token[TOKEN_MAX_LEN * 3 + 1];
     char request[2048];
     char response[2048];
+    int sn_ret;
+
+    /* Reset any leftover pending bytes from a previous connection so stale
+     * data cannot leak into this session (MAJ-24). The recv thread is not
+     * running yet at this point, so the write is race-free. */
+    client->pending_len = 0;
+    client->pending_off = 0;
 
     if (generate_ws_key(key, sizeof(key)) != 0) {
+        return -1;
+    }
+
+    /* Compute the expected Sec-WebSocket-Accept value so we can verify the
+     * server's response (RFC 6455 §4.2.2, MAJ-07). A non-compliant or
+     * malicious intermediary cannot complete the handshake without producing
+     * the correct SHA1+Base64 of (client-key || magic GUID). */
+    if (compute_accept_key(key, expected_accept, sizeof(expected_accept)) != 0) {
         return -1;
     }
 
@@ -159,15 +304,34 @@ static int ws_handshake(ws_client_t *client, const char *host, const char *path,
      * parameter. The server side already supports this auth scheme, so changing
      * to a header-based approach would break compatibility.
      */
-    /* Build query string, supporting additional parameters (e.g., terminal session id) */
-    char query[256];
-    if (extra_query && *extra_query) {
-        snprintf(query, sizeof(query), "?token=%s%s", token, extra_query);
-    } else {
-        snprintf(query, sizeof(query), "?token=%s", token);
+    /* URL-encode the token before placing it in the query string so that
+     * special characters (e.g., '&', '=', '+', space) cannot break out of
+     * the query parameter or inject additional parameters (MAJ-08). The
+     * encoded form may be up to 3x the original length ("%XX" per byte). */
+    if (url_encode(token, encoded_token, sizeof(encoded_token)) < 0) {
+        KOMARI_LOG_WARN("WebSocket token too long to URL-encode (max %d bytes)",
+                        TOKEN_MAX_LEN);
+        return -1;
     }
 
-    snprintf(request, sizeof(request),
+    /* Build query string, supporting additional parameters (e.g., terminal session id).
+     * The buffer must accommodate "?token=" + URL-encoded token (up to
+     * TOKEN_MAX_LEN*3 bytes) + extra_query + NUL. extra_query is treated as
+     * already-encoded by the caller. */
+    char query[TOKEN_MAX_LEN * 3 + 256];
+    if (extra_query && *extra_query) {
+        sn_ret = snprintf(query, sizeof(query), "?token=%s%s",
+                          encoded_token, extra_query);
+    } else {
+        sn_ret = snprintf(query, sizeof(query), "?token=%s", encoded_token);
+    }
+    if (sn_ret < 0 || (size_t)sn_ret >= sizeof(query)) {
+        KOMARI_LOG_WARN("WebSocket query string truncated (needed %d, had %zu)",
+                        sn_ret < 0 ? -1 : sn_ret + 1, sizeof(query));
+        return -1;
+    }
+
+    sn_ret = snprintf(request, sizeof(request),
         "GET %s%s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "Upgrade: websocket\r\n"
@@ -177,7 +341,12 @@ static int ws_handshake(ws_client_t *client, const char *host, const char *path,
         "User-Agent: komari-agent-c/1.0\r\n"
         "\r\n",
         path, query, host, key);
-    
+    if (sn_ret < 0 || (size_t)sn_ret >= sizeof(request)) {
+        KOMARI_LOG_WARN("WebSocket handshake request truncated (needed %d, had %zu)",
+                        sn_ret < 0 ? -1 : sn_ret + 1, sizeof(request));
+        return -1;
+    }
+
     ssize_t n;
     if (client->use_tls && client->ssl) {
         n = SSL_write(client->ssl, request, strlen(request));
@@ -185,7 +354,7 @@ static int ws_handshake(ws_client_t *client, const char *host, const char *path,
         n = send(client->fd, request, strlen(request), 0);
     }
     if (n < 0) return -1;
-    
+
     n = 0;
     ssize_t total = 0;
     while (total < (ssize_t)sizeof(response) - 1) {
@@ -211,11 +380,80 @@ static int ws_handshake(ws_client_t *client, const char *host, const char *path,
     if (n <= 0) return -1;
     response[total] = '\0';
 
+    /* Locate the end of the HTTP headers (MAJ-24). The server may start
+     * sending WebSocket frames immediately after the 101 response, and the
+     * recv loop above may have pulled those frame bytes into `response`
+     * together with the headers. Save any bytes past the trailing CRLFCRLF
+     * into client->pending_buf so the recv thread can consume them via
+     * read_full() instead of losing them. */
+    char *header_end = strstr(response, "\r\n\r\n");
+    if (header_end) {
+        size_t header_bytes = (size_t)(header_end - response) + 4;  /* include CRLFCRLF */
+        size_t extra = (size_t)total > header_bytes
+                         ? (size_t)total - header_bytes
+                         : 0;
+        if (extra > 0) {
+            if (extra > WS_PENDING_BUF_SIZE) {
+                /* Should be impossible: response and pending_buf are the same
+                 * size (2048 bytes), so extra can never exceed the buffer.
+                 * Guard defensively anyway to avoid a silent truncation. */
+                KOMARI_LOG_WARN("WebSocket handshake overflow: %zu trailing bytes "
+                                "exceed pending buffer %d", extra, WS_PENDING_BUF_SIZE);
+                return -1;
+            }
+            memcpy(client->pending_buf, response + header_bytes, extra);
+            client->pending_len = extra;
+            client->pending_off = 0;
+        }
+    }
+
     /* Validate the status line strictly rather than searching for "101" anywhere */
     if (strncmp(response, "HTTP/1.1 101", 12) != 0) return -1;
     if (strstr(response, "Upgrade") == NULL) return -1;
     if (strstr(response, "websocket") == NULL) return -1;
 
+    /* Verify the Sec-WebSocket-Accept header matches the expected value
+     * (RFC 6455 §4.2.2, MAJ-07). Without this check a non-WebSocket responder
+     * (e.g., a transparent proxy returning a 101 with no real upgrade) could
+     * trick the client into treating the stream as a WebSocket. */
+    char server_accept[128];
+    if (ws_extract_header(response, "Sec-WebSocket-Accept:",
+                          server_accept, sizeof(server_accept)) != 0) {
+        KOMARI_LOG_WARN("WebSocket handshake missing Sec-WebSocket-Accept header");
+        return -1;
+    }
+    if (strcmp(server_accept, expected_accept) != 0) {
+        KOMARI_LOG_WARN("WebSocket Sec-WebSocket-Accept mismatch (expected %s, got %s)",
+                        expected_accept, server_accept);
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Internal helper: send exactly `len` bytes over the socket/TLS stream, looping
+ * over send()/SSL_write() to handle partial writes (MAJ-16 / T14.1). Mirrors
+ * the send_full helpers in src/report/report.c and src/autodiscovery/autodiscovery.c.
+ * Returns 0 on success (all bytes sent), -1 on error or connection-closed.
+ * EINTR from send() is retried; SSL_write errors are surfaced as failures. */
+static int send_full(ws_client_t *client, const char *data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        int n;
+        if (client->use_tls && client->ssl) {
+            n = SSL_write(client->ssl, data + sent, (int)(len - sent));
+        } else {
+            n = (int)send(client->fd, data + sent, len - sent, 0);
+        }
+        if (n <= 0) {
+            /* Retry on signal interruption (only meaningful for plain send();
+             * SSL_write surfaces EINTR indirectly via its own error stack, but
+             * checking errno is consistent with the existing helpers). */
+            if (n < 0 && errno == EINTR) continue;
+            return -1;
+        }
+        sent += (size_t)n;
+    }
     return 0;
 }
 
@@ -270,23 +508,30 @@ static int ws_send_frame(ws_client_t *client, int opcode, const char *data, size
     }
 
     pthread_mutex_lock(&client->send_mutex);
-    ssize_t n;
-    if (client->use_tls && client->ssl) {
-        n = SSL_write(client->ssl, frame, frame_len);
-    } else {
-        n = send(client->fd, frame, frame_len, 0);
-    }
+    /* Use send_full to handle partial writes from send()/SSL_write() and to
+     * retry on EINTR (MAJ-16 / T14.1). The mutex is held across the entire
+     * send so frames from concurrent callers are not interleaved. */
+    int rc = send_full(client, (const char *)frame, frame_len);
     pthread_mutex_unlock(&client->send_mutex);
 
-    return (n == (ssize_t)frame_len) ? 0 : -1;
+    return rc;
 }
 
 /* Internal helper: read exactly `len` bytes from the socket/TLS stream.
  * Loops over recv()/SSL_read() to handle partial reads. Returns 0 on success
- * (all bytes read), or -1 on error/connection-closed before the full length. */
+ * (all bytes read), or -1 on error/connection-closed before the full length.
+ * Bytes left over from the HTTP handshake (MAJ-24) are drained from
+ * client->pending_buf first, before any recv()/SSL_read() call is issued. */
 static int read_full(ws_client_t *client, void *buf, size_t len) {
     size_t got = 0;
     char *p = (char *)buf;
+
+    /* Drain bytes saved by ws_handshake first so we don't lose data that
+     * was already pulled off the socket together with the 101 response. */
+    while (got < len && client->pending_off < client->pending_len) {
+        p[got++] = (char)client->pending_buf[client->pending_off++];
+    }
+
     while (got < len) {
         ssize_t ret;
         if (client->use_tls && client->ssl) {
@@ -295,6 +540,8 @@ static int read_full(ws_client_t *client, void *buf, size_t len) {
             ret = recv(client->fd, p + got, len - got, 0);
         }
         if (ret <= 0) {
+            /* Retry on signal interruption (only meaningful for plain recv()). */
+            if (ret < 0 && errno == EINTR) continue;
             return -1;
         }
         got += (size_t)ret;
@@ -305,7 +552,14 @@ static int read_full(ws_client_t *client, void *buf, size_t len) {
 /* Internal helper: receive a single WebSocket frame into `data`, returning the
  * opcode, FIN flag and length. Per RFC 6455 §5.4 the caller is responsible for
  * assembling fragmented messages; this function does not reject continuation
- * frames (opcode 0x00) or non-final frames (fin=0). */
+ * frames (opcode 0x00) or non-final frames (fin=0).
+ *
+ * Protocol-validity checks performed here (RFC 6455 §5.2 / §5.5):
+ *   - MIN-56: RSV1/RSV2/RSV3 bits must be zero (no extensions negotiated).
+ *   - MIN-57: Reserved opcodes (0x3-0x7, 0xB-0xF) are rejected.
+ *   - MIN-55: Control frame payload must be <= 125 bytes and FIN must be set.
+ *   - MAJ-17: Payload length exceeding the caller's buffer is an error
+ *     (previously the data was silently truncated). */
 static int ws_recv_frame(ws_client_t *client, int *opcode, int *fin, char *data, size_t *len) {
     unsigned char header[2];
 
@@ -313,6 +567,25 @@ static int ws_recv_frame(ws_client_t *client, int *opcode, int *fin, char *data,
 
     *fin = (header[0] & 0x80) != 0;
     *opcode = header[0] & 0x0F;
+
+    /* MIN-56: RSV1/RSV2/RSV3 (bits 6/5/4 of byte 0) must be zero unless an
+     * extension was negotiated during the handshake. We never negotiate
+     * extensions, so any non-zero reserved bit is a protocol error. */
+    if (header[0] & 0x70) {
+        KOMARI_LOG_WARN("WebSocket protocol error: RSV bits non-zero (byte0=0x%02x)",
+                        header[0]);
+        return -1;
+    }
+
+    /* MIN-57: Reject reserved opcodes 0x3-0x7 (data) and 0xB-0xF (control)
+     * per RFC 6455 §5.2. The remaining opcodes (0x0 continuation, 0x1 text,
+     * 0x2 binary, 0x8 close, 0x9 ping, 0xA pong) are valid. */
+    int op = *opcode;
+    if ((op >= 0x03 && op <= 0x07) || (op >= 0x0B && op <= 0x0F)) {
+        KOMARI_LOG_WARN("WebSocket protocol error: reserved opcode 0x%x", op);
+        return -1;
+    }
+
     int masked = (header[1] & 0x80) != 0;
     uint64_t payload_len = header[1] & 0x7F;
 
@@ -329,12 +602,38 @@ static int ws_recv_frame(ws_client_t *client, int *opcode, int *fin, char *data,
         }
     }
 
+    /* MIN-55: Control frames (opcodes 0x8-0xA) MUST NOT be fragmented and
+     * their payload MUST fit in the 7-bit basic length field (<= 125 bytes).
+     * RFC 6455 §5.5. */
+    if (op >= 0x08 && op <= 0x0A) {
+        if (payload_len > 125) {
+            KOMARI_LOG_WARN("WebSocket protocol error: control frame (opcode 0x%x) "
+                            "payload %llu exceeds 125 bytes", op,
+                            (unsigned long long)payload_len);
+            return -1;
+        }
+        if (!*fin) {
+            KOMARI_LOG_WARN("WebSocket protocol error: control frame (opcode 0x%x) "
+                            "fragmented (FIN=0)", op);
+            return -1;
+        }
+    }
+
     unsigned char mask[4] = {0};
     if (masked) {
         if (read_full(client, mask, 4) != 0) return -1;
     }
 
-    if (payload_len > *len) payload_len = *len;
+    /* MAJ-17 / T14.2: A payload that does not fit in the caller's buffer is a
+     * protocol error. Previously the data was silently truncated, which could
+     * cause the caller to process a partial message as if it were complete.
+     * Returning -1 forces the recv thread to close the connection so the
+     * caller can reconnect with a clean state. */
+    if (payload_len > (uint64_t)*len) {
+        KOMARI_LOG_WARN("WebSocket frame payload %llu bytes exceeds buffer %zu",
+                        (unsigned long long)payload_len, *len);
+        return -1;
+    }
 
     if (read_full(client, data, (size_t)payload_len) != 0) return -1;
 
@@ -715,9 +1014,17 @@ int ws_handle_v2_event(ws_client_t *client, const char *json_str) {
             if (id_node && cJSON_IsNumber(id_node)) {
                 long val = (long)id_node->valuedouble;
                 if (val > 0) {
+                    int id_ret;
                     ack_id = (int)val;
-                    snprintf(id_buf, sizeof(id_buf), "%ld", val);
-                    id_str = id_buf;
+                    id_ret = snprintf(id_buf, sizeof(id_buf), "%ld", val);
+                    if (id_ret < 0 || (size_t)id_ret >= sizeof(id_buf)) {
+                        /* Truncation only happens for values exceeding 31
+                         * digits, which cannot fit in an int anyway. Log and
+                         * skip dedup for this event (MAJ-11). */
+                        KOMARI_LOG_WARN("[v2] Event id %ld truncated for dedup", val);
+                    } else {
+                        id_str = id_buf;
+                    }
                 }
             }
             cJSON_Delete(root);
@@ -823,8 +1130,29 @@ ws_client_t *ws_client_create(const ws_client_config_t *config) {
         return NULL;
     }
 
-    pthread_mutex_init(&client->send_mutex, NULL);
-    pthread_mutex_init(&client->state_mutex, NULL);
+    /* MIN-64: pthread_mutex_init can fail (e.g. ENOMEM on some platforms).
+     * Check the return value of each init so we only call pthread_mutex_destroy
+     * on mutexes that were successfully initialized, and roll back all
+     * previously allocated resources (mutexes + v2 state) before freeing the
+     * client. */
+    int mutex_ret = pthread_mutex_init(&client->send_mutex, NULL);
+    if (mutex_ret != 0) {
+        KOMARI_LOG_ERROR("ws_client_create: pthread_mutex_init(send) failed: %s",
+                         strerror(mutex_ret));
+        v2_state_cleanup(&client->v2_state);
+        free(client);
+        return NULL;
+    }
+
+    mutex_ret = pthread_mutex_init(&client->state_mutex, NULL);
+    if (mutex_ret != 0) {
+        KOMARI_LOG_ERROR("ws_client_create: pthread_mutex_init(state) failed: %s",
+                         strerror(mutex_ret));
+        pthread_mutex_destroy(&client->send_mutex);
+        v2_state_cleanup(&client->v2_state);
+        free(client);
+        return NULL;
+    }
 
     return client;
 }
@@ -885,13 +1213,23 @@ int ws_client_connect(ws_client_t *client) {
      * mirrors the Go reference implementation (server/websocket.go,
      * buildWebSocketEndpoint) which picks the path by protocol version. */
     if (ws_client_should_use_v2(client)) {
-        snprintf(path, WS_PATH_MAX, "%s", V2_RPC_ENDPOINT);
+        int path_ret = snprintf(path, WS_PATH_MAX, "%s", V2_RPC_ENDPOINT);
+        if (path_ret < 0 || (size_t)path_ret >= WS_PATH_MAX) {
+            KOMARI_LOG_WARN("v2 RPC endpoint path truncated (MAJ-11)");
+            ws_client_note_protocol_result(client, false);
+            return -1;
+        }
     } else {
-        snprintf(path, WS_PATH_MAX, "%s", "/api/clients/report");
+        int path_ret = snprintf(path, WS_PATH_MAX, "%s", "/api/clients/report");
+        if (path_ret < 0 || (size_t)path_ret >= WS_PATH_MAX) {
+            KOMARI_LOG_WARN("v1 report endpoint path truncated (MAJ-11)");
+            ws_client_note_protocol_result(client, false);
+            return -1;
+        }
     }
 
     client->use_tls = (strcmp(scheme, "wss") == 0);
-    
+
     /* Use getaddrinfo() instead of gethostbyname() for IPv4/IPv6 dual-stack support.
      * gethostbyname() only returns IPv4 addresses and cannot connect to IPv6 endpoints.
      * Iterate over all returned addrinfo entries (like Go's net.Dialer) and keep the
@@ -902,7 +1240,14 @@ int ws_client_connect(ws_client_t *client) {
     hints.ai_socktype = SOCK_STREAM;
 
     char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
+    int port_ret = snprintf(port_str, sizeof(port_str), "%d", port);
+    if (port_ret < 0 || (size_t)port_ret >= sizeof(port_str)) {
+        /* Port is validated by parse_url as 1..65535, so at most 5 digits.
+         * Truncation is impossible in practice but check anyway (MAJ-11). */
+        KOMARI_LOG_WARN("Port string truncated (MAJ-11)");
+        ws_client_note_protocol_result(client, false);
+        return -1;
+    }
 
     int gai_err = getaddrinfo(host, port_str, &hints, &res);
     if (gai_err != 0) {
@@ -917,7 +1262,7 @@ int ws_client_connect(ws_client_t *client) {
             continue;
         }
 
-        struct timeval tv = {.tv_sec = 15, .tv_usec = 0};
+        struct timeval tv = {.tv_sec = WS_CONNECT_TIMEOUT_SEC, .tv_usec = 0};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -949,8 +1294,21 @@ int ws_client_connect(ws_client_t *client) {
             return -1;
         }
         
+        /*
+         * Mirror the Go reference implementation (see .komari-agent-main/
+         * server/websocket.go newWSDialer): a tls.Config verifies the
+         * peer by default; only set InsecureSkipVerify when ignore_cert
+         * is explicitly requested. Without this, MITM attackers can
+         * present any certificate and the handshake still succeeds.
+         */
         if (client->config.ignore_cert) {
             SSL_CTX_set_verify(client->ssl_ctx, SSL_VERIFY_NONE, NULL);
+        } else {
+            /* Enable certificate verification by default (mirrors Go
+             * tls.Config default). Load the system CA store so chain
+             * verification can succeed, then require peer verification. */
+            SSL_CTX_set_default_verify_paths(client->ssl_ctx);
+            SSL_CTX_set_verify(client->ssl_ctx, SSL_VERIFY_PEER, NULL);
         }
         
         client->ssl = SSL_new(client->ssl_ctx);
@@ -965,6 +1323,19 @@ int ws_client_connect(ws_client_t *client) {
         
         SSL_set_fd(client->ssl, client->fd);
         SSL_set_tlsext_host_name(client->ssl, host);
+        /*
+         * Verify hostname against certificate (mirrors Go
+         * tls.Config.ServerName). SSL_set1_host is available in
+         * OpenSSL 1.0.2+; for older builds we fall back to
+         * SSL_VERIFY_PEER chain-only verification.
+         */
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+        if (!client->config.ignore_cert) {
+            SSL_set1_host(client->ssl, host);
+        }
+#else
+        /* Fallback: rely on SSL_CTX_set_verify with SSL_VERIFY_PEER only */
+#endif
         
         if (SSL_connect(client->ssl) <= 0) {
             SSL_free(client->ssl);
@@ -1030,24 +1401,41 @@ void ws_client_disconnect(ws_client_t *client) {
     client->should_stop = true;
     client->connected = false;
     pthread_mutex_unlock(&client->state_mutex);
-    
+
+    /* Signal the recv thread to exit. shutdown(fd, SHUT_RDWR) causes any
+     * blocking recv()/SSL_read() on the underlying socket to return
+     * immediately so the recv thread can observe the failure, set
+     * connected=false and break out of its loop.
+     *
+     * We deliberately do NOT call SSL_shutdown, close(fd) or SSL_free here
+     * even though the recv thread may still be inside SSL_read/recv. Calling
+     * SSL_shutdown concurrently with SSL_read is unsafe (the SSL object is
+     * not reentrant) and freeing fd/ssl while the recv thread reads from
+     * them is a use-after-free (MAJ-18). Mirrors Go's ws.SafeConn.Close
+     * which signals the reader to stop before tearing down the connection. */
     if (client->fd >= 0) {
-        if (client->ssl) {
-            SSL_shutdown(client->ssl);
-        }
         shutdown(client->fd, SHUT_RDWR);
-        close(client->fd);
-        client->fd = -1;
     }
-    
-    if (client->ssl) {
-        SSL_free(client->ssl);
-        client->ssl = NULL;
-    }
-    
+
+    /* Wait for the recv thread to fully exit before touching SSL/fd for
+     * cleanup. Only the fd has been shut down (not closed), so the recv
+     * thread can safely return from its blocking read and exit. */
     if (client->recv_thread) {
         pthread_join(client->recv_thread, NULL);
         client->recv_thread = 0;
+    }
+
+    /* Now that no other thread is using the SSL object or fd, it is safe to
+     * perform the TLS shutdown, free the SSL state and close the socket. */
+    if (client->ssl) {
+        SSL_shutdown(client->ssl);
+        SSL_free(client->ssl);
+        client->ssl = NULL;
+    }
+
+    if (client->fd >= 0) {
+        close(client->fd);
+        client->fd = -1;
     }
 }
 

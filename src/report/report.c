@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
@@ -30,11 +31,25 @@
 #include "v2.h"
 #include "jsonrpc.h"
 
+/* Connect/send/recv timeout for HTTP requests (MIN-34: extracted magic number). */
+#define HTTP_CONNECT_TIMEOUT_SEC 10
+
 /* Escape special characters in a string for safe inclusion in a JSON string literal.
- * Conforms to RFC 8259: escapes ", \, and control characters (0x00-0x1F). */
+ * Conforms to RFC 8259 §7: escapes ", \, and control characters (0x00-0x1F)
+ * using the named escapes (\b, \t, \n, \f, \r) where defined and \u00XX
+ * for all other control characters. */
 static void escape_json_string(const char *src, char *dst, size_t dst_len) {
     static const char hex[] = "0123456789ABCDEF";
     size_t j = 0;
+    /* Guard against NULL inputs and undersized buffers: the \u00XX escape
+     * path below writes up to 6 bytes plus a NUL terminator, so bail out
+     * early when the buffer cannot hold the worst-case escape. This also
+     * prevents size_t underflow in the `dst_len - 6` bound check (size_t
+     * is unsigned, so a small dst_len would wrap to a huge value). */
+    if (!src || !dst || dst_len < 7) {
+        if (dst && dst_len > 0) dst[0] = '\0';
+        return;
+    }
     for (size_t i = 0; src[i] && j < dst_len - 1; i++) {
         unsigned char c = (unsigned char)src[i];
         if (c == '"' || c == '\\') {
@@ -84,6 +99,69 @@ static void escape_json_string(const char *src, char *dst, size_t dst_len) {
     dst[j] = '\0';
 }
 
+/* URL-encode a string for safe inclusion in a URL query parameter value.
+ * Encodes all characters except unreserved characters (A-Z, a-z, 0-9, -_~.)
+ * as %XX hex sequences. Mirrors Go url.QueryEscape semantics for the
+ * unreserved set; spaces are encoded as %20 (well-behaved servers accept
+ * both %20 and + in query values).
+ *
+ * @param src Input string to encode (NUL-terminated)
+ * @param dst Output buffer
+ * @param dst_len Size of dst
+ * @return Number of bytes written (excluding NUL) on success, -1 on
+ *         failure (NULL argument or dst too small) */
+static int url_encode(const char *src, char *dst, size_t dst_len) {
+    if (!src || !dst || dst_len == 0) return -1;
+    static const char hex[] = "0123456789ABCDEF";
+    size_t j = 0;
+    for (size_t i = 0; src[i]; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if ((c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            if (j + 1 >= dst_len) return -1;
+            dst[j++] = (char)c;
+        } else {
+            if (j + 3 >= dst_len) return -1;
+            dst[j++] = '%';
+            dst[j++] = hex[(c >> 4) & 0xF];
+            dst[j++] = hex[c & 0xF];
+        }
+    }
+    dst[j] = '\0';
+    return (int)j;
+}
+
+/* Send the entire buffer over the connected socket or TLS stream.
+ * send(2) and SSL_write may return fewer bytes than requested (partial
+ * write), so loop until all bytes are flushed. Retries on EINTR for
+ * plain TCP sockets; SSL failures are treated as fatal since SSL_get_error
+ * based retry logic is handled by OpenSSL internals for non-blocking mode.
+ *
+ * @param ssl  SSL object (NULL for plain TCP)
+ * @param fd   Socket file descriptor (used when ssl is NULL)
+ * @param data Buffer to send
+ * @param len  Number of bytes to send
+ * @return 0 on success, -1 on failure */
+static int send_full(SSL *ssl, int fd, const char *data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        int n;
+        if (ssl) {
+            n = SSL_write(ssl, data + sent, (int)(len - sent));
+        } else {
+            n = send(fd, data + sent, len - sent, 0);
+        }
+        if (n <= 0) {
+            if (errno == EINTR) continue;  /* Retry on signal interruption */
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+    return 0;
+}
+
 int report_generate(const agent_config_t *config, char *buf, size_t buf_len) {
     if (!config || !buf || buf_len == 0) return -1;
     
@@ -112,28 +190,33 @@ int report_generate(const agent_config_t *config, char *buf, size_t buf_len) {
     int len = snprintf(buf, buf_len,
         "{"
         "\"cpu\":{\"usage\":%.2f},"
-        "\"ram\":{\"total\":%lu,\"used\":%lu},"
-        "\"swap\":{\"total\":%lu,\"used\":%lu},"
+        "\"ram\":{\"total\":%" PRIu64 ",\"used\":%" PRIu64 "},"
+        "\"swap\":{\"total\":%" PRIu64 ",\"used\":%" PRIu64 "},"
         "\"load\":{\"load1\":%.2f,\"load5\":%.2f,\"load15\":%.2f},"
-        "\"disk\":{\"total\":%lu,\"used\":%lu},"
-        "\"network\":{\"up\":%lu,\"down\":%lu,\"totalUp\":%lu,\"totalDown\":%lu},"
+        "\"disk\":{\"total\":%" PRIu64 ",\"used\":%" PRIu64 "},"
+        "\"network\":{\"up\":%" PRIu64 ",\"down\":%" PRIu64 ",\"totalUp\":%" PRIu64 ",\"totalDown\":%" PRIu64 "},"
         "\"connections\":{\"tcp\":%d,\"udp\":%d},"
-        "\"uptime\":%lu,"
+        "\"uptime\":%" PRIu64 ","
         "\"process\":%d,"
         "\"message\":\"\""
         "}",
         cpu_usage,
-        (unsigned long)mem.total, (unsigned long)mem.used,
-        (unsigned long)swap.total, (unsigned long)swap.used,
+        mem.total, mem.used,
+        swap.total, swap.used,
         load.load1, load.load5, load.load15,
-        (unsigned long)disk.total, (unsigned long)disk.used,
-        (unsigned long)net.tx_speed, (unsigned long)net.rx_speed,
-        (unsigned long)net.tx_bytes, (unsigned long)net.rx_bytes,
+        disk.total, disk.used,
+        net.tx_speed, net.rx_speed,
+        net.tx_bytes, net.rx_bytes,
         conn.tcp_count, conn.udp_count,
-        (unsigned long)uptime,
+        uptime,
         process_count
     );
-    
+
+    /* Treat truncation or encoding error as failure: a truncated JSON body
+     * would be rejected by the server and could expose partial/malformed
+     * data. */
+    if (len < 0 || (size_t)len >= buf_len) return -1;
+
     return len;
 }
 
@@ -153,18 +236,19 @@ static int report_wrap_v2(const char *v1_json, char *buf, size_t buf_len,
     if (!v1_json || !buf || buf_len == 0 || !builder) return -1;
 
     /* Parse the v1 JSON into a cJSON object so the v2 builder can attach it
-     * under params.report / params.info. cJSON_Parse is thread-safe. */
+     * under params.report / params.info. cJSON_Parse is thread-safe.
+     *
+     * Ownership of `data` is transferred to the builder on success. The
+     * builder also takes care of freeing `data` on every failure path
+     * (MIN-43), so this function must NOT free `data` after a builder
+     * failure - doing so would be a double-free when the builder already
+     * freed it via cJSON_Delete(params). */
     cJSON *data = cJSON_Parse(v1_json);
     if (!data) return -1;
 
     char *v2_str = NULL;
     if (builder(data, &v2_str) != 0) {
-        /* v2_build_*_payload transfers ownership of data on input; on the
-         * failure path the underlying jsonrpc_build_*_payload may have
-         * leaked data when cJSON_CreateObject() failed, so free it here to
-         * avoid a leak. On the success path data is owned by the root
-         * object and freed internally. */
-        cJSON_Delete(data);
+        /* data has been freed by the builder (MIN-43). */
         return -1;
     }
 
@@ -206,7 +290,13 @@ int report_generate_v2_with_acks(const agent_config_t *config, char *buf,
     v1_buf[sizeof(v1_buf) - 1] = '\0';
 
     /* Parse the v1 JSON into a cJSON object so jsonrpc_build_report_request
-     * can attach it under params.report. cJSON_Parse is thread-safe. */
+     * can attach it under params.report. cJSON_Parse is thread-safe.
+     *
+     * Ownership of `data` is transferred to jsonrpc_build_report_request on
+     * success, and the builder also frees `data` on every failure path
+     * (MIN-43). Do NOT free `data` here after a builder failure - that
+     * would be a double-free when the builder already freed it via
+     * cJSON_Delete(params). */
     cJSON *data = cJSON_Parse(v1_buf);
     if (!data) return -1;
 
@@ -217,9 +307,7 @@ int report_generate_v2_with_acks(const agent_config_t *config, char *buf,
     int request_id = (int)time(NULL);
     cJSON *root = jsonrpc_build_report_request(request_id, data, ack_ids, ack_count);
     if (!root) {
-        /* On failure, jsonrpc_build_report_request may have leaked data when
-         * cJSON_CreateObject() failed; free it here to avoid a leak. */
-        cJSON_Delete(data);
+        /* data has been freed by the builder (MIN-43). */
         return -1;
     }
 
@@ -283,9 +371,9 @@ int report_generate_basic_info(const agent_config_t *config, char *buf, size_t b
         "\"kernel_version\":\"%s\","
         "\"ipv4\":\"%s\","
         "\"ipv6\":\"%s\","
-        "\"mem_total\":%lu,"
-        "\"swap_total\":%lu,"
-        "\"disk_total\":%lu,"
+        "\"mem_total\":%" PRIu64 ","
+        "\"swap_total\":%" PRIu64 ","
+        "\"disk_total\":%" PRIu64 ","
         "\"gpu_name\":\"%s\","
         "\"virtualization\":\"%s\","
         "\"version\":\"1.0.0\""
@@ -297,12 +385,17 @@ int report_generate_basic_info(const agent_config_t *config, char *buf, size_t b
         kernel_escaped,
         ipv4_val,
         ipv6_val,
-        (unsigned long)mem.total,
-        (unsigned long)swap.total,
-        (unsigned long)disk.total,
+        mem.total,
+        swap.total,
+        disk.total,
         gpu_name_escaped,
         virt_type
     );
+
+    /* Treat truncation or encoding error as failure: a truncated JSON body
+     * would be rejected by the server and could expose partial/malformed
+     * data. */
+    if (len < 0 || (size_t)len >= buf_len) return -1;
 
     return len;
 }
@@ -378,7 +471,10 @@ static int http_post_with_headers(const char *url, const char *payload, int igno
     
     /* DNS resolution: iterate through all addresses for IPv4/IPv6 support */
     char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
+    int port_n = snprintf(port_str, sizeof(port_str), "%d", port);
+    if (port_n < 0 || (size_t)port_n >= sizeof(port_str)) {
+        return -1;
+    }
 
     struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof(hints));
@@ -396,7 +492,7 @@ static int http_post_with_headers(const char *url, const char *payload, int igno
 
         /* Set timeout */
         struct timeval tv;
-        tv.tv_sec = 10;
+        tv.tv_sec = HTTP_CONNECT_TIMEOUT_SEC;
         tv.tv_usec = 0;
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -431,10 +527,23 @@ static int http_post_with_headers(const char *url, const char *payload, int igno
             return -1;
         }
         
+        /*
+         * Mirror the Go reference implementation (see .komari-agent-main/
+         * server/websocket.go newWSDialer): a tls.Config verifies the
+         * peer by default; only set InsecureSkipVerify when ignore_cert
+         * is explicitly requested. Without this, MITM attackers can
+         * present any certificate and the handshake still succeeds.
+         */
         if (ignore_cert) {
             SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
+        } else {
+            /* Enable certificate verification by default (mirrors Go
+             * tls.Config default). Load the system CA store so chain
+             * verification can succeed, then require peer verification. */
+            SSL_CTX_set_default_verify_paths(ssl_ctx);
+            SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
         }
-        
+
         ssl = SSL_new(ssl_ctx);
         if (!ssl) {
             SSL_CTX_free(ssl_ctx);
@@ -444,7 +553,20 @@ static int http_post_with_headers(const char *url, const char *payload, int igno
         
         SSL_set_fd(ssl, fd);
         SSL_set_tlsext_host_name(ssl, host);
-        
+        /*
+         * Verify hostname against certificate (mirrors Go
+         * tls.Config.ServerName). SSL_set1_host is available in
+         * OpenSSL 1.0.2+; for older builds we fall back to
+         * SSL_VERIFY_PEER chain-only verification.
+         */
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+        if (!ignore_cert) {
+            SSL_set1_host(ssl, host);
+        }
+#else
+        /* Fallback: rely on SSL_CTX_set_verify with SSL_VERIFY_PEER only */
+#endif
+
         if (SSL_connect(ssl) <= 0) {
             SSL_free(ssl);
             SSL_CTX_free(ssl_ctx);
@@ -452,7 +574,7 @@ static int http_post_with_headers(const char *url, const char *payload, int igno
             return -1;
         }
     }
-    
+
     /* Build HTTP request */
     char request[16384];
     int req_len;
@@ -487,24 +609,8 @@ static int http_post_with_headers(const char *url, const char *payload, int igno
         return -1;
     }
 
-    /* Send request: loop until all bytes are flushed. send(2) and SSL_write
-     * may return fewer bytes than requested, so retry the remainder. */
-    size_t sent = 0;
-    while (sent < (size_t)req_len) {
-        ssize_t n;
-        if (ssl) {
-            n = SSL_write(ssl, request + sent, req_len - sent);
-        } else {
-            n = send(fd, request + sent, req_len - sent, 0);
-        }
-        if (n <= 0) {
-            if (!ssl && n < 0 && errno == EINTR) continue;
-            break;  /* error or connection closed */
-        }
-        sent += (size_t)n;
-    }
-
-    if (sent < (size_t)req_len) {
+    /* Send the entire request, handling partial writes and EINTR. */
+    if (send_full(ssl, fd, request, (size_t)req_len) != 0) {
         if (ssl) SSL_free(ssl);
         if (ssl_ctx) SSL_CTX_free(ssl_ctx);
         close(fd);
@@ -546,6 +652,8 @@ static int http_post_with_headers(const char *url, const char *payload, int igno
     return ret;
 }
 
+/* Thin wrapper around http_post_with_headers for callers that do not need
+ * custom headers. Forwards the same arguments with extra_headers=NULL. */
 static int http_post(const char *url, const char *payload, int ignore_cert) {
     return http_post_with_headers(url, payload, ignore_cert, NULL);
 }
@@ -578,14 +686,30 @@ int report_upload_task_result(const agent_config_t *config,
      * The server side already supports this auth scheme, so changing to a
      * header-based approach would break compatibility.
      */
-    char url[512];
-    snprintf(url, sizeof(url), "%s/api/clients/task/result?token=%s",
-             config->endpoint, config->token);
+    /* URL-encode the token to handle special characters safely (mirrors
+     * Go url.QueryEscape used by the reference client). The encoded form
+     * may be up to 3x the original length (each byte -> %XX). */
+    char encoded_token[MAX_TOKEN_LEN * 3 + 1];
+    if (url_encode(config->token, encoded_token, sizeof(encoded_token)) < 0) {
+        free(escaped_result);
+        free(escaped_task_id);
+        return -1;
+    }
+
+    /* Size URL buffer for endpoint + path + encoded token with margin. */
+    char url[MAX_ENDPOINT_LEN + 64 + MAX_TOKEN_LEN * 3 + 1];
+    int url_n = snprintf(url, sizeof(url), "%s/api/clients/task/result?token=%s",
+                         config->endpoint, encoded_token);
+    if (url_n < 0 || (size_t)url_n >= sizeof(url)) {
+        free(escaped_result);
+        free(escaped_task_id);
+        return -1;
+    }
 
     char payload[8192];
     int n = snprintf(payload, sizeof(payload),
-        "{\"task_id\":\"%s\",\"result\":\"%s\",\"exit_code\":%d,\"finished_at\":%lu}",
-        escaped_task_id, escaped_result, exit_code, (unsigned long)finished_at);
+        "{\"task_id\":\"%s\",\"result\":\"%s\",\"exit_code\":%d,\"finished_at\":%" PRIu64 "}",
+        escaped_task_id, escaped_result, exit_code, finished_at);
 
     free(escaped_result);
     free(escaped_task_id);
@@ -598,10 +722,13 @@ int report_upload_task_result(const agent_config_t *config,
 
     char headers[512] = "";
     if (config->cf_access_client_id[0] != '\0' && config->cf_access_client_secret[0] != '\0') {
-        snprintf(headers, sizeof(headers),
+        int hdr_n = snprintf(headers, sizeof(headers),
                  "CF-Access-Client-Id: %s\r\n"
                  "CF-Access-Client-Secret: %s\r\n",
                  config->cf_access_client_id, config->cf_access_client_secret);
+        if (hdr_n < 0 || (size_t)hdr_n >= sizeof(headers)) {
+            return -1;
+        }
     }
     
     return http_post_with_headers(url, payload, config->ignore_unsafe_cert,
@@ -614,25 +741,55 @@ int report_upload_ping_result(const agent_config_t *config,
                                int value,
                                uint64_t finished_at) {
     if (!config || !ping_type) return -1;
-    
+
+    /* Escape ping_type before embedding it into the JSON payload to prevent
+     * log injection / JSON structural breakage when the field contains
+     * quotes, backslashes or control characters (MIN-18, T26.4). Mirrors
+     * the escaping applied to task_id/result in report_upload_task_result. */
+    char *escaped_ping_type = utils_json_escape(ping_type);
+    if (!escaped_ping_type) return -1;
+
     /* Token passed via URL query string by design; see design note above. */
-    char url[512];
-    snprintf(url, sizeof(url), "%s/api/clients/ping/result?token=%s",
-             config->endpoint, config->token);
-    
+    /* URL-encode the token to handle special characters safely (mirrors
+     * Go url.QueryEscape used by the reference client). */
+    char encoded_token[MAX_TOKEN_LEN * 3 + 1];
+    if (url_encode(config->token, encoded_token, sizeof(encoded_token)) < 0) {
+        free(escaped_ping_type);
+        return -1;
+    }
+
+    /* Size URL buffer for endpoint + path + encoded token with margin. */
+    char url[MAX_ENDPOINT_LEN + 64 + MAX_TOKEN_LEN * 3 + 1];
+    int url_n = snprintf(url, sizeof(url), "%s/api/clients/ping/result?token=%s",
+                         config->endpoint, encoded_token);
+    if (url_n < 0 || (size_t)url_n >= sizeof(url)) {
+        free(escaped_ping_type);
+        return -1;
+    }
+
     char payload[512];
-    snprintf(payload, sizeof(payload),
-        "{\"type\":\"ping_result\",\"task_id\":%u,\"ping_type\":\"%s\",\"value\":%d,\"finished_at\":%lu}",
-        task_id, ping_type, value, (unsigned long)finished_at);
-    
+    int payload_n = snprintf(payload, sizeof(payload),
+        "{\"type\":\"ping_result\",\"task_id\":%u,\"ping_type\":\"%s\",\"value\":%d,\"finished_at\":%" PRIu64 "}",
+        task_id, escaped_ping_type, value, finished_at);
+    if (payload_n < 0 || (size_t)payload_n >= sizeof(payload)) {
+        free(escaped_ping_type);
+        return -1;
+    }
+
+    /* escaped_ping_type is no longer needed once the payload has been built. */
+    free(escaped_ping_type);
+
     char headers[512] = "";
     if (config->cf_access_client_id[0] != '\0' && config->cf_access_client_secret[0] != '\0') {
-        snprintf(headers, sizeof(headers),
+        int hdr_n = snprintf(headers, sizeof(headers),
                  "CF-Access-Client-Id: %s\r\n"
                  "CF-Access-Client-Secret: %s\r\n",
                  config->cf_access_client_id, config->cf_access_client_secret);
+        if (hdr_n < 0 || (size_t)hdr_n >= sizeof(headers)) {
+            return -1;
+        }
     }
-    
+
     return http_post_with_headers(url, payload, config->ignore_unsafe_cert,
                                    headers[0] != '\0' ? headers : NULL);
 }

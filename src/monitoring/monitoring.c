@@ -10,6 +10,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
@@ -28,6 +30,7 @@
 #include "monitoring.h"
 #include "utils.h"
 #include "config.h"
+#include "logger.h"
 
 static const agent_config_t *g_config = NULL;
 
@@ -69,6 +72,8 @@ int monitoring_get_cpu_info(cpu_info_t *info) {
                     char *nl = strchr(colon, '\n');
                     if (nl) *nl = '\0';
                     strncpy(info->cpu_name, colon, sizeof(info->cpu_name) - 1);
+                    /* Explicit NUL termination in case source fills the buffer (MIN-50/51). */
+                    info->cpu_name[sizeof(info->cpu_name) - 1] = '\0';
                 }
                 break;
             }
@@ -88,23 +93,43 @@ int monitoring_get_cpu_info(cpu_info_t *info) {
             unsigned long long total = user + nice + system + idle + iowait + irq + softirq;
             unsigned long long used = user + nice + system + irq + softirq;
             
-            /* Sleep in smaller increments for responsiveness */
+            /* Sleep in smaller increments for responsiveness.
+               Use nanosleep instead of the deprecated usleep (MIN-26).
+               Restart on EINTR to honor the configured 100ms sampling
+               window so the CPU usage delta is measured accurately. */
+            struct timespec sleep_ts;
+            sleep_ts.tv_sec = 0;
+            sleep_ts.tv_nsec = 10 * 1000 * 1000;  /* 10ms */
             for (int i = 0; i < 10; i++) {
-                usleep(10000);
+                struct timespec req = sleep_ts;
+                while (nanosleep(&req, &req) == -1 && errno == EINTR) {
+                    /* Retry with remaining time updated by nanosleep. */
+                }
             }
             
-            fseek(stat_fp, 0, SEEK_SET);
-            unsigned long long user2, nice2, system2, idle2, iowait2, irq2, softirq2;
-            if (fscanf(stat_fp, "cpu %llu %llu %llu %llu %llu %llu %llu",
-                       &user2, &nice2, &system2, &idle2, &iowait2, &irq2, &softirq2) == 7) {
-                unsigned long long total2 = user2 + nice2 + system2 + idle2 + iowait2 + irq2 + softirq2;
-                unsigned long long used2 = user2 + nice2 + system2 + irq2 + softirq2;
-                
-                unsigned long long total_diff = total2 - total;
-                unsigned long long used_diff = used2 - used;
-                
-                if (total_diff > 0) {
-                    info->cpu_usage = (double)used_diff / total_diff * 100.0;
+            /* MIN-68: Check fseek return value. If rewinding /proc/stat fails
+             * (e.g. on a transient I/O error or a sealed file descriptor),
+             * the second fscanf would re-read the already-consumed line and
+             * produce a zero delta. Skip the second sample so CPU usage
+             * falls back to 0.0% for this cycle instead of reporting a
+             * misleading value. */
+            if (fseek(stat_fp, 0, SEEK_SET) != 0) {
+                KOMARI_LOG_WARN("monitoring: fseek(/proc/stat) failed: %s",
+                                strerror(errno));
+                /* Fall through: cpu_usage stays at 0.0 for this cycle. */
+            } else {
+                unsigned long long user2, nice2, system2, idle2, iowait2, irq2, softirq2;
+                if (fscanf(stat_fp, "cpu %llu %llu %llu %llu %llu %llu %llu",
+                           &user2, &nice2, &system2, &idle2, &iowait2, &irq2, &softirq2) == 7) {
+                    unsigned long long total2 = user2 + nice2 + system2 + idle2 + iowait2 + irq2 + softirq2;
+                    unsigned long long used2 = user2 + nice2 + system2 + irq2 + softirq2;
+
+                    unsigned long long total_diff = total2 - total;
+                    unsigned long long used_diff = used2 - used;
+
+                    if (total_diff > 0) {
+                        info->cpu_usage = (double)used_diff / total_diff * 100.0;
+                    }
                 }
             }
         }
@@ -233,11 +258,30 @@ int monitoring_get_disk_info(disk_info_t *info) {
             
             struct statvfs st;
             if (statvfs(mountpoint, &st) == 0) {
-                uint64_t total = st.f_blocks * st.f_frsize;
-                uint64_t free = st.f_bfree * st.f_frsize;
-                
-                info->total += total;
-                info->free += free;
+                /* Cast to uint64_t before multiplication to avoid 32-bit
+                   overflow on platforms where `unsigned long` is 32 bits,
+                   and defensively clamp on uint64_t overflow (MIN-27/28). */
+                uint64_t frsize = (uint64_t)st.f_frsize;
+                uint64_t blocks = (uint64_t)st.f_blocks;
+                uint64_t bfree  = (uint64_t)st.f_bfree;
+
+                uint64_t total = (frsize != 0 && blocks > UINT64_MAX / frsize)
+                                 ? UINT64_MAX : blocks * frsize;
+                uint64_t free  = (frsize != 0 && bfree  > UINT64_MAX / frsize)
+                                 ? UINT64_MAX : bfree  * frsize;
+
+                /* Clamp running totals to UINT64_MAX to prevent addition
+                   overflow when aggregating across multiple mounts. */
+                if (total > UINT64_MAX - info->total) {
+                    info->total = UINT64_MAX;
+                } else {
+                    info->total += total;
+                }
+                if (free > UINT64_MAX - info->free) {
+                    info->free = UINT64_MAX;
+                } else {
+                    info->free += free;
+                }
             }
         }
     }
@@ -304,8 +348,11 @@ int monitoring_get_net_info(net_info_t *info) {
             /* Guard against counter wraparound or reset to avoid underflow */
             uint64_t rx_diff = (total_rx >= g_last_rx) ? (total_rx - g_last_rx) : 0;
             uint64_t tx_diff = (total_tx >= g_last_tx) ? (total_tx - g_last_tx) : 0;
-            info->rx_speed = rx_diff / time_diff;
-            info->tx_speed = tx_diff / time_diff;
+            /* Use floating-point division and round to nearest to avoid
+               integer truncation that systematically under-reports the
+               transfer rate (MIN-29/30). */
+            info->rx_speed = (uint64_t)((double)rx_diff / (double)time_diff + 0.5);
+            info->tx_speed = (uint64_t)((double)tx_diff / (double)time_diff + 0.5);
         }
     }
     
@@ -403,6 +450,8 @@ int monitoring_get_system_info(system_info_t *info) {
                         end--;
                     }
                     strncpy(info->os_name, eq, sizeof(info->os_name) - 1);
+                    /* Explicit NUL termination in case source fills the buffer (MIN-50/51). */
+                    info->os_name[sizeof(info->os_name) - 1] = '\0';
                 }
                 break;
             }
@@ -417,8 +466,12 @@ int monitoring_get_system_info(system_info_t *info) {
     struct utsname uts;
     if (uname(&uts) == 0) {
         strncpy(info->kernel_version, uts.release, sizeof(info->kernel_version) - 1);
+        /* Explicit NUL termination in case source fills the buffer (MIN-50/51). */
+        info->kernel_version[sizeof(info->kernel_version) - 1] = '\0';
         strncpy(info->arch, uts.machine, sizeof(info->arch) - 1);
+        info->arch[sizeof(info->arch) - 1] = '\0';
         strncpy(info->hostname, uts.nodename, sizeof(info->hostname) - 1);
+        info->hostname[sizeof(info->hostname) - 1] = '\0';
     }
     
     info->uptime = monitoring_get_uptime();
@@ -489,6 +542,8 @@ int monitoring_get_ip_address(char *ipv4, size_t ipv4_len,
             if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
                            host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST) == 0) {
                 strncpy(ipv4, host, ipv4_len - 1);
+                /* Explicit NUL termination in case source fills the buffer (MIN-50/51). */
+                ipv4[ipv4_len - 1] = '\0';
             }
         } else if (family == AF_INET6 && ipv6 && ipv6[0] == '\0') {
             char host[NI_MAXHOST];
@@ -497,6 +552,7 @@ int monitoring_get_ip_address(char *ipv4, size_t ipv4_len,
                 if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in6),
                                host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST) == 0) {
                     strncpy(ipv6, host, ipv6_len - 1);
+                    ipv6[ipv6_len - 1] = '\0';
                 }
             }
         }

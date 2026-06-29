@@ -14,10 +14,15 @@
 /* Auto-discovery configuration file path (temporary file, may be lost after restart) */
 #define AUTODISCOVERY_FILE_PATH "/tmp/komari-auto-discovery.json"
 
+/* Token buffer length: keep consistent with MAX_TOKEN_LEN in config.h so the
+ * token acquired via registration can always fit into the agent_config_t
+ * token field without truncation. */
+#define AUTODISCOVERY_TOKEN_LEN 256
+
 /* Auto-discovery configuration data structure */
 typedef struct {
-    char uuid[64];    /* Client UUID */
-    char token[128];  /* Client communication token */
+    char uuid[64];                      /* Client UUID */
+    char token[AUTODISCOVERY_TOKEN_LEN]; /* Client communication token */
 } autodiscovery_config_t;
 
 /**

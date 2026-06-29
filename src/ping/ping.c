@@ -16,6 +16,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/icmp6.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -54,12 +55,54 @@ static int64_t get_time_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* Apply a millisecond-granularity send/receive timeout to a socket.
+ * Used by TCP and HTTP ping to bound how long a stuck peer can block the
+ * ping worker. Both SO_RCVTIMEO and SO_SNDTIMEO are set so a half-open
+ * connection fails promptly in either direction. */
 static void set_socket_timeout(int fd, int timeout_ms) {
     struct timeval tv;
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+/* Detect the address family of a numeric IP literal.
+ * Returns AF_INET, AF_INET6, or -1 when the string is not a valid IP
+ * literal. Uses temporary in_addr/in6_addr buffers so the caller's
+ * destination buffer (which may be smaller than sizeof(struct in6_addr))
+ * is never overwritten with binary address data. */
+static int parse_ip_family(const char *ip, struct in_addr *addr4,
+                           struct in6_addr *addr6) {
+    if (inet_pton(AF_INET, ip, addr4) == 1) {
+        return AF_INET;
+    }
+    if (inet_pton(AF_INET6, ip, addr6) == 1) {
+        return AF_INET6;
+    }
+    return -1;
+}
+
+/* Strip surrounding brackets from an IPv6 literal in-place, e.g. "[::1]" -> "::1".
+ * Mirrors Go strings.Trim(host, "[]") used by tcpPing/httpPing in
+ * .komari-agent-main/server/task.go. The buffer is NUL-terminated after
+ * the trimmed address. Returns 0 on success, -1 if the brackets are
+ * unbalanced. */
+static int strip_ipv6_brackets(char *host, size_t host_size) {
+    if (host[0] != '[') {
+        return 0;
+    }
+    char *end = strchr(host, ']');
+    if (!end) {
+        return -1;
+    }
+    size_t inner = (size_t)(end - host) - 1; /* exclude leading '[' */
+    if (inner >= host_size) {
+        return -1;
+    }
+    memmove(host, host + 1, inner);
+    host[inner] = '\0';
+    return 0;
 }
 
 int ping_resolve_ip(const char *target, char *ip_out, size_t ip_size, const char *custom_dns) {
@@ -114,12 +157,44 @@ int ping_resolve_ip(const char *target, char *ip_out, size_t ip_size, const char
 }
 
 int ping_task_icmp(const char *target, int timeout_ms, const char *custom_dns) {
+    /* Trim surrounding [] from a bracketed IPv6 literal, e.g. "[::1]" -> "::1".
+     * Mirrors Go strings.Trim(host, "[]") used by icmpPing in
+     * .komari-agent-main/server/task.go. */
+    char host_buf[256];
+    const char *host = target;
+    if (target[0] == '[') {
+        strncpy(host_buf, target, sizeof(host_buf) - 1);
+        host_buf[sizeof(host_buf) - 1] = '\0';
+        if (strip_ipv6_brackets(host_buf, sizeof(host_buf)) != 0) {
+            KOMARI_LOG_ERROR("Unbalanced IPv6 brackets in target: %s", target);
+            return -1;
+        }
+        host = host_buf;
+    }
+
     char ip[INET6_ADDRSTRLEN];
-    if (ping_resolve_ip(target, ip, sizeof(ip), custom_dns) != 0) {
+    if (ping_resolve_ip(host, ip, sizeof(ip), custom_dns) != 0) {
         return -1;
     }
 
-    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    /* Detect the address family of the resolved IP literal using temporary
+     * buffers (MAJ-16) so we never write 16-byte IPv6 binary data into a
+     * smaller caller-provided buffer. */
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    int family = parse_ip_family(ip, &addr4, &addr6);
+    if (family != AF_INET && family != AF_INET6) {
+        return -1;
+    }
+
+    /* Create a raw socket matching the address family. IPv6 uses
+     * IPPROTO_ICMPV6 (T10.2). */
+    int fd;
+    if (family == AF_INET) {
+        fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    } else {
+        fd = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    }
     if (fd < 0) {
         KOMARI_LOG_ERROR("ICMP socket creation failed (need root): %s", strerror(errno));
         return -1;
@@ -127,39 +202,60 @@ int ping_task_icmp(const char *target, int timeout_ms, const char *custom_dns) {
 
     set_socket_timeout(fd, timeout_ms);
 
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    if (inet_pton(AF_INET, ip, &dest_addr.sin_addr) != 1) {
-        close(fd);
-        return -1;
+    /* Build the ICMP/ICMPv6 echo request payload. ICMPv6 checksums are
+     * computed by the kernel for raw sockets, so we leave it zero. */
+    uint8_t packet[64];
+    memset(packet, 0, sizeof(packet));
+    int packet_len;
+    uint16_t echo_id = (uint16_t)(getpid() & 0xFFFF);
+
+    if (family == AF_INET) {
+        struct icmphdr *hdr = (struct icmphdr *)packet;
+        hdr->type = ICMP_ECHO;
+        hdr->code = 0;
+        hdr->un.echo.id = echo_id;
+        hdr->un.echo.sequence = 1;
+        packet_len = (int)sizeof(struct icmphdr) + 56; /* header + 56 bytes padding */
+        hdr->checksum = 0;
+        hdr->checksum = compute_checksum((uint16_t *)packet, packet_len);
+    } else {
+        struct icmp6_hdr *hdr = (struct icmp6_hdr *)packet;
+        hdr->icmp6_type = ICMP6_ECHO_REQUEST;
+        hdr->icmp6_code = 0;
+        hdr->icmp6_id = echo_id;
+        hdr->icmp6_seq = 1;
+        /* icmp6_cksum is filled in by the kernel for SOCK_RAW on Linux. */
+        packet_len = (int)sizeof(struct icmp6_hdr) + 56;
     }
-
-    struct {
-        struct icmphdr hdr;
-        char data[56];
-    } packet;
-
-    memset(&packet, 0, sizeof(packet));
-    packet.hdr.type = ICMP_ECHO;
-    packet.hdr.code = 0;
-    packet.hdr.un.echo.id = getpid() & 0xFFFF;
-    packet.hdr.un.echo.sequence = 1;
-    packet.hdr.checksum = 0;
-
-    int len = sizeof(packet);
-    packet.hdr.checksum = compute_checksum((uint16_t *)&packet, len);
 
     int64_t start_time = get_time_ms();
 
-    if (sendto(fd, &packet, len, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
-        KOMARI_LOG_ERROR("ICMP send failed: %s", strerror(errno));
-        close(fd);
-        return -1;
+    if (family == AF_INET) {
+        struct sockaddr_in dest_addr;
+        memset(&dest_addr, 0, sizeof(dest_addr));
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_addr = addr4;
+        if (sendto(fd, packet, (size_t)packet_len, 0,
+                   (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+            KOMARI_LOG_ERROR("ICMP send failed: %s", strerror(errno));
+            close(fd);
+            return -1;
+        }
+    } else {
+        struct sockaddr_in6 dest_addr;
+        memset(&dest_addr, 0, sizeof(dest_addr));
+        dest_addr.sin6_family = AF_INET6;
+        dest_addr.sin6_addr = addr6;
+        if (sendto(fd, packet, (size_t)packet_len, 0,
+                   (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+            KOMARI_LOG_ERROR("ICMPv6 send failed: %s", strerror(errno));
+            close(fd);
+            return -1;
+        }
     }
 
     char recv_buf[1024];
-    struct sockaddr_in src_addr;
+    struct sockaddr_storage src_addr;
     socklen_t src_len = sizeof(src_addr);
 
     while (1) {
@@ -169,7 +265,8 @@ int ping_task_icmp(const char *target, int timeout_ms, const char *custom_dns) {
             return -1;
         }
 
-        int n = recvfrom(fd, recv_buf, sizeof(recv_buf), 0, (struct sockaddr *)&src_addr, &src_len);
+        int n = recvfrom(fd, recv_buf, sizeof(recv_buf), 0,
+                         (struct sockaddr *)&src_addr, &src_len);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
@@ -178,41 +275,65 @@ int ping_task_icmp(const char *target, int timeout_ms, const char *custom_dns) {
             return -1;
         }
 
-        /* Reject ICMP responses that originate from a different host than the
-           one we probed; otherwise stray packets from other hosts could be
-           mistaken for our echo reply. */
-        if (src_addr.sin_family != AF_INET ||
-            src_addr.sin_addr.s_addr != dest_addr.sin_addr.s_addr) {
-            continue;
-        }
+        if (family == AF_INET) {
+            struct sockaddr_in *src_v4 = (struct sockaddr_in *)&src_addr;
+            /* Reject ICMP responses that originate from a different host than the
+               one we probed; otherwise stray packets from other hosts could be
+               mistaken for our echo reply. */
+            if (src_v4->sin_family != AF_INET ||
+                src_v4->sin_addr.s_addr != addr4.s_addr) {
+                continue;
+            }
 
-        /* Validate that the received datagram is large enough to hold an IP header. */
-        if (n < (int)sizeof(struct iphdr)) {
-            continue;
-        }
+            /* Validate that the received datagram is large enough to hold an IP header. */
+            if (n < (int)sizeof(struct iphdr)) {
+                continue;
+            }
 
-        struct iphdr *iph = (struct iphdr *)recv_buf;
+            struct iphdr *iph = (struct iphdr *)recv_buf;
 
-        /* Validate the IP header length field (ihl is in 32-bit words, minimum 5). */
-        int ip_hdr_len = iph->ihl * 4;
-        if (iph->ihl < 5 || ip_hdr_len > n) {
-            continue;
-        }
+            /* Validate the IP header length field (ihl is in 32-bit words, minimum 5). */
+            int ip_hdr_len = iph->ihl * 4;
+            if (iph->ihl < 5 || ip_hdr_len > n) {
+                continue;
+            }
 
-        if (iph->protocol != IPPROTO_ICMP) {
-            continue;
-        }
+            if (iph->protocol != IPPROTO_ICMP) {
+                continue;
+            }
 
-        /* Ensure the ICMP header fits within the remaining payload. */
-        if (ip_hdr_len > n - (int)sizeof(struct icmphdr)) {
-            continue;
-        }
+            /* Ensure the ICMP header fits within the remaining payload. */
+            if (ip_hdr_len > n - (int)sizeof(struct icmphdr)) {
+                continue;
+            }
 
-        struct icmphdr *icmph = (struct icmphdr *)(recv_buf + ip_hdr_len);
-        if (icmph->type == ICMP_ECHOREPLY && icmph->un.echo.id == packet.hdr.un.echo.id) {
-            int64_t end_time = get_time_ms();
-            close(fd);
-            return (int)(end_time - start_time);
+            struct icmphdr *icmph = (struct icmphdr *)(recv_buf + ip_hdr_len);
+            if (icmph->type == ICMP_ECHOREPLY && icmph->un.echo.id == echo_id) {
+                int64_t end_time = get_time_ms();
+                close(fd);
+                return (int)(end_time - start_time);
+            }
+        } else {
+            struct sockaddr_in6 *src_v6 = (struct sockaddr_in6 *)&src_addr;
+            /* For IPv6 raw sockets the kernel strips the IPv6 header, so the
+             * payload starts with the ICMPv6 header. Verify the source
+             * address matches the target before accepting the reply. */
+            if (src_v6->sin6_family != AF_INET6 ||
+                memcmp(&src_v6->sin6_addr, &addr6, sizeof(addr6)) != 0) {
+                continue;
+            }
+
+            if (n < (int)sizeof(struct icmp6_hdr)) {
+                continue;
+            }
+
+            struct icmp6_hdr *icmp6h = (struct icmp6_hdr *)recv_buf;
+            if (icmp6h->icmp6_type == ICMP6_ECHO_REPLY &&
+                icmp6h->icmp6_id == echo_id) {
+                int64_t end_time = get_time_ms();
+                close(fd);
+                return (int)(end_time - start_time);
+            }
         }
     }
 
@@ -223,7 +344,9 @@ int ping_task_icmp(const char *target, int timeout_ms, const char *custom_dns) {
 int ping_task_tcp(const char *target, int timeout_ms, const char *custom_dns) {
     /* Split host:port first so the host part can be resolved correctly.
        Use strrchr to locate the last colon, which avoids mistaking the
-       colons inside a literal IPv6 address for the port separator. */
+       colons inside a literal IPv6 address for the port separator. For
+       bracketed IPv6 literals such as "[::1]:80", strrchr lands on the
+       port separator after the closing bracket (T10.3). */
     char host[256];
     char port_str[8] = "80";
     const char *colon = strrchr(target, ':');
@@ -239,6 +362,13 @@ int ping_task_tcp(const char *target, int timeout_ms, const char *custom_dns) {
         host[sizeof(host) - 1] = '\0';
     }
 
+    /* Strip surrounding [] from an IPv6 literal, e.g. "[::1]" -> "::1".
+     * Mirrors Go strings.Trim(host, "[]") used by tcpPing. */
+    if (strip_ipv6_brackets(host, sizeof(host)) != 0) {
+        KOMARI_LOG_ERROR("Unbalanced IPv6 brackets in target: %s", target);
+        return -1;
+    }
+
     /* Resolve only the host part; inet_pton/getaddrinfo cannot parse
        strings that contain a port suffix. */
     char ip[INET6_ADDRSTRLEN];
@@ -251,7 +381,16 @@ int ping_task_tcp(const char *target, int timeout_ms, const char *custom_dns) {
         port = 80;
     }
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    /* Detect the address family of the resolved IP literal so we can
+     * construct the matching sockaddr and socket (T10.3). */
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    int family = parse_ip_family(ip, &addr4, &addr6);
+    if (family != AF_INET && family != AF_INET6) {
+        return -1;
+    }
+
+    int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) {
         KOMARI_LOG_ERROR("TCP socket creation failed: %s", strerror(errno));
         return -1;
@@ -260,18 +399,25 @@ int ping_task_tcp(const char *target, int timeout_ms, const char *custom_dns) {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &dest_addr.sin_addr) != 1) {
-        close(fd);
-        return -1;
-    }
-
     int64_t start_time = get_time_ms();
 
-    int ret = connect(fd, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    int ret;
+    if (family == AF_INET) {
+        struct sockaddr_in dest_addr;
+        memset(&dest_addr, 0, sizeof(dest_addr));
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons((uint16_t)port);
+        dest_addr.sin_addr = addr4;
+        ret = connect(fd, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    } else {
+        struct sockaddr_in6 dest_addr;
+        memset(&dest_addr, 0, sizeof(dest_addr));
+        dest_addr.sin6_family = AF_INET6;
+        dest_addr.sin6_port = htons((uint16_t)port);
+        dest_addr.sin6_addr = addr6;
+        ret = connect(fd, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    }
+
     if (ret < 0 && errno != EINPROGRESS) {
         close(fd);
         return -1;
@@ -308,15 +454,43 @@ int ping_task_tcp(const char *target, int timeout_ms, const char *custom_dns) {
 }
 
 int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
-    char url[512];
+    /* If the target is a bare IPv6 literal (no scheme, no brackets), wrap it
+     * in [] so the resulting URL has a valid authority. Mirrors Go httpPing:
+     *   if ip := net.ParseIP(target); ip != nil && ip.To4() == nil {
+     *       target = "[" + target + "]"
+     *   }
+     * (T10.4)
+     */
+    char adjusted_target[384]; /* INET6_ADDRSTRLEN + brackets + path margin */
+    const char *effective_target = target;
     if (strncmp(target, "http://", 7) != 0 && strncmp(target, "https://", 8) != 0) {
-        snprintf(url, sizeof(url), "http://%s", target);
+        struct in6_addr addr6_test;
+        if (target[0] != '[' && strchr(target, ':') != NULL &&
+            inet_pton(AF_INET6, target, &addr6_test) == 1) {
+            int adj_n = snprintf(adjusted_target, sizeof(adjusted_target), "[%s]", target);
+            if (adj_n < 0 || (size_t)adj_n >= sizeof(adjusted_target)) {
+                return -1; /* MAJ-11: snprintf truncation */
+            }
+            effective_target = adjusted_target;
+        }
+    }
+
+    char url[512];
+    if (strncmp(effective_target, "http://", 7) != 0 &&
+        strncmp(effective_target, "https://", 8) != 0) {
+        int url_n = snprintf(url, sizeof(url), "http://%s", effective_target);
+        if (url_n < 0 || (size_t)url_n >= sizeof(url)) {
+            return -1; /* MAJ-11: snprintf truncation */
+        }
     } else {
-        strncpy(url, target, sizeof(url) - 1);
+        strncpy(url, effective_target, sizeof(url) - 1);
         url[sizeof(url) - 1] = '\0';
     }
 
-    char host[256];
+    /* host_header preserves surrounding [] for IPv6 literals so it can be
+     * used verbatim in the HTTP Host header (RFC 2732). A separate stripped
+     * copy is produced later for DNS resolution. */
+    char host_header[256];
     int port = 80;
     bool use_tls = false;
 
@@ -334,30 +508,53 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
     const char *path_start = strchr(scheme_end, '/');
     if (path_start) {
         size_t host_len = (size_t)(path_start - scheme_end);
-        if (host_len >= sizeof(host)) host_len = sizeof(host) - 1;
-        strncpy(host, scheme_end, host_len);
-        host[host_len] = '\0';
+        if (host_len >= sizeof(host_header)) host_len = sizeof(host_header) - 1;
+        strncpy(host_header, scheme_end, host_len);
+        host_header[host_len] = '\0';
     } else {
-        strncpy(host, scheme_end, sizeof(host) - 1);
-        host[sizeof(host) - 1] = '\0';
+        strncpy(host_header, scheme_end, sizeof(host_header) - 1);
+        host_header[sizeof(host_header) - 1] = '\0';
     }
 
-    const char *colon = strrchr(host, ':');
+    /* Split optional port suffix. For bracketed IPv6 literals the closing
+     * ']' is followed by ':port'; for IPv4/hostname the only colon in the
+     * authority is the port separator. */
+    char *colon = strrchr(host_header, ':');
     if (colon) {
-        port = atoi(colon + 1);
-        char host_copy[256];
-        strncpy(host_copy, host, sizeof(host_copy) - 1);
-        host_copy[colon - host] = '\0';
-        strncpy(host, host_copy, sizeof(host) - 1);
-        host[sizeof(host) - 1] = '\0';
+        char *bracket = strchr(host_header, ']');
+        if (!bracket || colon > bracket) {
+            int parsed_port = atoi(colon + 1);
+            if (parsed_port > 0 && parsed_port <= 65535) {
+                port = parsed_port;
+            }
+            *colon = '\0'; /* truncate host_header at the port separator */
+        }
     }
 
-    char ip[INET6_ADDRSTRLEN];
-    if (ping_resolve_ip(host, ip, sizeof(ip), custom_dns) != 0) {
+    /* Build a stripped copy of the host (without []) for DNS resolution.
+     * Mirrors Go strings.Trim(host, "[]") used by httpPing. */
+    char host_for_resolve[256];
+    strncpy(host_for_resolve, host_header, sizeof(host_for_resolve) - 1);
+    host_for_resolve[sizeof(host_for_resolve) - 1] = '\0';
+    if (strip_ipv6_brackets(host_for_resolve, sizeof(host_for_resolve)) != 0) {
+        KOMARI_LOG_ERROR("Unbalanced IPv6 brackets in URL host: %s", host_header);
         return -1;
     }
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    char ip[INET6_ADDRSTRLEN];
+    if (ping_resolve_ip(host_for_resolve, ip, sizeof(ip), custom_dns) != 0) {
+        return -1;
+    }
+
+    /* Detect address family so we can open the matching socket (T10.4). */
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    int family = parse_ip_family(ip, &addr4, &addr6);
+    if (family != AF_INET && family != AF_INET6) {
+        return -1;
+    }
+
+    int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) {
         KOMARI_LOG_ERROR("HTTP socket creation failed: %s", strerror(errno));
         return -1;
@@ -366,18 +563,25 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &dest_addr.sin_addr) != 1) {
-        close(fd);
-        return -1;
-    }
-
     int64_t start_time = get_time_ms();
 
-    int ret = connect(fd, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    int ret;
+    if (family == AF_INET) {
+        struct sockaddr_in dest_addr;
+        memset(&dest_addr, 0, sizeof(dest_addr));
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons((uint16_t)port);
+        dest_addr.sin_addr = addr4;
+        ret = connect(fd, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    } else {
+        struct sockaddr_in6 dest_addr;
+        memset(&dest_addr, 0, sizeof(dest_addr));
+        dest_addr.sin6_family = AF_INET6;
+        dest_addr.sin6_port = htons((uint16_t)port);
+        dest_addr.sin6_addr = addr6;
+        ret = connect(fd, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    }
+
     if (ret < 0 && errno != EINPROGRESS) {
         close(fd);
         return -1;
@@ -437,6 +641,11 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
            handshake synchronously. */
         fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 
+        /* Apply socket-level timeouts so the TLS handshake and subsequent
+         * SSL_write/SSL_read cannot block indefinitely (T16, MAJ-23).
+         * Mirrors Go http.Client{Timeout: timeout}. */
+        set_socket_timeout(fd, timeout_ms);
+
         if (SSL_connect(ssl) <= 0) {
             KOMARI_LOG_ERROR("HTTP TLS handshake failed");
             SSL_free(ssl);
@@ -447,12 +656,21 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
     }
 
     char request[1024];
-    snprintf(request, sizeof(request),
+    int req_n = snprintf(request, sizeof(request),
              "GET / HTTP/1.1\r\n"
              "Host: %s\r\n"
              "User-Agent: KomariAgent/1.0\r\n"
              "Connection: close\r\n"
-             "\r\n", host);
+             "\r\n", host_header);
+    if (req_n < 0 || (size_t)req_n >= sizeof(request)) {
+        /* MAJ-11: request truncated; abort to avoid sending a malformed HTTP request. */
+        if (use_tls) {
+            SSL_free(ssl);
+            SSL_CTX_free(ssl_ctx);
+        }
+        close(fd);
+        return -1;
+    }
 
     if (use_tls) {
         SSL_write(ssl, request, strlen(request));
@@ -461,7 +679,7 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
     }
 
     char recv_buf[1024];
-    int64_t end_time = start_time;
+    int64_t end_time;
 
     if (use_tls) {
         int n = SSL_read(ssl, recv_buf, sizeof(recv_buf) - 1);
@@ -472,6 +690,7 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
             close(fd);
             return -1;
         }
+        recv_buf[n] = '\0';
     } else {
         int n = recv(fd, recv_buf, sizeof(recv_buf) - 1, 0);
         end_time = get_time_ms();
@@ -479,9 +698,8 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
             close(fd);
             return -1;
         }
+        recv_buf[n] = '\0';
     }
-
-    recv_buf[1023] = '\0';
 
     if (use_tls) {
         SSL_shutdown(ssl);

@@ -95,9 +95,12 @@ int v2_build_task_result_payload(int id, cJSON *task_result, char **output)
     }
     *output = NULL;
 
-    /* jsonrpc_new_request takes ownership of task_result */
+    /* jsonrpc_new_request takes ownership of task_result on success. On
+     * failure it does not free task_result, so free it here for consistent
+     * ownership semantics (MIN-43). */
     cJSON *root = jsonrpc_new_request(id, AGENT_TASK_RESULT, task_result);
     if (!root) {
+        cJSON_Delete(task_result);
         return -1;
     }
 
@@ -303,13 +306,27 @@ int v2_add_ack_event(v2_state_t *state, int event_id)
 
     pthread_mutex_lock(&state->mutex);
 
-    /* Expand capacity when insufficient */
-    if (state->ack_count >= state->ack_capacity) {
+    /* When the limit is reached, drop the oldest ACK ID first. This caps
+     * memory usage when the server floods events faster than the agent
+     * can flush them, mirroring the V2_SEEN_EVENTS_MAX policy. */
+    if (state->ack_count >= V2_ACK_IDS_MAX) {
+        memmove(&state->ack_ids[0], &state->ack_ids[1],
+                (state->ack_count - 1) * sizeof(int));
+        state->ack_count--;
+    }
+
+    /* Expand capacity when insufficient (capped at V2_ACK_IDS_MAX so we
+     * never over-allocate beyond the limit). */
+    if (state->ack_count >= state->ack_capacity &&
+        state->ack_capacity < V2_ACK_IDS_MAX) {
         int new_capacity;
         if (state->ack_capacity == 0) {
             new_capacity = V2_ACK_IDS_INIT_CAPACITY;
         } else {
             new_capacity = state->ack_capacity * 2;
+            if (new_capacity > V2_ACK_IDS_MAX) {
+                new_capacity = V2_ACK_IDS_MAX;
+            }
         }
 
         int *new_ids = (int *)realloc(state->ack_ids,

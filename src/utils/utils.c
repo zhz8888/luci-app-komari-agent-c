@@ -22,38 +22,169 @@
 #include <arpa/inet.h>
 
 #include "utils.h"
+#include "logger.h"
+
+/* Maximum fd value to scan when closing inherited descriptors, used as a
+ * fallback when sysconf(_SC_OPEN_MAX) is unavailable. */
+#define UTILS_FD_CLOSE_FALLBACK 1024
+
+/* Close all open file descriptors starting from lowfd upward.
+ *
+ * After fork() the child inherits a copy of the parent's file descriptor
+ * table. Any descriptor other than stdin/stdout/stderr must be closed before
+ * execvp() to avoid leaking fds (e.g. pipes, sockets, log files) into the
+ * spawned process. */
+static void utils_close_inherited_fds(const int lowfd) {
+#ifdef F_CLOSEM
+    /* Non-standard but efficient: atomically close all fds >= lowfd.
+     * Available on AIX, HP-UX and some BSDs. */
+    if (fcntl(lowfd, F_CLOSEM, 0) == 0) return;
+#endif
+    long max_fd = sysconf(_SC_OPEN_MAX);
+    if (max_fd < 0) max_fd = UTILS_FD_CLOSE_FALLBACK;
+    for (int fd = lowfd; fd < max_fd; fd++) {
+        close(fd);
+    }
+}
+
+/* Common fork + execvp + capture implementation shared by
+ * utils_exec_command() and utils_exec_command_argv().
+ *
+ * Redirects the child's stdout and stderr into a pipe, reads the output in
+ * the parent, and reports the child exit status. Returns 0 on success (the
+ * command may still have failed; check *exit_code), -1 on pipe/fork failure. */
+static int utils_exec_capture(char *const argv[], char *output, size_t output_size, int *exit_code) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        KOMARI_LOG_WARN("exec_capture: pipe() failed: %s", strerror(errno));
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        int saved_errno = errno;
+        close(pipefd[0]);
+        close(pipefd[1]);
+        KOMARI_LOG_WARN("exec_capture: fork() failed: %s", strerror(saved_errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* Child: redirect stdout and stderr to the pipe write end */
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
+            _exit(127);
+        }
+        if (dup2(pipefd[1], STDERR_FILENO) < 0) {
+            _exit(127);
+        }
+        /* Close the original write end unless it aliases a std fd */
+        if (pipefd[1] != STDOUT_FILENO && pipefd[1] != STDERR_FILENO) {
+            close(pipefd[1]);
+        }
+        /* Close every other inherited descriptor to prevent fd leaks */
+        utils_close_inherited_fds(STDERR_FILENO + 1);
+
+        execvp(argv[0], argv);
+        /* execvp only returns on failure */
+        _exit(127);
+    }
+
+    /* Parent: close write end and read child output */
+    close(pipefd[1]);
+
+    size_t total = 0;
+    if (output && output_size > 0) {
+        output[0] = '\0';
+        while (total < output_size - 1) {
+            ssize_t n;
+            /* Retry on EINTR (MIN-61) */
+            do {
+                n = read(pipefd[0], output + total, output_size - 1 - total);
+            } while (n < 0 && errno == EINTR);
+            if (n > 0) {
+                total += (size_t)n;
+            } else {
+                break;
+            }
+        }
+        output[total] = '\0';
+    } else {
+        char buf[1024];
+        for (;;) {
+            ssize_t n;
+            do {
+                n = read(pipefd[0], buf, sizeof(buf));
+            } while (n < 0 && errno == EINTR);
+            if (n <= 0) break;
+        }
+    }
+    close(pipefd[0]);
+
+    /* Reap the child, retrying on EINTR */
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        break;
+    }
+    if (exit_code) {
+        if (WIFEXITED(status)) {
+            *exit_code = WEXITSTATUS(status);
+        } else {
+            *exit_code = -1;
+        }
+    }
+
+    return 0;
+}
 
 int utils_read_file_string(const char *path, char *buf, size_t buf_len) {
     if (!path || !buf || buf_len == 0) return -1;
-    
+
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    
+    if (fd < 0) {
+        KOMARI_LOG_DEBUG("read_file_string: open(%s) failed: %s",
+                         path, strerror(errno));
+        return -1;
+    }
+
     ssize_t n = read(fd, buf, buf_len - 1);
+    int saved_errno = errno;
     close(fd);
-    
-    if (n < 0) return -1;
-    
+
+    if (n < 0) {
+        KOMARI_LOG_DEBUG("read_file_string: read(%s) failed: %s",
+                         path, strerror(saved_errno));
+        return -1;
+    }
+
     buf[n] = '\0';
     return 0;
 }
 
 int utils_read_file_line(const char *path, char *buf, size_t buf_len) {
     if (!path || !buf || buf_len == 0) return -1;
-    
+
     FILE *fp = fopen(path, "r");
-    if (!fp) return -1;
-    
-    if (fgets(buf, buf_len, fp) == NULL) {
-        fclose(fp);
+    if (!fp) {
+        KOMARI_LOG_DEBUG("read_file_line: fopen(%s) failed: %s",
+                         path, strerror(errno));
         return -1;
     }
-    
+
+    if (fgets(buf, buf_len, fp) == NULL) {
+        int saved_errno = errno;
+        fclose(fp);
+        KOMARI_LOG_DEBUG("read_file_line: fgets(%s) failed: %s",
+                         path, strerror(saved_errno));
+        return -1;
+    }
+
     fclose(fp);
-    
+
     char *nl = strchr(buf, '\n');
     if (nl) *nl = '\0';
-    
+
     return 0;
 }
 
@@ -61,13 +192,24 @@ int utils_write_file_string(const char *path, const char *data, mode_t mode) {
     if (!path || !data) return -1;
 
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
-    if (fd < 0) return -1;
-    
+    if (fd < 0) {
+        KOMARI_LOG_WARN("write_file_string: open(%s) failed: %s",
+                        path, strerror(errno));
+        return -1;
+    }
+
     size_t len = strlen(data);
     ssize_t n = write(fd, data, len);
+    int saved_errno = errno;
     close(fd);
-    
-    return (n == (ssize_t)len) ? 0 : -1;
+
+    if (n != (ssize_t)len) {
+        KOMARI_LOG_WARN("write_file_string: write(%s) incomplete: %s",
+                        path, strerror(saved_errno));
+        return -1;
+    }
+
+    return 0;
 }
 
 uint64_t utils_get_uptime_seconds(void) {
@@ -151,116 +293,53 @@ int utils_format_timestamp(uint64_t timestamp, char *buf, size_t buf_len) {
 }
 
 int utils_exec_command(const char *cmd, char *output, size_t output_len, int *exit_code) {
-    /* WARNING: cmd is executed via the shell. Never pass untrusted input here. */
+    /* WARNING: cmd is executed via "sh -c" and is therefore subject to shell
+     * interpretation. Never pass untrusted input here due to command injection
+     * risk. Use utils_exec_command_argv() instead for commands built from
+     * untrusted data.
+     *
+     * Implemented with fork() + execvp() rather than popen() so that the
+     * child properly closes inherited file descriptors (MIN-02). The const
+     * cast on cmd is safe because execvp/sh treat the argument as read-only. */
     if (!cmd) return -1;
 
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-    
-    size_t total = 0;
-    if (output && output_len > 0) {
-        output[0] = '\0';
-        while (fgets(output + total, output_len - total, fp) != NULL) {
-            total = strlen(output);
-            if (total >= output_len - 1) break;
-        }
-    } else {
-        char buf[1024];
-        while (fgets(buf, sizeof(buf), fp) != NULL);
-    }
-    
-    int status = pclose(fp);
-    if (exit_code) {
-        if (WIFEXITED(status)) {
-            *exit_code = WEXITSTATUS(status);
-        } else {
-            *exit_code = -1;
-        }
-    }
-    
-    return 0;
+    KOMARI_LOG_DEBUG("exec_command: running '%s'", cmd);
+
+    char *argv[] = {"sh", "-c", (char *)cmd, NULL};
+    return utils_exec_capture(argv, output, output_len, exit_code);
 }
 
 int utils_exec_command_argv(char *const argv[], char *output, size_t output_size, int *exit_code) {
     if (!argv || !argv[0]) return -1;
 
-    int pipefd[2];
-    if (pipe(pipefd) != 0) return -1;
+    KOMARI_LOG_DEBUG("exec_command_argv: running '%s'", argv[0]);
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return -1;
-    }
-
-    if (pid == 0) {
-        /* Child: redirect stdout and stderr to the pipe write end */
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[1]);
-
-        execvp(argv[0], argv);
-        /* execvp only returns on failure */
-        _exit(127);
-    }
-
-    /* Parent: close write end and read child output */
-    close(pipefd[1]);
-
-    size_t total = 0;
-    if (output && output_size > 0) {
-        output[0] = '\0';
-        while (total < output_size - 1) {
-            ssize_t n = read(pipefd[0], output + total, output_size - 1 - total);
-            if (n > 0) {
-                total += (size_t)n;
-            } else {
-                break;
-            }
-        }
-        output[total] = '\0';
-    } else {
-        char buf[1024];
-        while (read(pipefd[0], buf, sizeof(buf)) > 0) {
-            /* drain */
-        }
-    }
-    close(pipefd[0]);
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (exit_code) {
-        if (WIFEXITED(status)) {
-            *exit_code = WEXITSTATUS(status);
-        } else {
-            *exit_code = -1;
-        }
-    }
-
-    return 0;
+    return utils_exec_capture(argv, output, output_size, exit_code);
 }
 
 int utils_mkdir_p(const char *path) {
     if (!path) return -1;
-    
+
+    KOMARI_LOG_DEBUG("mkdir_p: creating directory tree %s", path);
+
     char tmp[512];
     strncpy(tmp, path, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
-    
+
     size_t len = strlen(tmp);
     if (len == 0) return -1;
     if (tmp[len - 1] == '/') {
         tmp[len - 1] = '\0';
     }
-    
+
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
             if (mkdir(tmp, 0755) < 0) {
                 if (errno != EEXIST) {
                     /* real error */
+                    KOMARI_LOG_WARN("mkdir_p: mkdir(%s) failed: %s",
+                                    tmp, strerror(errno));
                     return -1;
                 }
                 /* EEXIST is ok, directory already exists */
@@ -272,6 +351,8 @@ int utils_mkdir_p(const char *path) {
     if (mkdir(tmp, 0755) < 0) {
         if (errno != EEXIST) {
             /* real error */
+            KOMARI_LOG_WARN("mkdir_p: mkdir(%s) failed: %s",
+                            tmp, strerror(errno));
             return -1;
         }
         /* EEXIST is ok, directory already exists */
@@ -328,15 +409,29 @@ char *utils_json_escape(const char *str) {
                 break;
             default:
                 if (c < 0x20) {
-                    /* Other control characters: \u00XX per RFC 8259 */
+                    /* Other control characters: \u00XX per RFC 8259.
+                     * The escape sequence is exactly 6 chars; require room
+                     * for it plus the NUL terminator. */
+                    if (escaped_len - j < 7) {
+                        /* Buffer too small: truncation would occur. Stop
+                         * encoding to avoid writing a partial escape. */
+                        KOMARI_LOG_WARN("json_escape: buffer truncated at offset %zu", j);
+                        goto escape_done;
+                    }
                     int n = snprintf(escaped + j, escaped_len - j, "\\u%04X", c);
-                    if (n > 0) j += (size_t)n;
+                    if (n < 0 || (size_t)n >= escaped_len - j) {
+                        /* snprintf error or truncation (MAJ-11) */
+                        KOMARI_LOG_WARN("json_escape: snprintf failed/truncated for byte 0x%02X", c);
+                        goto escape_done;
+                    }
+                    j += (size_t)n;
                 } else {
                     escaped[j++] = c;
                 }
                 break;
         }
     }
+escape_done:
     escaped[j] = '\0';
 
     return escaped;
@@ -353,6 +448,8 @@ int utils_json_unescape(const char *json, char *out, size_t out_len) {
             switch (json[i]) {
                 case '"': out[j++] = '"'; break;
                 case '\\': out[j++] = '\\'; break;
+                case 'b': out[j++] = '\b'; break;
+                case 'f': out[j++] = '\f'; break;
                 case 'n': out[j++] = '\n'; break;
                 case 'r': out[j++] = '\r'; break;
                 case 't': out[j++] = '\t'; break;
@@ -361,7 +458,7 @@ int utils_json_unescape(const char *json, char *out, size_t out_len) {
                      * Surrogate pairs are not handled (simplified). */
                     if (i + 4 < len) {
                         char hex[5] = {0};
-                        memcpy(hex, json + i + 1, 4);
+                        memcpy(hex, json + i + 1, sizeof(hex) - 1);
                         unsigned int cp = (unsigned int)strtoul(hex, NULL, 16);
                         if (cp < 0x80) {
                             if (j < out_len - 1) out[j++] = (char)cp;
