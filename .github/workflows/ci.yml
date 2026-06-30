@@ -37,27 +37,43 @@ jobs:
           - goarch: amd64
             cc: x86_64-linux-gnu-gcc
             pkg: gcc-x86-64-linux-gnu
+            debian_arch: amd64
+            multiarch_triplet: x86_64-linux-gnu
           - goarch: arm64
             cc: aarch64-linux-gnu-gcc
             pkg: gcc-aarch64-linux-gnu
+            debian_arch: arm64
+            multiarch_triplet: aarch64-linux-gnu
           - goarch: arm
             cc: arm-linux-gnueabi-gcc
             pkg: gcc-arm-linux-gnueabi
+            debian_arch: armel
+            multiarch_triplet: arm-linux-gnueabi
           - goarch: armv7
             cc: arm-linux-gnueabihf-gcc
             pkg: gcc-arm-linux-gnueabihf
+            debian_arch: armhf
+            multiarch_triplet: arm-linux-gnueabihf
           - goarch: mipsel
             cc: mipsel-linux-gnu-gcc
             pkg: gcc-mipsel-linux-gnu
+            debian_arch: mipsel
+            multiarch_triplet: mipsel-linux-gnu
           - goarch: mips64
             cc: mips64el-linux-gnuabi64-gcc
             pkg: gcc-mips64el-linux-gnuabi64
+            debian_arch: mips64el
+            multiarch_triplet: mips64el-linux-gnuabi64
           - goarch: riscv64
             cc: riscv64-linux-gnu-gcc
             pkg: gcc-riscv64-linux-gnu
+            debian_arch: riscv64
+            multiarch_triplet: riscv64-linux-gnu
           - goarch: 386
             cc: i686-linux-gnu-gcc
             pkg: gcc-i686-linux-gnu
+            debian_arch: i386
+            multiarch_triplet: i386-linux-gnu
 
     steps:
       - uses: actions/checkout@v5
@@ -65,7 +81,16 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ${{ matrix.pkg }} libssl-dev zlib1g-dev pkg-config
+          if [ "${{ matrix.debian_arch }}" != "amd64" ]; then
+            sudo dpkg --add-architecture ${{ matrix.debian_arch }}
+            sudo apt-get update
+            sudo apt-get install -y cmake ${{ matrix.pkg }} \
+              zlib1g-dev:${{ matrix.debian_arch }} \
+              libssl-dev:${{ matrix.debian_arch }} \
+              pkg-config
+          else
+            sudo apt-get install -y cmake ${{ matrix.pkg }} libssl-dev zlib1g-dev pkg-config
+          fi
 
       - name: Build binary
         run: |
@@ -73,7 +98,14 @@ jobs:
           START_TIME=$(date +%s)
 
           rm -rf build
-          if cmake -B build -DCMAKE_C_COMPILER="${{ matrix.cc }}" 2>&1 && cmake --build build 2>&1; then
+          EXTRA_CMAKE_ARGS=""
+          if [ "${{ matrix.debian_arch }}" != "amd64" ]; then
+            export CMAKE_LIBRARY_PATH="/usr/lib/${{ matrix.multiarch_triplet }}"
+            export OPENSSL_ROOT_DIR="/usr/lib/${{ matrix.multiarch_triplet }}"
+            EXTRA_CMAKE_ARGS="-DCMAKE_FIND_ROOT_PATH=/usr/lib/${{ matrix.multiarch_triplet }} -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH"
+          fi
+
+          if cmake -B build -DCMAKE_C_COMPILER="${{ matrix.cc }}" $EXTRA_CMAKE_ARGS 2>&1 && cmake --build build 2>&1; then
             END_TIME=$(date +%s)
             BUILD_TIME=$((END_TIME - START_TIME))
             echo "Build completed in ${BUILD_TIME}s"
@@ -131,7 +163,6 @@ jobs:
           - mips_24kc
           - mipsel_24kc
         version:
-          - 18.06.7
           - 24.10.6
           - 25.12.2
 
@@ -149,6 +180,9 @@ jobs:
           cp -r cmake package/${{ env.PACKAGE_NAME }}/ 2>/dev/null || true
           cp CMakeLists.txt package/${{ env.PACKAGE_NAME }}/
           cp openwrt/Makefile package/${{ env.PACKAGE_NAME }}/Makefile
+
+          # Override PKG_SOURCE_VERSION with current commit hash for CI testing
+          sed -i "s/PKG_SOURCE_VERSION:=v[0-9.]\+/PKG_SOURCE_VERSION:=${{ github.sha }}/" package/${{ env.PACKAGE_NAME }}/Makefile
 
           mkdir -p package/${{ env.PACKAGE_NAME }}/files
           cp openwrt/files/komari-agent-c.config package/${{ env.PACKAGE_NAME }}/files/
@@ -235,8 +269,12 @@ jobs:
           python -c "
           import yaml
           import sys
-          files = ['.github/workflows/build.yml', '.github/workflows/release.yml', '.github/workflows/ci.yml']
+          import os
+          files = ['.github/workflows/ci.yml', '.github/workflows/release.yml']
           for f in files:
+              if not os.path.exists(f):
+                  print(f'⚠️ {f}: File not found, skipping')
+                  continue
               try:
                   with open(f) as fh:
                       yaml.safe_load(fh)

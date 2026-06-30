@@ -4,7 +4,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=komari-agent-c
-PKG_VERSION:=1.0.1
+PKG_VERSION:=1.0.0
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=zhz8888
@@ -12,7 +12,7 @@ PKG_LICENSE:=MIT
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/zhz8888/luci-app-komari-agent-c.git
-PKG_SOURCE_VERSION:=v1.0.1
+PKG_SOURCE_VERSION:=v1.0.0
 
 include $(INCLUDE_DIR)/package.mk
 
