@@ -1,0 +1,11 @@
+.git
+build
+output
+_ci_logs2
+logs_*.zip
+*.zip
+.trae
+.github
+.claude
+*.md
+!CMakeLists.txt

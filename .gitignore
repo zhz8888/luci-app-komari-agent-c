@@ -6,6 +6,9 @@ obj/
 *.a
 *.so
 
+# Docker build output
+output/
+
 # IDE configuration
 .vscode/
 .idea/

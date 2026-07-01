@@ -1,0 +1,197 @@
+name: komari-agent-c
+
+services:
+  build-amd64:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.build
+      args:
+        DEBIAN_ARCH: amd64
+        MULTIARCH_TRIPLET: x86_64-linux-gnu
+        CC_PKG: gcc-x86-64-linux-gnu
+        CC: x86_64-linux-gnu-gcc
+        APT_MIRROR: ${APT_MIRROR:-default}
+    environment:
+      - GOARCH=amd64
+      - DEBIAN_ARCH=amd64
+      - MULTIARCH_TRIPLET=x86_64-linux-gnu
+      - CC=x86_64-linux-gnu-gcc
+      - OUTPUT_DIR=/output
+      - SRC_DIR=/src
+    volumes:
+      - ..:/src:ro
+      - ../output:/output
+    command: ["build.sh"]
+
+  build-arm64:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.build
+      args:
+        DEBIAN_ARCH: arm64
+        MULTIARCH_TRIPLET: aarch64-linux-gnu
+        CC_PKG: gcc-aarch64-linux-gnu
+        CC: aarch64-linux-gnu-gcc
+        APT_MIRROR: ${APT_MIRROR:-default}
+    environment:
+      - GOARCH=arm64
+      - DEBIAN_ARCH=arm64
+      - MULTIARCH_TRIPLET=aarch64-linux-gnu
+      - CC=aarch64-linux-gnu-gcc
+      - OUTPUT_DIR=/output
+      - SRC_DIR=/src
+    volumes:
+      - ..:/src:ro
+      - ../output:/output
+    command: ["build.sh"]
+
+  build-arm:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.build
+      args:
+        DEBIAN_ARCH: armel
+        MULTIARCH_TRIPLET: arm-linux-gnueabi
+        CC_PKG: gcc-arm-linux-gnueabi
+        CC: arm-linux-gnueabi-gcc
+        APT_MIRROR: ${APT_MIRROR:-default}
+    environment:
+      - GOARCH=arm
+      - DEBIAN_ARCH=armel
+      - MULTIARCH_TRIPLET=arm-linux-gnueabi
+      - CC=arm-linux-gnueabi-gcc
+      - OUTPUT_DIR=/output
+      - SRC_DIR=/src
+    volumes:
+      - ..:/src:ro
+      - ../output:/output
+    command: ["build.sh"]
+
+  build-armv7:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.build
+      args:
+        DEBIAN_ARCH: armhf
+        MULTIARCH_TRIPLET: arm-linux-gnueabihf
+        CC_PKG: gcc-arm-linux-gnueabihf
+        CC: arm-linux-gnueabihf-gcc
+        APT_MIRROR: ${APT_MIRROR:-default}
+    environment:
+      - GOARCH=armv7
+      - DEBIAN_ARCH=armhf
+      - MULTIARCH_TRIPLET=arm-linux-gnueabihf
+      - CC=arm-linux-gnueabihf-gcc
+      - OUTPUT_DIR=/output
+      - SRC_DIR=/src
+    volumes:
+      - ..:/src:ro
+      - ../output:/output
+    command: ["build.sh"]
+
+  build-mipsel:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.build
+      args:
+        DEBIAN_ARCH: mipsel
+        MULTIARCH_TRIPLET: mipsel-linux-gnu
+        CC_PKG: gcc-mipsel-linux-gnu
+        CC: mipsel-linux-gnu-gcc
+        APT_MIRROR: ${APT_MIRROR:-default}
+    environment:
+      - GOARCH=mipsel
+      - DEBIAN_ARCH=mipsel
+      - MULTIARCH_TRIPLET=mipsel-linux-gnu
+      - CC=mipsel-linux-gnu-gcc
+      - OUTPUT_DIR=/output
+      - SRC_DIR=/src
+    volumes:
+      - ..:/src:ro
+      - ../output:/output
+    command: ["build.sh"]
+
+  build-mips64:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.build
+      args:
+        DEBIAN_ARCH: mips64el
+        MULTIARCH_TRIPLET: mips64el-linux-gnuabi64
+        CC_PKG: gcc-mips64el-linux-gnuabi64
+        CC: mips64el-linux-gnuabi64-gcc
+        APT_MIRROR: ${APT_MIRROR:-default}
+    environment:
+      - GOARCH=mips64
+      - DEBIAN_ARCH=mips64el
+      - MULTIARCH_TRIPLET=mips64el-linux-gnuabi64
+      - CC=mips64el-linux-gnuabi64-gcc
+      - OUTPUT_DIR=/output
+      - SRC_DIR=/src
+    volumes:
+      - ..:/src:ro
+      - ../output:/output
+    command: ["build.sh"]
+
+  build-riscv64:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.build
+      args:
+        DEBIAN_ARCH: riscv64
+        MULTIARCH_TRIPLET: riscv64-linux-gnu
+        CC_PKG: gcc-riscv64-linux-gnu
+        CC: riscv64-linux-gnu-gcc
+        APT_MIRROR: ${APT_MIRROR:-default}
+    environment:
+      - GOARCH=riscv64
+      - DEBIAN_ARCH=riscv64
+      - MULTIARCH_TRIPLET=riscv64-linux-gnu
+      - CC=riscv64-linux-gnu-gcc
+      - OUTPUT_DIR=/output
+      - SRC_DIR=/src
+    volumes:
+      - ..:/src:ro
+      - ../output:/output
+    command: ["build.sh"]
+
+  build-386:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.build
+      args:
+        DEBIAN_ARCH: i386
+        MULTIARCH_TRIPLET: i386-linux-gnu
+        CC_PKG: gcc-i686-linux-gnu
+        CC: i686-linux-gnu-gcc
+        APT_MIRROR: ${APT_MIRROR:-default}
+    environment:
+      - GOARCH=386
+      - DEBIAN_ARCH=i386
+      - MULTIARCH_TRIPLET=i386-linux-gnu
+      - CC=i686-linux-gnu-gcc
+      - OUTPUT_DIR=/output
+      - SRC_DIR=/src
+    volumes:
+      - ..:/src:ro
+      - ../output:/output
+    command: ["build.sh"]
+
+  test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.build
+      args:
+        DEBIAN_ARCH: amd64
+        MULTIARCH_TRIPLET: x86_64-linux-gnu
+        CC_PKG: gcc-x86-64-linux-gnu
+        CC: x86_64-linux-gnu-gcc
+        APT_MIRROR: ${APT_MIRROR:-default}
+    environment:
+      - CC=x86_64-linux-gnu-gcc
+      - OUTPUT_DIR=/output
+      - SRC_DIR=/src
+    volumes:
+      - ..:/src:ro
+      - ../output:/output
+    command: ["test.sh"]

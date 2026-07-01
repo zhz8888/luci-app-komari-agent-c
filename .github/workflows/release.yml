@@ -50,6 +50,12 @@ jobs:
           cp CMakeLists.txt package/${{ env.PACKAGE_NAME }}/
           cp openwrt/Makefile package/${{ env.PACKAGE_NAME }}/Makefile
 
+          # Add PKG_MIRROR_HASH:=x to skip mirror hash check
+          # (x is OpenWrt's special value that bypasses hash verification without warnings)
+          if ! grep -q "^PKG_MIRROR_HASH" package/${{ env.PACKAGE_NAME }}/Makefile; then
+            sed -i "/^PKG_SOURCE_VERSION:/a PKG_MIRROR_HASH:=x" package/${{ env.PACKAGE_NAME }}/Makefile
+          fi
+
           mkdir -p package/${{ env.PACKAGE_NAME }}/files
           cp openwrt/files/komari-agent-c.config package/${{ env.PACKAGE_NAME }}/files/
           cp openwrt/files/komari-agent-c.init package/${{ env.PACKAGE_NAME }}/files/
@@ -199,6 +205,12 @@ jobs:
           cp -r cmake package/${{ env.PACKAGE_NAME }}/ 2>/dev/null || true
           cp CMakeLists.txt package/${{ env.PACKAGE_NAME }}/
           cp openwrt/Makefile package/${{ env.PACKAGE_NAME }}/Makefile
+
+          # Add PKG_MIRROR_HASH:=x to skip mirror hash check
+          # (x is OpenWrt's special value that bypasses hash verification without warnings)
+          if ! grep -q "^PKG_MIRROR_HASH" package/${{ env.PACKAGE_NAME }}/Makefile; then
+            sed -i "/^PKG_SOURCE_VERSION:/a PKG_MIRROR_HASH:=x" package/${{ env.PACKAGE_NAME }}/Makefile
+          fi
 
           mkdir -p package/${{ env.PACKAGE_NAME }}/files
           cp openwrt/files/komari-agent-c.config package/${{ env.PACKAGE_NAME }}/files/

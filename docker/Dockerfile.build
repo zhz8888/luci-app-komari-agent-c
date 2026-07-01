@@ -1,0 +1,55 @@
+FROM ubuntu:22.04
+
+ARG DEBIAN_ARCH=amd64
+ARG MULTIARCH_TRIPLET=x86_64-linux-gnu
+ARG CC_PKG=gcc
+ARG CC=gcc
+# APT_MIRROR: "default" for official Ubuntu mirrors (CI), "cn" for Tsinghua mirror (local builds in China)
+ARG APT_MIRROR=default
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_ARCH=${DEBIAN_ARCH}
+ENV MULTIARCH_TRIPLET=${MULTIARCH_TRIPLET}
+ENV CC=${CC}
+
+# Optionally switch to Chinese apt mirror for faster local builds
+# Use HTTP (not HTTPS) because base ubuntu:22.04 image lacks ca-certificates
+RUN if [ "$APT_MIRROR" = "cn" ]; then \
+      sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list && \
+      sed -i 's|http://security.ubuntu.com/ubuntu|http://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list; \
+    fi
+
+RUN if [ "$DEBIAN_ARCH" != "amd64" ]; then \
+      dpkg --add-architecture "$DEBIAN_ARCH" && \
+      if [ "$APT_MIRROR" = "cn" ]; then \
+        sed -i 's|^deb |deb [arch=amd64,i386] |' /etc/apt/sources.list && \
+        sed -i 's|^deb-src |deb-src [arch=amd64,i386] |' /etc/apt/sources.list 2>/dev/null || true && \
+        echo "deb [arch=$DEBIAN_ARCH] http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/ jammy main universe restricted multiverse" > /etc/apt/sources.list.d/ports.list && \
+        echo "deb [arch=$DEBIAN_ARCH] http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/ jammy-updates main universe restricted multiverse" >> /etc/apt/sources.list.d/ports.list && \
+        echo "deb [arch=$DEBIAN_ARCH] http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/ jammy-security main universe restricted multiverse" >> /etc/apt/sources.list.d/ports.list; \
+      else \
+        sed -i 's|^deb |deb [arch=amd64,i386] |' /etc/apt/sources.list && \
+        sed -i 's|^deb-src |deb-src [arch=amd64,i386] |' /etc/apt/sources.list 2>/dev/null || true && \
+        echo "deb [arch=$DEBIAN_ARCH] https://ports.ubuntu.com/ubuntu-ports/ jammy main universe restricted multiverse" > /etc/apt/sources.list.d/ports.list && \
+        echo "deb [arch=$DEBIAN_ARCH] https://ports.ubuntu.com/ubuntu-ports/ jammy-updates main universe restricted multiverse" >> /etc/apt/sources.list.d/ports.list && \
+        echo "deb [arch=$DEBIAN_ARCH] https://ports.ubuntu.com/ubuntu-ports/ jammy-security main universe restricted multiverse" >> /etc/apt/sources.list.d/ports.list; \
+      fi && \
+      apt-get update && \
+      apt-get install -y --no-install-recommends \
+        cmake make pkg-config file ca-certificates \
+        "$CC_PKG" \
+        "libssl-dev:$DEBIAN_ARCH" \
+        "zlib1g-dev:$DEBIAN_ARCH"; \
+    else \
+      apt-get update && \
+      apt-get install -y --no-install-recommends \
+        cmake make pkg-config file ca-certificates \
+        "$CC_PKG" libssl-dev zlib1g-dev; \
+    fi && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY docker/build.sh /usr/local/bin/build.sh
+COPY docker/test.sh /usr/local/bin/test.sh
+RUN chmod +x /usr/local/bin/build.sh /usr/local/bin/test.sh
+
+WORKDIR /src

@@ -8,6 +8,8 @@ on:
       - 'include/**'
       - 'CMakeLists.txt'
       - 'cmake/**'
+      - 'docker/**'
+      - 'scripts/**'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main, develop]
@@ -16,6 +18,8 @@ on:
       - 'include/**'
       - 'CMakeLists.txt'
       - 'cmake/**'
+      - 'docker/**'
+      - 'scripts/**'
       - '.github/workflows/ci.yml'
   workflow_dispatch:
 
@@ -33,120 +37,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - goarch: amd64
-            cc: x86_64-linux-gnu-gcc
-            pkg: gcc-x86-64-linux-gnu
-            debian_arch: amd64
-            multiarch_triplet: x86_64-linux-gnu
-          - goarch: arm64
-            cc: aarch64-linux-gnu-gcc
-            pkg: gcc-aarch64-linux-gnu
-            debian_arch: arm64
-            multiarch_triplet: aarch64-linux-gnu
-          - goarch: arm
-            cc: arm-linux-gnueabi-gcc
-            pkg: gcc-arm-linux-gnueabi
-            debian_arch: armel
-            multiarch_triplet: arm-linux-gnueabi
-          - goarch: armv7
-            cc: arm-linux-gnueabihf-gcc
-            pkg: gcc-arm-linux-gnueabihf
-            debian_arch: armhf
-            multiarch_triplet: arm-linux-gnueabihf
-          - goarch: mipsel
-            cc: mipsel-linux-gnu-gcc
-            pkg: gcc-mipsel-linux-gnu
-            debian_arch: mipsel
-            multiarch_triplet: mipsel-linux-gnu
-          - goarch: mips64
-            cc: mips64el-linux-gnuabi64-gcc
-            pkg: gcc-mips64el-linux-gnuabi64
-            debian_arch: mips64el
-            multiarch_triplet: mips64el-linux-gnuabi64
-          - goarch: riscv64
-            cc: riscv64-linux-gnu-gcc
-            pkg: gcc-riscv64-linux-gnu
-            debian_arch: riscv64
-            multiarch_triplet: riscv64-linux-gnu
-          - goarch: 386
-            cc: i686-linux-gnu-gcc
-            pkg: gcc-i686-linux-gnu
-            debian_arch: i386
-            multiarch_triplet: i386-linux-gnu
+        goarch: [amd64, arm64, arm, armv7, mipsel, mips64, riscv64, 386]
 
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install dependencies
+      - name: Build binary in Docker
         run: |
-          sudo apt-get update
-          if [ "${{ matrix.debian_arch }}" != "amd64" ]; then
-            sudo dpkg --add-architecture ${{ matrix.debian_arch }}
-            sudo apt-get update
-            sudo apt-get install -y cmake ${{ matrix.pkg }} \
-              zlib1g-dev:${{ matrix.debian_arch }} \
-              libssl-dev:${{ matrix.debian_arch }} \
-              pkg-config
-          else
-            sudo apt-get install -y cmake ${{ matrix.pkg }} libssl-dev zlib1g-dev pkg-config
-          fi
+          mkdir -p output
+          docker compose -f docker/docker-compose.yml run --rm build-${{ matrix.goarch }}
 
-      - name: Build binary
+      - name: Verify binary
         run: |
-          echo "Building for linux/${{ matrix.goarch }} with ${{ matrix.cc }}..."
-          START_TIME=$(date +%s)
-
-          rm -rf build
-          EXTRA_CMAKE_ARGS=""
-          if [ "${{ matrix.debian_arch }}" != "amd64" ]; then
-            export CMAKE_LIBRARY_PATH="/usr/lib/${{ matrix.multiarch_triplet }}"
-            export OPENSSL_ROOT_DIR="/usr/lib/${{ matrix.multiarch_triplet }}"
-            EXTRA_CMAKE_ARGS="-DCMAKE_FIND_ROOT_PATH=/usr/lib/${{ matrix.multiarch_triplet }} -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH"
-          fi
-
-          if cmake -B build -DCMAKE_C_COMPILER="${{ matrix.cc }}" $EXTRA_CMAKE_ARGS 2>&1 && cmake --build build 2>&1; then
-            END_TIME=$(date +%s)
-            BUILD_TIME=$((END_TIME - START_TIME))
-            echo "Build completed in ${BUILD_TIME}s"
-
-            if [ ! -f "build/bin/komari-agent-c" ]; then
-              echo "Error: Build failed - binary not found!"
-              exit 1
-            fi
-
-            BINARY_SIZE=$(stat -f%z "build/bin/komari-agent-c" 2>/dev/null || stat -c%s "build/bin/komari-agent-c" 2>/dev/null)
-            echo "Binary size: $((BINARY_SIZE / 1024)) KB"
-
-            echo "Checking binary file type..."
-            file build/bin/komari-agent-c || true
-
-            echo "Checking binary is statically linked..."
-            ldd build/bin/komari-agent-c 2>&1 || echo "Static linking confirmed (ldd error expected)"
-
-            echo "Checking binary is executable..."
-            if [ -x "build/bin/komari-agent-c" ]; then
-              echo "Binary is executable: YES"
-            else
-              echo "Error: Binary is not executable!"
-              exit 1
-            fi
-
-            echo "Build successful for linux/${{ matrix.goarch }}"
-          else
-            echo "Error: Build failed with compilation errors!"
+          BINARY="output/komari-agent-c-linux-${{ matrix.goarch }}"
+          if [ ! -f "$BINARY" ]; then
+            echo "Error: Binary not found at $BINARY"
             exit 1
           fi
+          echo "Binary size: $(du -h "$BINARY" | cut -f1)"
+          file "$BINARY"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: test-binary-linux-${{ matrix.goarch }}
-          path: build/bin/komari-agent-c
+          path: output/komari-agent-c-linux-${{ matrix.goarch }}
           retention-days: 7
 
-  test-build:
+  test-openwrt-build:
     name: Test build on ${{ matrix.arch }} (${{ matrix.version }})
+    needs: test-binary-build
+    if: always()
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -183,6 +104,12 @@ jobs:
 
           # Override PKG_SOURCE_VERSION with current commit hash for CI testing
           sed -i "s/PKG_SOURCE_VERSION:=v[0-9.]\+/PKG_SOURCE_VERSION:=${{ github.sha }}/" package/${{ env.PACKAGE_NAME }}/Makefile
+
+          # Add PKG_MIRROR_HASH:=x to skip mirror hash check
+          # (x is OpenWrt's special value that bypasses hash verification without warnings)
+          if ! grep -q "^PKG_MIRROR_HASH" package/${{ env.PACKAGE_NAME }}/Makefile; then
+            sed -i "/^PKG_SOURCE_VERSION:/a PKG_MIRROR_HASH:=x" package/${{ env.PACKAGE_NAME }}/Makefile
+          fi
 
           mkdir -p package/${{ env.PACKAGE_NAME }}/files
           cp openwrt/files/komari-agent-c.config package/${{ env.PACKAGE_NAME }}/files/
@@ -255,6 +182,8 @@ jobs:
       - name: Install lint tools
         run: |
           pip install codespell pyyaml
+          sudo apt-get update
+          sudo apt-get install -y cppcheck
 
       - name: Spell check
         run: |
@@ -270,7 +199,7 @@ jobs:
           import yaml
           import sys
           import os
-          files = ['.github/workflows/ci.yml', '.github/workflows/release.yml']
+          files = ['.github/workflows/ci.yml', '.github/workflows/release.yml', 'docker/docker-compose.yml']
           for f in files:
               if not os.path.exists(f):
                   print(f'⚠️ {f}: File not found, skipping')
@@ -284,16 +213,15 @@ jobs:
                   sys.exit(1)
           "
 
-      - name: Install build dependencies
+      - name: Verify CI config
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake libssl-dev zlib1g-dev pkg-config cppcheck
+          chmod +x scripts/verify-ci-config.sh
+          ./scripts/verify-ci-config.sh
 
-      - name: Build for verification
+      - name: Run unit tests in Docker
         run: |
-          rm -rf build
-          cmake -B build -DCMAKE_C_COMPILER=gcc 2>&1 || { echo "CMake configuration failed"; exit 1; }
-          cmake --build build 2>&1 || { echo "Build failed"; exit 1; }
+          mkdir -p output
+          docker compose -f docker/docker-compose.yml run --rm test
 
       - name: Run cppcheck
         run: |
@@ -313,16 +241,4 @@ jobs:
             fi
           else
             echo "cppcheck not installed, skipping..."
-          fi
-
-      - name: Run unit tests
-        run: |
-          if command -v gcc &> /dev/null; then
-            echo "Running unit tests..."
-            rm -rf build
-            cmake -B build -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc 2>&1
-            cmake --build build 2>&1
-            ctest --test-dir build --output-on-failure 2>&1
-          else
-            echo "gcc not installed, skipping unit tests..."
           fi
