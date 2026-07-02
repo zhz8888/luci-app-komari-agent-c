@@ -1,0 +1,42 @@
+FROM debian:bookworm-slim
+
+ARG DEBIAN_ARCH=amd64
+ARG MULTIARCH_TRIPLET=x86_64-linux-gnu
+ARG CC_PKG=gcc
+ARG CC=gcc
+# APT_MIRROR: "default" for official Debian mirrors (CI), "cn" for Tsinghua mirror (local builds in China)
+ARG APT_MIRROR=default
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_ARCH=${DEBIAN_ARCH}
+ENV MULTIARCH_TRIPLET=${MULTIARCH_TRIPLET}
+ENV CC=${CC}
+
+# Optionally switch to Chinese apt mirror for faster local builds
+RUN if [ "$APT_MIRROR" = "cn" ]; then \
+      sed -i 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' /etc/apt/sources.list.d/debian.sources; \
+    fi
+
+# For cross-compilation: add foreign architecture and install cross-toolchain + target libraries
+# Debian bookworm supports: amd64 arm64 armel armhf i386 mips64el mipsel ppc64el riscv64 s390x
+RUN if [ "$DEBIAN_ARCH" != "amd64" ]; then \
+      dpkg --add-architecture "$DEBIAN_ARCH" && \
+      apt-get update && \
+      apt-get install -y --no-install-recommends \
+        cmake make pkg-config file ca-certificates \
+        "$CC_PKG" \
+        "libssl-dev:$DEBIAN_ARCH" \
+        "zlib1g-dev:$DEBIAN_ARCH"; \
+    else \
+      apt-get update && \
+      apt-get install -y --no-install-recommends \
+        cmake make pkg-config file ca-certificates \
+        "$CC_PKG" libssl-dev zlib1g-dev; \
+    fi && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY docker/build.sh /usr/local/bin/build.sh
+COPY docker/test.sh /usr/local/bin/test.sh
+RUN chmod +x /usr/local/bin/build.sh /usr/local/bin/test.sh
+
+WORKDIR /src

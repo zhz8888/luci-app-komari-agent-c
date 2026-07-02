@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ARG DEBIAN_ARCH=amd64
 ARG MULTIARCH_TRIPLET=x86_64-linux-gnu
@@ -12,36 +12,46 @@ ENV DEBIAN_ARCH=${DEBIAN_ARCH}
 ENV MULTIARCH_TRIPLET=${MULTIARCH_TRIPLET}
 ENV CC=${CC}
 
-# Optionally switch to Chinese apt mirror for faster local builds
-# Use HTTP (not HTTPS) for ports mirrors because base ubuntu:22.04 image lacks ca-certificates
+# Install ca-certificates first so HTTPS works for ports.ubuntu.com if needed
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Configure apt sources for cross-compilation
+# Ubuntu 24.04 uses DEB822 format at /etc/apt/sources.list.d/ubuntu.sources
+# - Optionally switch to Tsinghua mirror (cn)
+# - For non-amd64: add Architectures: amd64 restriction to main sources,
+#   dpkg --add-architecture, and add ports repository for target libraries
+# - i386 uses main repository (not ports); other foreign archs use ports
 RUN if [ "$APT_MIRROR" = "cn" ]; then \
-      sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list && \
-      sed -i 's|http://security.ubuntu.com/ubuntu|http://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list; \
+      sed -i 's|http://archive.ubuntu.com/ubuntu/|http://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list.d/ubuntu.sources && \
+      sed -i 's|http://security.ubuntu.com/ubuntu/|http://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list.d/ubuntu.sources; \
+    fi && \
+    if [ "$DEBIAN_ARCH" != "amd64" ]; then \
+      if [ "$DEBIAN_ARCH" = "i386" ]; then \
+        sed -i '/^Signed-By:/a Architectures: amd64 i386' /etc/apt/sources.list.d/ubuntu.sources && \
+        dpkg --add-architecture "$DEBIAN_ARCH"; \
+      else \
+        sed -i '/^Signed-By:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources && \
+        dpkg --add-architecture "$DEBIAN_ARCH" && \
+        if [ "$APT_MIRROR" = "cn" ]; then \
+          PORTS_URI="http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/"; \
+        else \
+          PORTS_URI="http://ports.ubuntu.com/ubuntu-ports/"; \
+        fi && \
+        printf 'Types: deb\nURIs: %s\nSuites: noble noble-updates noble-backports\nComponents: main universe restricted multiverse\nArchitectures: %s\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\nTypes: deb\nURIs: %s\nSuites: noble-security\nComponents: main universe restricted multiverse\nArchitectures: %s\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' "$PORTS_URI" "$DEBIAN_ARCH" "$PORTS_URI" "$DEBIAN_ARCH" > /etc/apt/sources.list.d/ports.sources; \
+      fi; \
     fi
 
-RUN if [ "$DEBIAN_ARCH" != "amd64" ]; then \
-      dpkg --add-architecture "$DEBIAN_ARCH" && \
-      if [ "$APT_MIRROR" = "cn" ]; then \
-        sed -i 's|^deb |deb [arch=amd64,i386] |' /etc/apt/sources.list && \
-        sed -i 's|^deb-src |deb-src [arch=amd64,i386] |' /etc/apt/sources.list 2>/dev/null || true && \
-        echo "deb [arch=$DEBIAN_ARCH] http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/ jammy main universe restricted multiverse" > /etc/apt/sources.list.d/ports.list && \
-        echo "deb [arch=$DEBIAN_ARCH] http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/ jammy-updates main universe restricted multiverse" >> /etc/apt/sources.list.d/ports.list && \
-        echo "deb [arch=$DEBIAN_ARCH] http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/ jammy-security main universe restricted multiverse" >> /etc/apt/sources.list.d/ports.list; \
-      else \
-        sed -i 's|^deb |deb [arch=amd64,i386] |' /etc/apt/sources.list && \
-        sed -i 's|^deb-src |deb-src [arch=amd64,i386] |' /etc/apt/sources.list 2>/dev/null || true && \
-        echo "deb [arch=$DEBIAN_ARCH] http://ports.ubuntu.com/ubuntu-ports/ jammy main universe restricted multiverse" > /etc/apt/sources.list.d/ports.list && \
-        echo "deb [arch=$DEBIAN_ARCH] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main universe restricted multiverse" >> /etc/apt/sources.list.d/ports.list && \
-        echo "deb [arch=$DEBIAN_ARCH] http://ports.ubuntu.com/ubuntu-ports/ jammy-security main universe restricted multiverse" >> /etc/apt/sources.list.d/ports.list; \
-      fi && \
-      apt-get update && \
+# Install build tools, cross-compiler, and target architecture libraries
+RUN apt-get update && \
+    if [ "$DEBIAN_ARCH" != "amd64" ]; then \
       apt-get install -y --no-install-recommends \
         cmake make pkg-config file ca-certificates \
         "$CC_PKG" \
         "libssl-dev:$DEBIAN_ARCH" \
         "zlib1g-dev:$DEBIAN_ARCH"; \
     else \
-      apt-get update && \
       apt-get install -y --no-install-recommends \
         cmake make pkg-config file ca-certificates \
         "$CC_PKG" libssl-dev zlib1g-dev; \

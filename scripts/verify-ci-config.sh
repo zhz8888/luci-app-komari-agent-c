@@ -78,7 +78,7 @@ echo ""
 
 # 3. Verify Docker infrastructure files exist
 echo "--- Docker Infrastructure Check ---"
-for f in docker/Dockerfile.build docker/build.sh docker/test.sh docker/docker-compose.yml scripts/docker-build.sh .dockerignore; do
+for f in docker/Dockerfile.build docker/Dockerfile.legacy docker/build.sh docker/test.sh docker/docker-compose.yml scripts/docker-build.sh .dockerignore; do
     if [ -f "$f" ]; then
         pass "$f: exists"
     else

@@ -8,14 +8,14 @@ services:
       args:
         DEBIAN_ARCH: amd64
         MULTIARCH_TRIPLET: x86_64-linux-gnu
-        CC_PKG: gcc-x86-64-linux-gnu
-        CC: x86_64-linux-gnu-gcc
+        CC_PKG: gcc
+        CC: gcc
         APT_MIRROR: ${APT_MIRROR:-default}
     environment:
       - GOARCH=amd64
       - DEBIAN_ARCH=amd64
       - MULTIARCH_TRIPLET=x86_64-linux-gnu
-      - CC=x86_64-linux-gnu-gcc
+      - CC=gcc
       - OUTPUT_DIR=/output
       - SRC_DIR=/src
     volumes:
@@ -48,7 +48,7 @@ services:
   build-arm:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.build
+      dockerfile: docker/Dockerfile.legacy
       args:
         DEBIAN_ARCH: armel
         MULTIARCH_TRIPLET: arm-linux-gnueabi
@@ -92,7 +92,7 @@ services:
   build-mipsel:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.build
+      dockerfile: docker/Dockerfile.legacy
       args:
         DEBIAN_ARCH: mipsel
         MULTIARCH_TRIPLET: mipsel-linux-gnu
@@ -114,7 +114,7 @@ services:
   build-mips64:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.build
+      dockerfile: docker/Dockerfile.legacy
       args:
         DEBIAN_ARCH: mips64el
         MULTIARCH_TRIPLET: mips64el-linux-gnuabi64
@@ -184,11 +184,11 @@ services:
       args:
         DEBIAN_ARCH: amd64
         MULTIARCH_TRIPLET: x86_64-linux-gnu
-        CC_PKG: gcc-x86-64-linux-gnu
-        CC: x86_64-linux-gnu-gcc
+        CC_PKG: gcc
+        CC: gcc
         APT_MIRROR: ${APT_MIRROR:-default}
     environment:
-      - CC=x86_64-linux-gnu-gcc
+      - CC=gcc
       - OUTPUT_DIR=/output
       - SRC_DIR=/src
     volumes:

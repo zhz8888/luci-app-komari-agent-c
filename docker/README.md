@@ -10,7 +10,8 @@
 
 | 文件 | 说明 |
 |------|------|
-| `Dockerfile.build` | 基于 Ubuntu 22.04 的构建环境镜像 |
+| `Dockerfile.build` | 基于 Ubuntu 24.04 的构建环境镜像，支持 amd64/arm64/armhf/riscv64/i386 |
+| `Dockerfile.legacy` | 基于 Debian 12 (bookworm) 的构建环境镜像，支持 armel/mipsel/mips64el |
 | `docker-compose.yml` | 8 个架构构建服务 + 1 个测试服务的定义 |
 | `build.sh` | 容器内执行的构建脚本 |
 | `test.sh` | 容器内执行的单元测试脚本 |
@@ -34,6 +35,9 @@
 
 # 构建 arm64（交叉编译）
 ./scripts/docker-build.sh arm64
+
+# 构建 riscv64（交叉编译）
+./scripts/docker-build.sh riscv64
 ```
 
 ### 构建所有架构
@@ -56,16 +60,18 @@ APT_MIRROR=cn ./scripts/docker-build.sh amd64
 
 ## 支持的架构
 
-| 服务 | GOARCH | Debian 架构 | 编译器 | 说明 |
-|------|--------|------------|--------|------|
-| `build-amd64` | amd64 | amd64 | x86_64-linux-gnu-gcc | x86-64 64 位 |
-| `build-arm64` | arm64 | arm64 | aarch64-linux-gnu-gcc | ARM 64 位 |
-| `build-arm` | arm | armel | arm-linux-gnueabi-gcc | ARM 软浮点 |
-| `build-armv7` | armv7 | armhf | arm-linux-gnueabihf-gcc | ARM 硬浮点 |
-| `build-mipsel` | mipsel | mipsel | mipsel-linux-gnu-gcc | MIPS 小端 |
-| `build-mips64` | mips64 | mips64el | mips64el-linux-gnuabi64-gcc | MIPS64 小端 |
-| `build-riscv64` | riscv64 | riscv64 | riscv64-linux-gnu-gcc | RISC-V 64 位 |
-| `build-386` | 386 | i386 | i686-linux-gnu-gcc | x86 32 位 |
+| 服务 | GOARCH | Debian 架构 | 编译器 | 基础镜像 | 说明 |
+|------|--------|------------|--------|---------|------|
+| `build-amd64` | amd64 | amd64 | gcc | Ubuntu 24.04 | x86-64 64 位 |
+| `build-arm64` | arm64 | arm64 | aarch64-linux-gnu-gcc | Ubuntu 24.04 | ARM 64 位 |
+| `build-arm` | arm | armel | arm-linux-gnueabi-gcc | Debian 12 | ARM 软浮点 |
+| `build-armv7` | armv7 | armhf | arm-linux-gnueabihf-gcc | Ubuntu 24.04 | ARM 硬浮点 |
+| `build-mipsel` | mipsel | mipsel | mipsel-linux-gnu-gcc | Debian 12 | MIPS 小端 |
+| `build-mips64` | mips64 | mips64el | mips64el-linux-gnuabi64-gcc | Debian 12 | MIPS64 小端 |
+| `build-riscv64` | riscv64 | riscv64 | riscv64-linux-gnu-gcc | Ubuntu 24.04 | RISC-V 64 位 |
+| `build-386` | 386 | i386 | i686-linux-gnu-gcc | Ubuntu 24.04 | x86 32 位 |
+
+> **说明**：armel、mipsel、mips64el 三种架构在 Ubuntu 24.04 ports 仓库中不可用，因此使用 Debian 12 (bookworm-slim) 作为基础镜像。
 
 ## 构建输出
 
@@ -76,7 +82,11 @@ output/
 ├── komari-agent-c-linux-amd64
 ├── komari-agent-c-linux-arm64
 ├── komari-agent-c-linux-arm
-└── ...
+├── komari-agent-c-linux-armv7
+├── komari-agent-c-linux-mipsel
+├── komari-agent-c-linux-mips64
+├── komari-agent-c-linux-riscv64
+└── komari-agent-c-linux-386
 ```
 
 ## 工作原理
@@ -93,7 +103,7 @@ output/
 
 | 值 | 镜像 | 使用场景 |
 |----|------|---------|
-| `default` | Ubuntu 官方镜像 | CI（GitHub Actions） |
+| `default` | 官方镜像（Ubuntu/Debian） | CI（GitHub Actions） |
 | `cn` | 清华大学镜像 | 中国本地构建 |
 
 通过环境变量设置：
@@ -122,10 +132,6 @@ Docker Compose 可能使用了缓存镜像。强制重建：
 ```bash
 docker compose -f docker/docker-compose.yml build --no-cache build-amd64
 ```
-
-### 使用 APT_MIRROR=cn 时出现 "Certificate verification failed"
-
-基础镜像 `ubuntu:22.04` 不包含 `ca-certificates`。Dockerfile 使用 HTTP（而非 HTTPS）访问 apt 镜像以避免此问题。如修改 Dockerfile，请确保在安装 `ca-certificates` 之前使用 HTTP 协议。
 
 ### 二进制架构不匹配
 

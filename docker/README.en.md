@@ -10,7 +10,8 @@ This directory contains the Docker-based build environment for **komari-agent-c*
 
 | File | Description |
 |------|-------------|
-| `Dockerfile.build` | Build environment image based on Ubuntu 22.04 |
+| `Dockerfile.build` | Build environment image based on Ubuntu 24.04, supports amd64/arm64/armhf/riscv64/i386 |
+| `Dockerfile.legacy` | Build environment image based on Debian 12 (bookworm), supports armel/mipsel/mips64el |
 | `docker-compose.yml` | Service definitions for 8 architecture builds + 1 test service |
 | `build.sh` | Build script executed inside the container |
 | `test.sh` | Unit test script executed inside the container |
@@ -34,6 +35,9 @@ From the **project root directory**:
 
 # Build arm64 (cross-compile)
 ./scripts/docker-build.sh arm64
+
+# Build riscv64 (cross-compile)
+./scripts/docker-build.sh riscv64
 ```
 
 ### Build All Architectures
@@ -56,16 +60,18 @@ APT_MIRROR=cn ./scripts/docker-build.sh amd64
 
 ## Supported Architectures
 
-| Service | GOARCH | Debian Arch | Compiler | Description |
-|---------|--------|-------------|----------|-------------|
-| `build-amd64` | amd64 | amd64 | x86_64-linux-gnu-gcc | x86-64 64-bit |
-| `build-arm64` | arm64 | arm64 | aarch64-linux-gnu-gcc | ARM 64-bit |
-| `build-arm` | arm | armel | arm-linux-gnueabi-gcc | ARM soft-float |
-| `build-armv7` | armv7 | armhf | arm-linux-gnueabihf-gcc | ARM hard-float |
-| `build-mipsel` | mipsel | mipsel | mipsel-linux-gnu-gcc | MIPS little-endian |
-| `build-mips64` | mips64 | mips64el | mips64el-linux-gnuabi64-gcc | MIPS64 little-endian |
-| `build-riscv64` | riscv64 | riscv64 | riscv64-linux-gnu-gcc | RISC-V 64-bit |
-| `build-386` | 386 | i386 | i686-linux-gnu-gcc | x86 32-bit |
+| Service | GOARCH | Debian Arch | Compiler | Base Image | Description |
+|---------|--------|-------------|----------|------------|-------------|
+| `build-amd64` | amd64 | amd64 | gcc | Ubuntu 24.04 | x86-64 64-bit |
+| `build-arm64` | arm64 | arm64 | aarch64-linux-gnu-gcc | Ubuntu 24.04 | ARM 64-bit |
+| `build-arm` | arm | armel | arm-linux-gnueabi-gcc | Debian 12 | ARM soft-float |
+| `build-armv7` | armv7 | armhf | arm-linux-gnueabihf-gcc | Ubuntu 24.04 | ARM hard-float |
+| `build-mipsel` | mipsel | mipsel | mipsel-linux-gnu-gcc | Debian 12 | MIPS little-endian |
+| `build-mips64` | mips64 | mips64el | mips64el-linux-gnuabi64-gcc | Debian 12 | MIPS64 little-endian |
+| `build-riscv64` | riscv64 | riscv64 | riscv64-linux-gnu-gcc | Ubuntu 24.04 | RISC-V 64-bit |
+| `build-386` | 386 | i386 | i686-linux-gnu-gcc | Ubuntu 24.04 | x86 32-bit |
+
+> **Note**: armel, mipsel, and mips64el are not available in Ubuntu 24.04 ports repository, so Debian 12 (bookworm-slim) is used as the base image for these architectures.
 
 ## Build Output
 
@@ -76,7 +82,11 @@ output/
 ├── komari-agent-c-linux-amd64
 ├── komari-agent-c-linux-arm64
 ├── komari-agent-c-linux-arm
-└── ...
+├── komari-agent-c-linux-armv7
+├── komari-agent-c-linux-mipsel
+├── komari-agent-c-linux-mips64
+├── komari-agent-c-linux-riscv64
+└── komari-agent-c-linux-386
 ```
 
 ## How It Works
@@ -93,7 +103,7 @@ The `APT_MIRROR` build argument controls which apt mirror is used inside the con
 
 | Value | Mirror | Use Case |
 |-------|--------|----------|
-| `default` | Official Ubuntu mirrors | CI (GitHub Actions) |
+| `default` | Official mirrors (Ubuntu/Debian) | CI (GitHub Actions) |
 | `cn` | Tsinghua University mirror | Local builds in China |
 
 Set via environment variable:
@@ -122,10 +132,6 @@ Docker Compose may use a cached image. Force a rebuild:
 ```bash
 docker compose -f docker/docker-compose.yml build --no-cache build-amd64
 ```
-
-### "Certificate verification failed" when using APT_MIRROR=cn
-
-The base `ubuntu:22.04` image does not include `ca-certificates`. The Dockerfile uses HTTP (not HTTPS) for apt mirrors to avoid this issue. If you modify the Dockerfile, ensure mirrors use HTTP before `ca-certificates` is installed.
 
 ### Binary architecture mismatch
 
