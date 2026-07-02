@@ -179,8 +179,8 @@ else
 fi
 echo ""
 
-# 7. Verify PKG_MIRROR_HASH sed command
-echo "--- PKG_MIRROR_HASH sed Command Check ---"
+# 7. Verify PKG_SOURCE_* removal sed command
+echo "--- PKG_SOURCE Removal Command Check ---"
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
@@ -195,41 +195,34 @@ PKG_SOURCE_URL:=https://github.com/zhz8888/luci-app-komari-agent-c.git
 PKG_SOURCE_VERSION:=v1.0.0
 EOF
 
-sed -i "s/PKG_SOURCE_VERSION:=v[0-9.]\+/PKG_SOURCE_VERSION:=abc123/" "$TMPDIR/Makefile"
-if ! grep -q "^PKG_MIRROR_HASH" "$TMPDIR/Makefile"; then
-    sed -i "/^PKG_SOURCE_VERSION:/a PKG_MIRROR_HASH:=x" "$TMPDIR/Makefile"
+sed -i '/^PKG_SOURCE_PROTO:/d; /^PKG_SOURCE_URL:/d; /^PKG_SOURCE_VERSION:/d' "$TMPDIR/Makefile"
+
+if ! grep -q "^PKG_SOURCE_" "$TMPDIR/Makefile"; then
+    pass "sed command correctly removes all PKG_SOURCE_* lines"
+else
+    fail "sed command failed to remove all PKG_SOURCE_* lines"
 fi
 
-if grep -q "^PKG_MIRROR_HASH:=x$" "$TMPDIR/Makefile"; then
-    pass "sed command correctly adds PKG_MIRROR_HASH:=x"
+# Verify other lines remain intact
+if grep -q "^PKG_NAME:=komari-agent-c" "$TMPDIR/Makefile" && grep -q "^PKG_VERSION:=1.0.0" "$TMPDIR/Makefile"; then
+    pass "sed command preserves other Makefile lines"
 else
-    fail "sed command failed to add PKG_MIRROR_HASH:=x"
-fi
-
-# Verify idempotency
-if ! grep -q "^PKG_MIRROR_HASH" "$TMPDIR/Makefile"; then
-    sed -i "/^PKG_SOURCE_VERSION:/a PKG_MIRROR_HASH:=x" "$TMPDIR/Makefile"
-fi
-COUNT=$(grep -c "^PKG_MIRROR_HASH:=x$" "$TMPDIR/Makefile")
-if [ "$COUNT" -eq 1 ]; then
-    pass "sed command is idempotent (no duplicate insertion)"
-else
-    fail "sed command inserted PKG_MIRROR_HASH $COUNT times (expected 1)"
+    fail "sed command incorrectly removed non-PKG_SOURCE lines"
 fi
 echo ""
 
-# 8. Verify release.yml and ci.yml contain PKG_MIRROR_HASH sed
-echo "--- PKG_MIRROR_HASH in Workflows ---"
-if grep -q "PKG_MIRROR_HASH:=x" .github/workflows/release.yml; then
-    pass "release.yml contains PKG_MIRROR_HASH:=x sed command"
+# 8. Verify release.yml and ci.yml contain PKG_SOURCE removal sed
+echo "--- PKG_SOURCE Removal in Workflows ---"
+if grep -q "PKG_SOURCE_PROTO:/d" .github/workflows/release.yml; then
+    pass "release.yml contains PKG_SOURCE removal sed command"
 else
-    fail "release.yml missing PKG_MIRROR_HASH:=x sed command"
+    fail "release.yml missing PKG_SOURCE removal sed command"
 fi
 
-if grep -q "PKG_MIRROR_HASH:=x" .github/workflows/ci.yml; then
-    pass "ci.yml contains PKG_MIRROR_HASH:=x sed command"
+if grep -q "PKG_SOURCE_PROTO:/d" .github/workflows/ci.yml; then
+    pass "ci.yml contains PKG_SOURCE removal sed command"
 else
-    fail "ci.yml missing PKG_MIRROR_HASH:=x sed command"
+    fail "ci.yml missing PKG_SOURCE removal sed command"
 fi
 echo ""
 

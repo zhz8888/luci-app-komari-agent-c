@@ -13,7 +13,7 @@ ENV MULTIARCH_TRIPLET=${MULTIARCH_TRIPLET}
 ENV CC=${CC}
 
 # Optionally switch to Chinese apt mirror for faster local builds
-# Use HTTP (not HTTPS) because base ubuntu:22.04 image lacks ca-certificates
+# Use HTTP (not HTTPS) for ports mirrors because base ubuntu:22.04 image lacks ca-certificates
 RUN if [ "$APT_MIRROR" = "cn" ]; then \
       sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list && \
       sed -i 's|http://security.ubuntu.com/ubuntu|http://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list; \
@@ -30,9 +30,9 @@ RUN if [ "$DEBIAN_ARCH" != "amd64" ]; then \
       else \
         sed -i 's|^deb |deb [arch=amd64,i386] |' /etc/apt/sources.list && \
         sed -i 's|^deb-src |deb-src [arch=amd64,i386] |' /etc/apt/sources.list 2>/dev/null || true && \
-        echo "deb [arch=$DEBIAN_ARCH] https://ports.ubuntu.com/ubuntu-ports/ jammy main universe restricted multiverse" > /etc/apt/sources.list.d/ports.list && \
-        echo "deb [arch=$DEBIAN_ARCH] https://ports.ubuntu.com/ubuntu-ports/ jammy-updates main universe restricted multiverse" >> /etc/apt/sources.list.d/ports.list && \
-        echo "deb [arch=$DEBIAN_ARCH] https://ports.ubuntu.com/ubuntu-ports/ jammy-security main universe restricted multiverse" >> /etc/apt/sources.list.d/ports.list; \
+        echo "deb [arch=$DEBIAN_ARCH] http://ports.ubuntu.com/ubuntu-ports/ jammy main universe restricted multiverse" > /etc/apt/sources.list.d/ports.list && \
+        echo "deb [arch=$DEBIAN_ARCH] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main universe restricted multiverse" >> /etc/apt/sources.list.d/ports.list && \
+        echo "deb [arch=$DEBIAN_ARCH] http://ports.ubuntu.com/ubuntu-ports/ jammy-security main universe restricted multiverse" >> /etc/apt/sources.list.d/ports.list; \
       fi && \
       apt-get update && \
       apt-get install -y --no-install-recommends \
