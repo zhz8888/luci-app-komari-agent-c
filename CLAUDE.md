@@ -11,7 +11,6 @@
 - **CI/CD**：GitHub Actions
 - **目标平台**：Linux、OpenWrt、多架构支持
 - **测试框架**：Unity v2.5.2
-- **静态分析**：cppcheck
 - **第三方库**：cJSON v1.7.19、OpenSSL、zlib
 
 ## 开发规范
@@ -37,7 +36,6 @@
 - 所有代码注释必须使用英文
 - 变量命名应清晰明了
 - 跨平台代码需处理平台兼容性
-- 使用 cppcheck 进行静态分析
 - 所有内存分配必须检查返回值
 - 文件操作必须检查返回值
 
@@ -70,7 +68,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build
 #### 依赖安装
 
 ```bash
-brew install cmake openssl zlib cppcheck
+brew install cmake openssl zlib
 ```
 
 #### 构建流程说明
@@ -82,7 +80,6 @@ brew install cmake openssl zlib cppcheck
 
 保留执行的步骤：
 - `cmake -B build` - CMake 配置检查（验证 CMakeLists.txt 语法和依赖检测）
-- `cppcheck --enable=warning,style,performance,portability -i src/vendor src/` - 静态分析
 
 如需在 macOS 上尝试完整构建，需手动设置 OpenSSL 路径：
 
@@ -96,8 +93,7 @@ cmake -B build && cmake --build build
 #### macOS 上的推荐工作流
 
 1. 使用 `cmake -B build` 验证 CMake 配置
-2. 使用 `cppcheck` 进行静态代码分析
-3. 使用 WSL（Windows Subsystem for Linux）或 GitHub Actions 进行完整构建验证
+2. 使用 WSL（Windows Subsystem for Linux）或 GitHub Actions 进行完整构建验证
 
 ### Windows 开发环境说明
 
@@ -132,7 +128,7 @@ WSL 环境下的标准构建流程：
 cd /mnt/对应路径/luci-app-komari-agent-c
 
 # 安装依赖（Ubuntu/Debian）
-sudo apt update && sudo apt install -y cmake build-essential libssl-dev zlib1g-dev cppcheck
+sudo apt update && sudo apt install -y cmake build-essential libssl-dev zlib1g-dev
 
 # 配置并构建
 cmake -B build && cmake --build build

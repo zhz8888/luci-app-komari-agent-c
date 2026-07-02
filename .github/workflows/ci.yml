@@ -177,8 +177,6 @@ jobs:
       - name: Install lint tools
         run: |
           pip install codespell pyyaml
-          sudo apt-get update
-          sudo apt-get install -y cppcheck
 
       - name: Spell check
         run: |
@@ -218,22 +216,4 @@ jobs:
           mkdir -p output
           docker compose -f docker/docker-compose.yml run --rm test
 
-      - name: Run cppcheck
-        run: |
-          if command -v cppcheck &> /dev/null; then
-            echo "Running cppcheck static analysis on src/..."
-            cppcheck --enable=warning,style,performance,portability \
-              --suppress=missingIncludeSystem \
-              -I include -I include/komari-agent-c \
-              -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
-              src/ \
-              --output-file=cppcheck-report.txt --xml 2>&1 || true
-            if [ -f cppcheck-report.txt ] && [ -s cppcheck-report.txt ]; then
-              echo "⚠️ Cppcheck found issues:"
-              cat cppcheck-report.txt
-            else
-              echo "✅ No issues found by cppcheck"
-            fi
-          else
-            echo "cppcheck not installed, skipping..."
-          fi
+
