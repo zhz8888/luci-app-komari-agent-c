@@ -1,0 +1,192 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Default (Release, binary profile)",
+      "description": "Default Release build for standalone binary deployment",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "KOMARI_BUILD_PROFILE": "binary",
+        "KOMARI_BUILD_TESTS": "ON",
+        "KOMARI_ENABLE_CCACHE": "ON",
+        "KOMARI_VERBOSE_CMAKE": "OFF"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (binary profile)",
+      "description": "Debug build with tests and verbose diagnostics",
+      "binaryDir": "${sourceDir}/build-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "KOMARI_BUILD_PROFILE": "binary",
+        "KOMARI_BUILD_TESTS": "ON",
+        "KOMARI_VERBOSE_CMAKE": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (no tests, binary profile)",
+      "description": "Optimized Release build without unit tests for faster builds",
+      "binaryDir": "${sourceDir}/build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "KOMARI_BUILD_PROFILE": "binary",
+        "KOMARI_BUILD_TESTS": "OFF",
+        "KOMARI_ENABLE_LTO": "ON"
+      }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "RelWithDebInfo (binary profile)",
+      "description": "Optimized build with debug symbols",
+      "binaryDir": "${sourceDir}/build-relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "KOMARI_BUILD_PROFILE": "binary",
+        "KOMARI_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "minsizerel",
+      "displayName": "MinSizeRel (binary profile)",
+      "description": "Minimal size build for embedded targets",
+      "binaryDir": "${sourceDir}/build-minsizerel",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "MinSizeRel",
+        "KOMARI_BUILD_PROFILE": "binary",
+        "KOMARI_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "sanitize",
+      "displayName": "Sanitizers (ASan + UBSan, binary profile)",
+      "description": "Debug build with AddressSanitizer + UndefinedBehaviorSanitizer enabled",
+      "binaryDir": "${sourceDir}/build-sanitize",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Sanitize",
+        "KOMARI_BUILD_PROFILE": "binary",
+        "KOMARI_BUILD_TESTS": "ON",
+        "KOMARI_ENABLE_SANITIZERS": "ON",
+        "KOMARI_WERROR": "ON"
+      }
+    },
+    {
+      "name": "coverage",
+      "displayName": "Coverage (binary profile)",
+      "description": "Debug build with code coverage instrumentation",
+      "binaryDir": "${sourceDir}/build-coverage",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Coverage",
+        "KOMARI_BUILD_PROFILE": "binary",
+        "KOMARI_BUILD_TESTS": "ON",
+        "KOMARI_ENABLE_COVERAGE": "ON"
+      }
+    },
+    {
+      "name": "openwrt",
+      "displayName": "OpenWrt cross-compile (openwrt profile)",
+      "description": "Cross-compile using the OpenWrt SDK toolchain (requires OpenWrt SDK env). Uses build-openwrt/ directory to stay isolated from binary builds.",
+      "binaryDir": "${sourceDir}/build-openwrt",
+      "toolchainFile": "${sourceDir}/cmake/toolchain-openwrt.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "KOMARI_BUILD_PROFILE": "openwrt",
+        "KOMARI_BUILD_TESTS": "OFF",
+        "KOMARI_ENABLE_CPACK": "OFF"
+      }
+    },
+    {
+      "name": "analyze",
+      "displayName": "Static analysis (clang-tidy, binary profile)",
+      "description": "Build with clang-tidy enabled (requires clang compiler)",
+      "binaryDir": "${sourceDir}/build-analyze",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "KOMARI_BUILD_PROFILE": "binary",
+        "KOMARI_BUILD_TESTS": "ON",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_C_CLANG_TIDY": "clang-tidy;-checks=-*,bugprone-*,performance-*,portability-*,readability-*,-readability-magic-numbers"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default"
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "relwithdebinfo",
+      "configurePreset": "relwithdebinfo"
+    },
+    {
+      "name": "minsizerel",
+      "configurePreset": "minsizerel"
+    },
+    {
+      "name": "sanitize",
+      "configurePreset": "sanitize"
+    },
+    {
+      "name": "coverage",
+      "configurePreset": "coverage"
+    },
+    {
+      "name": "openwrt",
+      "configurePreset": "openwrt"
+    },
+    {
+      "name": "analyze",
+      "configurePreset": "analyze"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": false
+      }
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "sanitize",
+      "configurePreset": "sanitize",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "coverage",
+      "configurePreset": "coverage",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

@@ -16,6 +16,19 @@ PKG_SOURCE_VERSION:=v1.0.0
 
 include $(INCLUDE_DIR)/package.mk
 
+# ---------------------------------------------------------------------------
+# Build profile and subdirectory configuration
+# ---------------------------------------------------------------------------
+# KOMARI_BUILD_SUBDIR separates the OpenWrt CMake build tree from the
+# standalone binary build tree (which uses "build/"). This avoids any
+# path collision when the same source tree is used for both build modes
+# and makes the OpenWrt build artifacts easy to identify.
+#
+# KOMARI_BUILD_PROFILE=openwrt tells the CMake configuration to disable
+# tests/CPack and apply musl-friendly hardening defaults.
+KOMARI_BUILD_SUBDIR ?= build-openwrt
+KOMARI_BUILD_PROFILE ?= openwrt
+
 define Package/komari-agent-c
 	SECTION:=net
 	CATEGORY:=Network
@@ -28,7 +41,7 @@ define Package/komari-agent-c/description
 	Komari Agent is a lightweight monitoring agent designed for OpenWrt.
 	It collects system metrics (CPU, memory, disk, network) and reports
 	to a central Komari Monitor dashboard via WebSocket.
-	
+
 	Features:
 	- Real-time system monitoring
 	- Web SSH terminal support
@@ -56,17 +69,20 @@ define Build/Compile
 	cd $(PKG_BUILD_DIR) && cmake \
 		-DCMAKE_TOOLCHAIN_FILE=$(PKG_BUILD_DIR)/cmake/toolchain-openwrt.cmake \
 		-DCMAKE_BUILD_TYPE=Release \
-		-B build
-	cmake --build $(PKG_BUILD_DIR)/build
+		-DKOMARI_BUILD_PROFILE=$(KOMARI_BUILD_PROFILE) \
+		-DKOMARI_BUILD_TESTS=OFF \
+		-DKOMARI_ENABLE_CPACK=OFF \
+		-B $(KOMARI_BUILD_SUBDIR)
+	cmake --build $(PKG_BUILD_DIR)/$(KOMARI_BUILD_SUBDIR)
 endef
 
 define Package/komari-agent-c/install
 	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/build/bin/komari-agent-c $(1)/usr/bin/
-	
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/$(KOMARI_BUILD_SUBDIR)/bin/komari-agent-c $(1)/usr/bin/
+
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/komari-agent-c.init $(1)/etc/init.d/komari-agent-c
-	
+
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/komari-agent-c.config $(1)/etc/config/komari-agent-c
 endef

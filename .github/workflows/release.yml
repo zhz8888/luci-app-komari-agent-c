@@ -107,39 +107,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - goarch: amd64
-            cc: x86_64-linux-gnu-gcc
-            pkg: gcc-x86-64-linux-gnu
-          - goarch: arm64
-            cc: aarch64-linux-gnu-gcc
-            pkg: gcc-aarch64-linux-gnu
-          - goarch: arm
-            cc: arm-linux-gnueabi-gcc
-            pkg: gcc-arm-linux-gnueabi
-          - goarch: armv7
-            cc: arm-linux-gnueabihf-gcc
-            pkg: gcc-arm-linux-gnueabihf
-          - goarch: mipsel
-            cc: mipsel-linux-gnu-gcc
-            pkg: gcc-mipsel-linux-gnu
-          - goarch: mips64
-            cc: mips64el-linux-gnuabi64-gcc
-            pkg: gcc-mips64el-linux-gnuabi64
-          - goarch: riscv64
-            cc: riscv64-linux-gnu-gcc
-            pkg: gcc-riscv64-linux-gnu
-          - goarch: 386
-            cc: i686-linux-gnu-gcc
-            pkg: gcc-i686-linux-gnu
+        goarch: [amd64, arm64, arm, armv7, mipsel, mips64, riscv64, 386]
 
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install dependencies
+      - name: Build binary in Docker
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ${{ matrix.pkg }} libssl-dev zlib1g-dev pkg-config
+          mkdir -p output
+          docker compose -f docker/docker-compose.yml run --rm build-${{ matrix.goarch }}
 
       - name: Get version
         id: get_version
@@ -150,24 +126,24 @@ jobs:
             echo "VERSION=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           fi
 
-      - name: Build binary
+      - name: Verify and package binary
         run: |
           VERSION="${{ steps.get_version.outputs.VERSION }}"
           GOARCH="${{ matrix.goarch }}"
+          BINARY="output/komari-agent-c-linux-${GOARCH}"
 
-          echo "Building for linux/$GOARCH..."
-
-          rm -rf build
-          cmake -B build -DCMAKE_C_COMPILER="${{ matrix.cc }}"
-          cmake --build build
-
-          if [ ! -f "build/bin/komari-agent-c" ]; then
-            echo "Error: Build failed - binary not found!"
+          if [ ! -f "$BINARY" ]; then
+            echo "Error: Binary not found at $BINARY"
             exit 1
           fi
 
+          echo "Binary size: $(du -h "$BINARY" | cut -f1)"
+          file "$BINARY"
+
+          # Rename to canonical name so tarball always extracts to ./komari-agent-c
+          cp "$BINARY" "output/komari-agent-c"
           mkdir -p dist
-          tar -czf "dist/komari-agent-c-${VERSION}-linux-${GOARCH}.tar.gz" -C build/bin komari-agent-c
+          tar -czf "dist/komari-agent-c-${VERSION}-linux-${GOARCH}.tar.gz" -C output komari-agent-c
 
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v4

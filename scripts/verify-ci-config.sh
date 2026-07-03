@@ -226,6 +226,136 @@ else
 fi
 echo ""
 
+# 9. Verify release.yml uses Docker for binary builds (no host-system compilation)
+echo "--- Docker-Based Build Check in release.yml ---"
+if grep -q "docker compose -f docker/docker-compose.yml run --rm build-" .github/workflows/release.yml; then
+    pass "release.yml: build-binaries uses docker compose run"
+else
+    fail "release.yml: build-binaries does not use docker compose run"
+fi
+
+# release.yml build-binaries should NOT install cross-compiler packages (Docker handles it)
+if grep -Eq 'sudo apt-get install -y cmake \$\{?matrix\.pkg\}? libssl-dev' .github/workflows/release.yml; then
+    fail "release.yml: still installs host cross-compiler packages (should be in Docker)"
+else
+    pass "release.yml: no host cross-compiler package install (handled by Docker)"
+fi
+
+# release.yml build-binaries should NOT run host-system cmake directly
+if grep -Eq 'cmake -B build -DCMAKE_C_COMPILER="\$\{?\{?matrix\.cc' .github/workflows/release.yml; then
+    fail "release.yml: still contains host-system 'cmake -B build' with matrix.cc (should be in Docker)"
+else
+    pass "release.yml: no host-system cmake -B build with matrix.cc (compiled in Docker)"
+fi
+echo ""
+
+# 10. Verify docker/build.sh uses new CMake options
+echo "--- New CMake Options in docker/build.sh ---"
+if grep -q "KOMARI_BUILD_PROFILE=binary" docker/build.sh; then
+    pass "docker/build.sh: sets KOMARI_BUILD_PROFILE=binary"
+else
+    fail "docker/build.sh: missing KOMARI_BUILD_PROFILE=binary"
+fi
+
+if grep -q "KOMARI_BUILD_TESTS=OFF" docker/build.sh; then
+    pass "docker/build.sh: sets KOMARI_BUILD_TESTS=OFF (skip test targets in binary build)"
+else
+    fail "docker/build.sh: missing KOMARI_BUILD_TESTS=OFF"
+fi
+echo ""
+
+# 11. Verify CMake modular configuration files exist
+echo "--- CMake Modular Config Files Check ---"
+for f in cmake/BuildOptions.cmake cmake/Version.cmake cmake/Platform.cmake \
+         cmake/CompilerFlags.cmake cmake/Dependencies.cmake cmake/toolchain-openwrt.cmake \
+         CMakePresets.json; do
+    if [ -f "$f" ]; then
+        pass "$f: exists"
+    else
+        fail "$f: missing"
+    fi
+done
+echo ""
+
+# 12. Verify CMakePresets.json is valid JSON and defines key presets
+echo "--- CMakePresets.json Check ---"
+if python3 -c "
+import json
+with open('CMakePresets.json') as f:
+    p = json.load(f)
+presets = set(cp['name'] for cp in p.get('configurePresets', []))
+required = {'default', 'debug', 'release', 'openwrt', 'sanitize', 'coverage'}
+missing = required - presets
+if missing:
+    print(f'FAIL: missing presets: {missing}')
+    exit(1)
+# openwrt preset must set KOMARI_BUILD_PROFILE=openwrt and use build-openwrt dir
+for cp in p['configurePresets']:
+    if cp['name'] == 'openwrt':
+        cv = cp.get('cacheVariables', {})
+        if cv.get('KOMARI_BUILD_PROFILE') != 'openwrt':
+            print('FAIL: openwrt preset does not set KOMARI_BUILD_PROFILE=openwrt')
+            exit(1)
+        if 'build-openwrt' not in cp.get('binaryDir', ''):
+            print('FAIL: openwrt preset binaryDir should contain build-openwrt')
+            exit(1)
+        break
+print(f'OK: {len(presets)} presets defined, required presets present, openwrt profile correct')
+" 2>/dev/null; then
+    pass "CMakePresets.json: valid JSON, required presets present, openwrt profile correct"
+else
+    fail "CMakePresets.json: invalid or missing required presets/profile"
+fi
+echo ""
+
+# 13. Verify OpenWrt Makefile uses KOMARI_BUILD_SUBDIR (path separation)
+echo "--- OpenWrt Path Separation Check ---"
+if grep -q "KOMARI_BUILD_SUBDIR" openwrt/Makefile; then
+    pass "openwrt/Makefile: uses KOMARI_BUILD_SUBDIR for path isolation"
+else
+    fail "openwrt/Makefile: missing KOMARI_BUILD_SUBDIR (path isolation broken)"
+fi
+
+if grep -q "KOMARI_BUILD_PROFILE" openwrt/Makefile; then
+    pass "openwrt/Makefile: sets KOMARI_BUILD_PROFILE for build profile"
+else
+    fail "openwrt/Makefile: missing KOMARI_BUILD_PROFILE"
+fi
+
+if grep -q "build-openwrt" openwrt/Makefile; then
+    pass "openwrt/Makefile: uses build-openwrt/ directory (separate from binary build/)"
+else
+    fail "openwrt/Makefile: missing build-openwrt directory reference"
+fi
+echo ""
+
+# 14. Verify CMakeLists.txt includes modular config and supports KOMARI_BUILD_PROFILE
+echo "--- Root CMakeLists.txt Modular Integration Check ---"
+if grep -q "include(BuildOptions)" CMakeLists.txt; then
+    pass "CMakeLists.txt: includes BuildOptions module"
+else
+    fail "CMakeLists.txt: missing include(BuildOptions)"
+fi
+
+if grep -q "include(CompilerFlags)" CMakeLists.txt; then
+    pass "CMakeLists.txt: includes CompilerFlags module"
+else
+    fail "CMakeLists.txt: missing include(CompilerFlags)"
+fi
+
+if grep -q "include(Dependencies)" CMakeLists.txt; then
+    pass "CMakeLists.txt: includes Dependencies module"
+else
+    fail "CMakeLists.txt: missing include(Dependencies)"
+fi
+
+if grep -q "KOMARI_BUILD_PROFILE" CMakeLists.txt; then
+    pass "CMakeLists.txt: references KOMARI_BUILD_PROFILE"
+else
+    fail "CMakeLists.txt: missing KOMARI_BUILD_PROFILE reference"
+fi
+echo ""
+
 # Summary
 echo "=== Summary ==="
 echo "Passed: $PASS"

@@ -1,13 +1,32 @@
-# Build artifacts
-build*/
+# Build artifacts - binary profile (standalone ELF binaries)
+build/
+build-debug/
+build-release/
+build-relwithdebinfo/
+build-minsizerel/
+build-sanitize/
+build-coverage/
+build-analyze/
+
+# Build artifacts - openwrt profile (OpenWrt package cross-compile)
+# Kept separate from binary build dirs to enforce path isolation.
+build-openwrt/
+
+# Legacy wildcard (catches any other build-* directories)
+build-*/
+
 obj/
 /komari-agent-c
 *.o
 *.a
 *.so
 
-# Docker build output
+# Docker build output (multi-arch standalone binaries)
 output/
+
+# OpenWrt SDK package build output (CI workflow)
+package/
+bin/packages/
 
 # IDE configuration
 .vscode/

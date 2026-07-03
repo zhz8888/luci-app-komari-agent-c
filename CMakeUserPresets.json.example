@@ -1,0 +1,24 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "local-cn",
+      "displayName": "Local (China mirror)",
+      "description": "Local build with Chinese apt mirror flag (for docker build only)",
+      "binaryDir": "${sourceDir}/build-local",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "KOMARI_BUILD_TESTS": "ON",
+        "KOMARI_VERBOSE_CMAKE": "ON"
+      },
+      "environment": {
+        "APT_MIRROR": "cn"
+      }
+    }
+  ]
+}

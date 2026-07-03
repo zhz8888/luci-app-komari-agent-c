@@ -1,259 +1,128 @@
 # Copyright (C) 2026 zhz8888/luci-app-komari-agent-c Contributors
 # Licensed under MIT License
+#
+# Unit test definitions for komari-agent-c. Tests use the Unity v2.5.2
+# framework shipped in this directory and link against the komari_core
+# static library to avoid recompiling individual source files.
 
-# Unity test framework source files
-set(UNITY_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/unity.c"
+# ---------------------------------------------------------------------------
+# Unity test framework
+# ---------------------------------------------------------------------------
+set(UNITY_SOURCES  "${CMAKE_CURRENT_SOURCE_DIR}/unity.c")
+set(UNITY_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}")
+
+# Unity's TEST_ASSERT_EQUAL_DOUBLE requires -DUNITY_INCLUDE_DOUBLE.
+add_definitions(-DUNITY_INCLUDE_DOUBLE)
+
+# ---------------------------------------------------------------------------
+# Helper: add a unit test target
+# ---------------------------------------------------------------------------
+# Usage:
+#   komari_add_test(<name>
+#       SOURCES <test_source.c> [<extra_source.c>...]
+#       LIBS    <extra_lib>...
+#   )
+#
+# The test automatically links against:
+#   - Unity framework (unity.c)
+#   - komari_core static library (which transitively brings OpenSSL, ZLIB,
+#     Threads, and the discovered system libraries)
+#   - Math library (-lm)
+function(komari_add_test NAME)
+    set(options)
+    set(one_value_args)
+    set(multi_value_args SOURCES LIBS)
+    cmake_parse_arguments(KAT "${options}" "${one_value_args}" "${multi_value_args}" ${ARGN})
+
+    # Test executable sources: Unity + caller-provided test source(s)
+    set(_sources ${UNITY_SOURCES} ${KAT_SOURCES})
+
+    add_executable(${NAME} ${_sources})
+
+    # Unity headers + public/private komari headers (transitively via komari_core)
+    target_include_directories(${NAME} PRIVATE
+        ${UNITY_INCLUDE_DIRS}
+    )
+
+    # The komari_core target's PUBLIC include dirs already cover include/
+    # and include/komari-agent-c, plus its PRIVATE dirs cover all module
+    # subdirectories — but PRIVATE dirs do not propagate to consumers.
+    # Tests that need to include e.g. "utils.h" directly must do so via
+    # the public header (komari-agent-c.h), so we additionally expose the
+    # module headers here for backward compatibility with existing tests.
+    set(KOMARI_TEST_SUBDIRS
+        core config network monitoring report terminal ping
+        utils vendor protocol autodiscovery update
+    )
+    foreach(_dir ${KOMARI_TEST_SUBDIRS})
+        target_include_directories(${NAME} PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/${_dir}")
+    endforeach()
+
+    # Link the static library (transitively pulls OpenSSL/ZLIB/Threads).
+    target_link_libraries(${NAME} PRIVATE
+        komari_core
+        m
+        ${KAT_LIBS}
+    )
+
+    # Unity test functions are declared in the test source file but have no
+    # forward declarations — silence -Wmissing-prototypes for test targets.
+    # Also silence -Wstrict-prototypes since Unity's RUN_TEST macro passes
+    # function pointers without parameters.
+    if(KOMARI_COMPILER_GCC_LIKE)
+        target_compile_options(${NAME} PRIVATE
+            -Wno-missing-prototypes
+            -Wno-strict-prototypes
+        )
+    endif()
+
+    # Register with CTest
+    add_test(NAME ${NAME} COMMAND ${NAME})
+endfunction()
+
+# ---------------------------------------------------------------------------
+# Test targets
+# ---------------------------------------------------------------------------
+# Each test links komari_core for the implementation of the modules it
+# exercises; only the test driver itself needs to be specified here.
+
+# test_utils — exercises utils.c, logger.c, cJSON.c
+komari_add_test(test_utils
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test_utils.c"
 )
 
-set(UNITY_INCLUDE_DIRS
-    "${CMAKE_CURRENT_SOURCE_DIR}"
+# test_config — exercises config.c + cJSON/utils/logger
+komari_add_test(test_config
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test_config.c"
 )
 
-# Compilation flags (consistent with the main project)
-set(KOMARI_TEST_C_FLAGS "-std=c99 -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -DUNITY_INCLUDE_DOUBLE -Wall -Wextra")
-
-# Convert space-separated string to CMake list to avoid target_compile_options treating it as a single argument
-separate_arguments(KOMARI_TEST_C_FLAGS UNIX_COMMAND "${KOMARI_TEST_C_FLAGS}")
-
-# Check if compiler supports GCC-style flags
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    set(KOMARI_TEST_C_FLAGS_LIST ${KOMARI_TEST_C_FLAGS})
-else()
-    set(KOMARI_TEST_C_FLAGS_LIST -Wall -Wextra)
-endif()
-
-# Common test dependency source files (linked as needed)
-# Each test declares its dependent source file list for easy future extension
-
-# ====== Test target definitions ======
-
-# Test target: test_utils
-# Links ../src/utils/utils.c, ../src/utils/logger.c and ../src/vendor/cJSON.c
-add_executable(test_utils
-    ${UNITY_SOURCES}
-    "${CMAKE_CURRENT_SOURCE_DIR}/test_utils.c"
-    "${CMAKE_SOURCE_DIR}/src/utils/utils.c"
-    "${CMAKE_SOURCE_DIR}/src/utils/logger.c"
-    "${CMAKE_SOURCE_DIR}/src/vendor/cJSON.c"
+# test_idn — exercises network/idn.c
+komari_add_test(test_idn
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test_idn.c"
 )
 
-target_include_directories(test_utils PRIVATE
-    ${UNITY_INCLUDE_DIRS}
-    "${CMAKE_SOURCE_DIR}/src/utils"
-    "${CMAKE_SOURCE_DIR}/src/vendor"
-    "${CMAKE_SOURCE_DIR}/include"
-    "${CMAKE_SOURCE_DIR}/include/komari-agent-c"
+# test_monitoring — exercises monitoring.c + dependencies
+komari_add_test(test_monitoring
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test_monitoring.c"
 )
 
-target_link_libraries(test_utils PRIVATE m)
-
-target_compile_options(test_utils PRIVATE ${KOMARI_TEST_C_FLAGS_LIST})
-
-add_test(NAME test_utils COMMAND test_utils)
-
-# ====== Test target: test_config ======
-# Links config.c, cJSON.c, utils.c, logger.c
-add_executable(test_config
-    ${UNITY_SOURCES}
-    "${CMAKE_CURRENT_SOURCE_DIR}/test_config.c"
-    "${CMAKE_SOURCE_DIR}/src/config/config.c"
-    "${CMAKE_SOURCE_DIR}/src/vendor/cJSON.c"
-    "${CMAKE_SOURCE_DIR}/src/utils/utils.c"
-    "${CMAKE_SOURCE_DIR}/src/utils/logger.c"
+# test_websocket — exercises websocket.c + protocol stack (OpenSSL/ZLIB)
+komari_add_test(test_websocket
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test_websocket.c"
 )
 
-target_include_directories(test_config PRIVATE
-    ${UNITY_INCLUDE_DIRS}
-    "${CMAKE_SOURCE_DIR}/src/config"
-    "${CMAKE_SOURCE_DIR}/src/vendor"
-    "${CMAKE_SOURCE_DIR}/src/utils"
-    "${CMAKE_SOURCE_DIR}/include"
-    "${CMAKE_SOURCE_DIR}/include/komari-agent-c"
+# test_jsonrpc — exercises jsonrpc.c + cJSON
+komari_add_test(test_jsonrpc
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test_jsonrpc.c"
 )
 
-target_link_libraries(test_config PRIVATE m)
-
-target_compile_options(test_config PRIVATE ${KOMARI_TEST_C_FLAGS_LIST})
-
-add_test(NAME test_config COMMAND test_config)
-
-# ====== Test target: test_idn ======
-# Links idn.c
-add_executable(test_idn
-    ${UNITY_SOURCES}
-    "${CMAKE_CURRENT_SOURCE_DIR}/test_idn.c"
-    "${CMAKE_SOURCE_DIR}/src/network/idn.c"
+# test_v2 — exercises v2.c + jsonrpc.c (depends on Threads for v2 state mutex)
+komari_add_test(test_v2
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test_v2.c"
 )
 
-target_include_directories(test_idn PRIVATE
-    ${UNITY_INCLUDE_DIRS}
-    "${CMAKE_SOURCE_DIR}/src/network"
-    "${CMAKE_SOURCE_DIR}/src/utils"
-    "${CMAKE_SOURCE_DIR}/include"
-    "${CMAKE_SOURCE_DIR}/include/komari-agent-c"
+# test_report — exercises report.c + monitoring + protocol (OpenSSL/Threads)
+komari_add_test(test_report
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test_report.c"
 )
-
-target_link_libraries(test_idn PRIVATE m)
-
-target_compile_options(test_idn PRIVATE ${KOMARI_TEST_C_FLAGS_LIST})
-
-add_test(NAME test_idn COMMAND test_idn)
-
-# ====== Test target: test_monitoring ======
-# Links monitoring.c, cJSON.c, utils.c, logger.c, config.c
-add_executable(test_monitoring
-    ${UNITY_SOURCES}
-    "${CMAKE_CURRENT_SOURCE_DIR}/test_monitoring.c"
-    "${CMAKE_SOURCE_DIR}/src/monitoring/monitoring.c"
-    "${CMAKE_SOURCE_DIR}/src/vendor/cJSON.c"
-    "${CMAKE_SOURCE_DIR}/src/utils/utils.c"
-    "${CMAKE_SOURCE_DIR}/src/utils/logger.c"
-    "${CMAKE_SOURCE_DIR}/src/config/config.c"
-)
-
-target_include_directories(test_monitoring PRIVATE
-    ${UNITY_INCLUDE_DIRS}
-    "${CMAKE_SOURCE_DIR}/src/monitoring"
-    "${CMAKE_SOURCE_DIR}/src/config"
-    "${CMAKE_SOURCE_DIR}/src/vendor"
-    "${CMAKE_SOURCE_DIR}/src/utils"
-    "${CMAKE_SOURCE_DIR}/include"
-    "${CMAKE_SOURCE_DIR}/include/komari-agent-c"
-)
-
-target_link_libraries(test_monitoring PRIVATE m)
-
-target_compile_options(test_monitoring PRIVATE ${KOMARI_TEST_C_FLAGS_LIST})
-
-add_test(NAME test_monitoring COMMAND test_monitoring)
-
-# ====== Test target: test_websocket ======
-# Links websocket.c, cJSON.c, utils.c, logger.c, v2.c, v1.c, compress.c, jsonrpc.c; depends on OpenSSL, ZLIB and Threads
-add_executable(test_websocket
-    ${UNITY_SOURCES}
-    "${CMAKE_CURRENT_SOURCE_DIR}/test_websocket.c"
-    "${CMAKE_SOURCE_DIR}/src/network/websocket.c"
-    "${CMAKE_SOURCE_DIR}/src/vendor/cJSON.c"
-    "${CMAKE_SOURCE_DIR}/src/utils/utils.c"
-    "${CMAKE_SOURCE_DIR}/src/utils/logger.c"
-    "${CMAKE_SOURCE_DIR}/src/protocol/v2.c"
-    "${CMAKE_SOURCE_DIR}/src/protocol/v1.c"
-    "${CMAKE_SOURCE_DIR}/src/protocol/compress.c"
-    "${CMAKE_SOURCE_DIR}/src/protocol/jsonrpc.c"
-)
-
-target_include_directories(test_websocket PRIVATE
-    ${UNITY_INCLUDE_DIRS}
-    "${CMAKE_SOURCE_DIR}/src/network"
-    "${CMAKE_SOURCE_DIR}/src/config"
-    "${CMAKE_SOURCE_DIR}/src/monitoring"
-    "${CMAKE_SOURCE_DIR}/src/protocol"
-    "${CMAKE_SOURCE_DIR}/src/vendor"
-    "${CMAKE_SOURCE_DIR}/src/utils"
-    "${CMAKE_SOURCE_DIR}/include"
-    "${CMAKE_SOURCE_DIR}/include/komari-agent-c"
-)
-
-target_link_libraries(test_websocket PRIVATE
-    m
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    ZLIB::ZLIB
-    Threads::Threads
-)
-
-target_compile_options(test_websocket PRIVATE ${KOMARI_TEST_C_FLAGS_LIST})
-
-add_test(NAME test_websocket COMMAND test_websocket)
-
-# ====== Test target: test_jsonrpc ======
-# Links jsonrpc.c, cJSON.c
-add_executable(test_jsonrpc
-    ${UNITY_SOURCES}
-    "${CMAKE_CURRENT_SOURCE_DIR}/test_jsonrpc.c"
-    "${CMAKE_SOURCE_DIR}/src/protocol/jsonrpc.c"
-    "${CMAKE_SOURCE_DIR}/src/vendor/cJSON.c"
-)
-
-target_include_directories(test_jsonrpc PRIVATE
-    ${UNITY_INCLUDE_DIRS}
-    "${CMAKE_SOURCE_DIR}/src/protocol"
-    "${CMAKE_SOURCE_DIR}/src/vendor"
-    "${CMAKE_SOURCE_DIR}/include"
-    "${CMAKE_SOURCE_DIR}/include/komari-agent-c"
-)
-
-target_link_libraries(test_jsonrpc PRIVATE m)
-
-target_compile_options(test_jsonrpc PRIVATE ${KOMARI_TEST_C_FLAGS_LIST})
-
-add_test(NAME test_jsonrpc COMMAND test_jsonrpc)
-
-# ====== Test target: test_v2 ======
-# Links v2.c, jsonrpc.c, cJSON.c; depends on Threads (v2 state uses pthread mutex)
-add_executable(test_v2
-    ${UNITY_SOURCES}
-    "${CMAKE_CURRENT_SOURCE_DIR}/test_v2.c"
-    "${CMAKE_SOURCE_DIR}/src/protocol/v2.c"
-    "${CMAKE_SOURCE_DIR}/src/protocol/jsonrpc.c"
-    "${CMAKE_SOURCE_DIR}/src/vendor/cJSON.c"
-)
-
-target_include_directories(test_v2 PRIVATE
-    ${UNITY_INCLUDE_DIRS}
-    "${CMAKE_SOURCE_DIR}/src/protocol"
-    "${CMAKE_SOURCE_DIR}/src/vendor"
-    "${CMAKE_SOURCE_DIR}/include"
-    "${CMAKE_SOURCE_DIR}/include/komari-agent-c"
-)
-
-target_link_libraries(test_v2 PRIVATE
-    m
-    Threads::Threads
-)
-
-target_compile_options(test_v2 PRIVATE ${KOMARI_TEST_C_FLAGS_LIST})
-
-add_test(NAME test_v2 COMMAND test_v2)
-
-# ====== Test target: test_report ======
-# Links report.c, monitoring.c, cJSON.c, utils.c, virtual.c, logger.c, config.c, gpu.c,
-# v2.c, jsonrpc.c (for report_generate_v2 / report_generate_basic_info_v2); depends on OpenSSL, Threads
-add_executable(test_report
-    ${UNITY_SOURCES}
-    "${CMAKE_CURRENT_SOURCE_DIR}/test_report.c"
-    "${CMAKE_SOURCE_DIR}/src/report/report.c"
-    "${CMAKE_SOURCE_DIR}/src/monitoring/monitoring.c"
-    "${CMAKE_SOURCE_DIR}/src/monitoring/gpu.c"
-    "${CMAKE_SOURCE_DIR}/src/vendor/cJSON.c"
-    "${CMAKE_SOURCE_DIR}/src/utils/utils.c"
-    "${CMAKE_SOURCE_DIR}/src/utils/virtual.c"
-    "${CMAKE_SOURCE_DIR}/src/utils/logger.c"
-    "${CMAKE_SOURCE_DIR}/src/config/config.c"
-    "${CMAKE_SOURCE_DIR}/src/protocol/v2.c"
-    "${CMAKE_SOURCE_DIR}/src/protocol/jsonrpc.c"
-)
-
-target_include_directories(test_report PRIVATE
-    ${UNITY_INCLUDE_DIRS}
-    "${CMAKE_SOURCE_DIR}/src/report"
-    "${CMAKE_SOURCE_DIR}/src/monitoring"
-    "${CMAKE_SOURCE_DIR}/src/config"
-    "${CMAKE_SOURCE_DIR}/src/protocol"
-    "${CMAKE_SOURCE_DIR}/src/vendor"
-    "${CMAKE_SOURCE_DIR}/src/utils"
-    "${CMAKE_SOURCE_DIR}/include"
-    "${CMAKE_SOURCE_DIR}/include/komari-agent-c"
-)
-
-target_link_libraries(test_report PRIVATE
-    m
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    Threads::Threads
-)
-
-target_compile_options(test_report PRIVATE ${KOMARI_TEST_C_FLAGS_LIST})
-
-add_test(NAME test_report COMMAND test_report)

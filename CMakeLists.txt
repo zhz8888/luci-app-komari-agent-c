@@ -1,101 +1,165 @@
 # Copyright (C) 2026 zhz8888/luci-app-komari-agent-c Contributors
 # Licensed under MIT License
+#
+# Top-level CMake configuration for komari-agent-c.
+#
+# Quick start:
+#   cmake -B build && cmake --build build          # default Release
+#   cmake -B build -DCMAKE_BUILD_TYPE=Debug        # debug build
+#   cmake -B build -DKOMARI_ENABLE_SANITIZERS=ON   # ASan + UBSan
+#   cmake -B build -DKOMARI_ENABLE_CCACHE=ON       # use ccache if available
+#   cmake -B build -DKOMARI_BUILD_TESTS=OFF        # skip tests
+#
+# For standardized presets see CMakePresets.json.
 
 cmake_minimum_required(VERSION 3.10)
 
-# Read version number from include/komari-agent-c/version.h
-set(_VERSION_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/include/komari-agent-c/version.h")
+# ---------------------------------------------------------------------------
+# Load user-facing options BEFORE project() so they can influence toolchain.
+# ---------------------------------------------------------------------------
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(BuildOptions)
 
-if(NOT EXISTS "${_VERSION_HEADER}")
-    message(FATAL_ERROR "Version header file not found: ${_VERSION_HEADER}")
-endif()
-
-file(READ "${_VERSION_HEADER}" _VERSION_CONTENT)
-
-# Extract version number using regex
-string(REGEX MATCH "KOMARI_AGENT_C_VERSION_MAJOR[ \t]+([0-9]+)" _MATCH "${_VERSION_CONTENT}")
-set(KOMARI_AGENT_C_VERSION_MAJOR "${CMAKE_MATCH_1}")
-
-string(REGEX MATCH "KOMARI_AGENT_C_VERSION_MINOR[ \t]+([0-9]+)" _MATCH "${_VERSION_CONTENT}")
-set(KOMARI_AGENT_C_VERSION_MINOR "${CMAKE_MATCH_1}")
-
-string(REGEX MATCH "KOMARI_AGENT_C_VERSION_PATCH[ \t]+([0-9]+)" _MATCH "${_VERSION_CONTENT}")
-set(KOMARI_AGENT_C_VERSION_PATCH "${CMAKE_MATCH_1}")
-
-string(REGEX MATCH "KOMARI_AGENT_C_VERSION_STRING[ \t]+\"([^\"]+)\"" _MATCH "${_VERSION_CONTENT}")
-set(KOMARI_AGENT_C_VERSION_STRING "${CMAKE_MATCH_1}")
-
-# Note: Cannot use NOT check, because CMake treats string "0" as false
-if(KOMARI_AGENT_C_VERSION_MAJOR STREQUAL "" OR KOMARI_AGENT_C_VERSION_MINOR STREQUAL "" OR KOMARI_AGENT_C_VERSION_PATCH STREQUAL "")
-    message(FATAL_ERROR "Failed to parse version number from version.h")
-endif()
-
-set(KOMARI_AGENT_C_VERSION "${KOMARI_AGENT_C_VERSION_MAJOR}.${KOMARI_AGENT_C_VERSION_MINOR}.${KOMARI_AGENT_C_VERSION_PATCH}")
+# ---------------------------------------------------------------------------
+# Parse version from include/komari-agent-c/version.h
+# ---------------------------------------------------------------------------
+include(Version)
+komari_parse_version("${CMAKE_CURRENT_SOURCE_DIR}/include/komari-agent-c/version.h")
 
 project(komari-agent-c
     VERSION "${KOMARI_AGENT_C_VERSION}"
     LANGUAGES C
+    DESCRIPTION "Komari monitoring agent (C implementation)"
+    HOMEPAGE_URL "https://github.com/zhz8888/luci-app-komari-agent-c"
 )
 
-message(STATUS "Komari Agent version: ${KOMARI_AGENT_C_VERSION} (string: ${KOMARI_AGENT_C_VERSION_STRING})")
+# ---------------------------------------------------------------------------
+# Post-project platform detection and dependency discovery
+# ---------------------------------------------------------------------------
+include(Platform)
+include(CompilerFlags)
+include(Dependencies)
 
-# C standard: C99
-set(CMAKE_C_STANDARD 99)
-set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_EXTENSIONS OFF)
-
-# Default build type is Release
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
-endif()
-
-# Compilation flags (unified requirements)
-set(KOMARI_C_FLAGS "-std=c99 -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Wall -Wextra")
-
-# Convert space-separated string to CMake list to avoid add_compile_options treating it as a single argument
-separate_arguments(KOMARI_C_FLAGS UNIX_COMMAND "${KOMARI_C_FLAGS}")
-
-# Check if compiler supports GCC-style flags
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    add_compile_options(${KOMARI_C_FLAGS})
-else()
-    # Other compilers only add recognizable flags
-    add_compile_options(-Wall -Wextra)
-endif()
-
-# Dependency lookup
-find_package(OpenSSL REQUIRED)
-find_package(Threads REQUIRED)
-find_package(ZLIB REQUIRED)
-
-# Output directories
+# ---------------------------------------------------------------------------
+# Global output directories (kept in build tree, also used by tests)
+# ---------------------------------------------------------------------------
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
-# Testing switch
-option(BUILD_TESTING "Build unit tests" ON)
+# ---------------------------------------------------------------------------
+# Default install layout (GNU-style)
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
 
+# ---------------------------------------------------------------------------
 # Subdirectories
+# ---------------------------------------------------------------------------
 add_subdirectory(src)
 
-if(BUILD_TESTING)
+if(KOMARI_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
 
-# Install targets
+# ---------------------------------------------------------------------------
+# Install rules
+# ---------------------------------------------------------------------------
+# Install rules are shared between the binary and openwrt profiles; the
+# OpenWrt SDK's Build/Compile step ignores CMAKE_INSTALL_PREFIX and uses
+# its own Package/install define instead, so these rules only matter for
+# standalone `cmake --install` usage.
 install(TARGETS komari-agent-c
-    RUNTIME DESTINATION /usr/bin
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/openwrt/files/komari-agent-c.init"
-    DESTINATION /etc/init.d
+    DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/init.d
     RENAME komari-agent-c
-    PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+    PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                GROUP_READ GROUP_EXECUTE
+                WORLD_READ WORLD_EXECUTE
 )
 
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/openwrt/files/komari-agent-c.config"
-    DESTINATION /etc/config
+    DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/config
     RENAME komari-agent-c
 )
+
+# ---------------------------------------------------------------------------
+# CPack packaging (DEB / RPM / TGZ) — binary profile only
+# ---------------------------------------------------------------------------
+# The OpenWrt SDK produces .ipk/.apk packages via its own packager, so
+# CPack is disabled in the openwrt profile to avoid duplicate packaging
+# rules and potential conflicts.
+if(KOMARI_ENABLE_CPACK)
+    include(CPack)
+
+    set(CPACK_PACKAGE_NAME              "komari-agent-c")
+    set(CPACK_PACKAGE_VERSION           "${KOMARI_AGENT_C_VERSION_STRING}")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Komari monitoring agent (C implementation)")
+    set(CPACK_PACKAGE_HOMEPAGE_URL      "https://github.com/zhz8888/luci-app-komari-agent-c")
+    set(CPACK_PACKAGE_CONTACT           "zhz8888")
+    set(CPACK_PACKAGE_LICENSE           "MIT")
+    set(CPACK_RESOURCE_FILE_LICENSE      "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+    set(CPACK_STRIP_FILES                ON)
+    set(CPACK_PACKAGE_EXECUTABLES        "komari-agent-c;komari-agent-c")
+
+    # Detect target architecture for package naming
+    if(CMAKE_SYSTEM_PROCESSOR)
+        set(CPACK_PACKAGE_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+    else()
+        set(CPACK_PACKAGE_ARCH "unknown")
+    endif()
+
+    # Component layout — single "runtime" component for the agent binary
+    set(CPACK_COMPONENTS_ALL runtime)
+    set(CPACK_COMPONENT_RUNTIME_DISPLAY_NAME "Komari Agent runtime")
+
+    # Source package configuration (TGZ by default; DEB/RPM when available)
+    set(CPACK_GENERATOR "TGZ")
+    find_program(DPKG_BUILDER dpkg-buildpackage)
+    if(DPKG_BUILDER)
+        list(APPEND CPACK_GENERATOR "DEB")
+    endif()
+    find_program(RPMBUILDER rpmbuild)
+    if(RPMBUILDER)
+        list(APPEND CPACK_GENERATOR "RPM")
+    endif()
+
+    # DEB-specific
+    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "${CPACK_PACKAGE_ARCH}")
+    set(CPACK_DEBIAN_PACKAGE_MAINTAINER   "zhz8888 <zhz8888@users.noreply.github.com>")
+    set(CPACK_DEBIAN_PACKAGE_SECTION      "net")
+    set(CPACK_DEBIAN_PACKAGE_PRIORITY     "optional")
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS      "libssl3, zlib1g (>= 1:1.2.0)")
+
+    # RPM-specific
+    set(CPACK_RPM_PACKAGE_ARCHITECTURE    "${CPACK_PACKAGE_ARCH}")
+    set(CPACK_RPM_PACKAGE_LICENSE         "MIT")
+    set(CPACK_RPM_PACKAGE_GROUP           "Applications/Internet")
+    set(CPACK_RPM_PACKAGE_REQUIRES        "openssl >= 1.1.0, zlib >= 1.2.11")
+endif()
+
+# Display final configuration summary
+message(STATUS "")
+message(STATUS "==== komari-agent-c configuration summary ====")
+message(STATUS "  Version:        ${KOMARI_AGENT_C_VERSION_STRING}")
+message(STATUS "  Build type:     ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Profile:        ${KOMARI_BUILD_PROFILE} (subdir: ${KOMARI_BUILD_SUBDIR})")
+message(STATUS "  Compiler:       ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
+message(STATUS "  Target:         ${CMAKE_SYSTEM_NAME} (${CMAKE_SYSTEM_PROCESSOR})")
+message(STATUS "  Cross-comp:     ${CMAKE_CROSSCOMPILING}")
+message(STATUS "  Tests:          ${KOMARI_BUILD_TESTS}")
+message(STATUS "  CPack:          ${KOMARI_ENABLE_CPACK}")
+message(STATUS "  Sanitizers:     ${KOMARI_ENABLE_SANITIZERS}")
+message(STATUS "  Coverage:       ${KOMARI_ENABLE_COVERAGE}")
+message(STATUS "  LTO:            ${KOMARI_ENABLE_LTO}")
+message(STATUS "  PIE:            ${KOMARI_ENABLE_PIE}")
+message(STATUS "  Werror:         ${KOMARI_WERROR}")
+message(STATUS "  ccache:         ${KOMARI_ENABLE_CCACHE} (${CCACHE_PROGRAM})")
+message(STATUS "  OpenSSL:        ${OPENSSL_VERSION}")
+message(STATUS "  ZLIB:           ${ZLIB_VERSION_STRING}")
+message(STATUS "  Install prefix: ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "==============================================")
+message(STATUS "")
