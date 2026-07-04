@@ -106,8 +106,8 @@ endef
 define Package/komari-agent-c/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] || {
-	/etc/init.d/komari-agent-c stop
-	/etc/init.d/komari-agent-c disable
+	/etc/init.d/komari-agent-c stop 2>/dev/null || true
+	/etc/init.d/komari-agent-c disable 2>/dev/null || true
 }
 exit 0
 endef
