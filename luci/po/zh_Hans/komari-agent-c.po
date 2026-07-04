@@ -330,3 +330,60 @@ msgstr "服务已重启"
 
 msgid "Komari Agent Configuration"
 msgstr "Komari 代理配置"
+
+msgid "Language Settings"
+msgstr "语言设置"
+
+msgid "Interface Language"
+msgstr "界面语言"
+
+msgid "Language for agent logs and communication (auto = follow system)"
+msgstr "代理日志和通信使用的语言（auto = 跟随系统）"
+
+msgid "Auto (System Default)"
+msgstr "自动（系统默认）"
+
+msgid "Chinese"
+msgstr "中文"
+
+msgid "English"
+msgstr "英文"
+
+msgid "Auto Discovery Key"
+msgstr "自动发现密钥"
+
+msgid "Auto-discovery key for auto-registration to the panel (optional)"
+msgstr "用于自动注册到面板的自动发现密钥（可选）"
+
+msgid "Protocol Version"
+msgstr "协议版本"
+
+msgid "Protocol version to use (1=legacy, 2=current)"
+msgstr "使用的协议版本（1=旧版，2=当前版本）"
+
+msgid "v1 (Legacy)"
+msgstr "v1（旧版）"
+
+msgid "v2 (Current)"
+msgstr "v2（当前版本）"
+
+msgid "Disable Compression"
+msgstr "禁用压缩"
+
+msgid "Disable data compression for protocol communication"
+msgstr "禁用协议通信的数据压缩"
+
+msgid "Disable Auto Update Check"
+msgstr "禁用自动更新检查"
+
+msgid "Disable automatic update checking on startup"
+msgstr "禁用启动时的自动更新检查"
+
+msgid "Auto Start"
+msgstr "开机自启"
+
+msgid "Enabled"
+msgstr "已启用"
+
+msgid "Disabled"
+msgstr "已禁用"

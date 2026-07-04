@@ -327,3 +327,60 @@ msgstr ""
 
 msgid "Komari Agent Configuration"
 msgstr ""
+
+msgid "Language Settings"
+msgstr ""
+
+msgid "Interface Language"
+msgstr ""
+
+msgid "Language for agent logs and communication (auto = follow system)"
+msgstr ""
+
+msgid "Auto (System Default)"
+msgstr ""
+
+msgid "Chinese"
+msgstr ""
+
+msgid "English"
+msgstr ""
+
+msgid "Auto Discovery Key"
+msgstr ""
+
+msgid "Auto-discovery key for auto-registration to the panel (optional)"
+msgstr ""
+
+msgid "Protocol Version"
+msgstr ""
+
+msgid "Protocol version to use (1=legacy, 2=current)"
+msgstr ""
+
+msgid "v1 (Legacy)"
+msgstr ""
+
+msgid "v2 (Current)"
+msgstr ""
+
+msgid "Disable Compression"
+msgstr ""
+
+msgid "Disable data compression for protocol communication"
+msgstr ""
+
+msgid "Disable Auto Update Check"
+msgstr ""
+
+msgid "Disable automatic update checking on startup"
+msgstr ""
+
+msgid "Auto Start"
+msgstr ""
+
+msgid "Enabled"
+msgstr ""
+
+msgid "Disabled"
+msgstr ""

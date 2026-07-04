@@ -54,7 +54,12 @@ function get_service_status()
     if pid and pid ~= "" then
         running = true
     end
-    return running
+    local enabled = false
+    local rc = os.execute("/etc/init.d/komari-agent-c enabled >/dev/null 2>&1")
+    if rc == 0 then
+        enabled = true
+    end
+    return running, enabled
 end
 
 function get_uptime()
@@ -66,9 +71,10 @@ function get_uptime()
 end
 
 function action_status()
-    local running = get_service_status()
+    local running, enabled = get_service_status()
     local status = {
         running = running,
+        enabled = enabled,
         uptime = get_uptime(),
         version = "1.0.0"
     }
@@ -103,10 +109,11 @@ function action_log()
 end
 
 function api_get_status()
-    local running = get_service_status()
+    local running, enabled = get_service_status()
     local response = {
         code = 0,
         running = running,
+        enabled = enabled,
         uptime = get_uptime()
     }
 

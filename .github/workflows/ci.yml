@@ -162,6 +162,86 @@ jobs:
           path: logs/
           retention-days: 7
 
+  test-luci-build:
+    name: Test LuCI build on (${{ matrix.version }})
+    needs: test-binary-build
+    if: always()
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - 24.10.6
+          - 25.12.2
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+
+      - name: Prepare packages
+        run: |
+          mkdir -p package/luci-app-komari-agent-c
+          cp -r luci/* package/luci-app-komari-agent-c/
+
+          mkdir -p package/${{ env.PACKAGE_NAME }}
+          cp -r src package/${{ env.PACKAGE_NAME }}/
+          cp -r include package/${{ env.PACKAGE_NAME }}/
+          cp -r cmake package/${{ env.PACKAGE_NAME }}/ 2>/dev/null || true
+          cp CMakeLists.txt package/${{ env.PACKAGE_NAME }}/
+          cp openwrt/Makefile package/${{ env.PACKAGE_NAME }}/Makefile
+
+          sed -i '/^PKG_SOURCE_PROTO:/d; /^PKG_SOURCE_URL:/d; /^PKG_SOURCE_VERSION:/d' package/${{ env.PACKAGE_NAME }}/Makefile
+
+          mkdir -p package/${{ env.PACKAGE_NAME }}/files
+          cp openwrt/files/komari-agent-c.config package/${{ env.PACKAGE_NAME }}/files/
+          cp openwrt/files/komari-agent-c.init package/${{ env.PACKAGE_NAME }}/files/
+
+      - name: Build
+        uses: openwrt/gh-action-sdk@v9
+        env:
+          ARCH: x86_64-${{ matrix.version }}
+          FEEDNAME: ${{ env.FEED_NAME }}
+          PACKAGES: luci-app-komari-agent-c
+          KOMARI_VERBOSE_CMAKE: ON
+
+      - name: Verify build
+        run: |
+          echo "Checking for LuCI packages..."
+          IPK_COUNT=$(find bin/packages/ -name "luci-app-komari-agent-c*.ipk" 2>/dev/null | wc -l)
+          echo "Found $IPK_COUNT IPK package(s)"
+
+          APK_COUNT=$(find bin/packages/ -name "luci-app-komari-agent-c*.apk" 2>/dev/null | wc -l)
+          echo "Found $APK_COUNT APK package(s)"
+
+          I18N_COUNT=$(find bin/packages/ -name "luci-i18n-komari-agent-c*.*pk" 2>/dev/null | wc -l)
+          echo "Found $I18N_COUNT i18n package(s)"
+
+          if [ "$IPK_COUNT" -eq 0 ] && [ "$APK_COUNT" -eq 0 ]; then
+            echo "Error: Build failed - no LuCI package files found!"
+            exit 1
+          fi
+
+          echo "Build successful for OpenWrt ${{ matrix.version }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-luci-${{ matrix.version }}
+          path: |
+            bin/packages/*/${{ env.FEED_NAME }}/luci-app-komari-agent-c*.*pk
+            bin/packages/*/${{ env.FEED_NAME }}/luci-i18n-komari-agent-c*.*pk
+          retention-days: 7
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-luci-test-${{ matrix.version }}
+          path: logs/
+          retention-days: 7
+
   lint:
     name: Code quality checks
     runs-on: ubuntu-latest

@@ -10,6 +10,8 @@ Licensed under MIT License
     var translations = {
         running: '<%:Running%>',
         notRunning: '<%:Not Running%>',
+        enabled: '<%:Enabled%>',
+        disabled: '<%:Disabled%>',
         connected: '<%:Connected%>',
         disconnected: '<%:Disconnected%>',
         serviceStarted: '<%:Service started%>',
@@ -68,6 +70,12 @@ Licensed under MIT License
                     if (data.running) {
                         statusEl.innerHTML = '<span style="color: green;">●</span> ' + translations.running;
                         uptimeEl.textContent = formatUptime(data.uptime || 0);
+                        var enabledEl = document.getElementById('enabled-status');
+                        if (enabledEl) {
+                            enabledEl.innerHTML = data.enabled ?
+                                '<span style="color: green;">●</span> ' + translations.enabled :
+                                '<span style="color: red;">●</span> ' + translations.disabled;
+                        }
                         
                         if (data.data) {
                             connectedEl.innerHTML = data.data.connected ? 
@@ -83,6 +91,12 @@ Licensed under MIT License
                     } else {
                         statusEl.innerHTML = '<span style="color: red;">●</span> ' + translations.notRunning;
                         uptimeEl.textContent = '-';
+                        var enabledEl = document.getElementById('enabled-status');
+                        if (enabledEl) {
+                            enabledEl.innerHTML = data.enabled ?
+                                '<span style="color: green;">●</span> ' + translations.enabled :
+                                '<span style="color: red;">●</span> ' + translations.disabled;
+                        }
                         connectedEl.innerHTML = '-';
                         endpointEl.textContent = '-';
                         cpuEl.textContent = '-';
@@ -160,10 +174,12 @@ Licensed under MIT License
         <table class="cbi-section-table">
             <tr class="cbi-section-table-titles">
                 <th class="cbi-section-table-cell"><%:Status%></th>
+                <th class="cbi-section-table-cell"><%:Auto Start%></th>
                 <th class="cbi-section-table-cell"><%:Agent Uptime%></th>
             </tr>
             <tr class="cbi-section-table-row">
                 <td id="service-status">-</td>
+                <td id="enabled-status">-</td>
                 <td id="agent-uptime">-</td>
             </tr>
         </table>

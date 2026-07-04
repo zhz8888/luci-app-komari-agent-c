@@ -67,6 +67,15 @@ dns.datatype = "ipaddr"
 local ignore_cert = s2:option(Flag, "ignore_unsafe_cert", translate("Ignore Certificate Errors"), translate("Ignore SSL certificate validation errors (not recommended for production)"))
 ignore_cert.default = 0
 
+local auto_discovery = s2:option(Value, "auto_discovery_key", translate("Auto Discovery Key"), translate("Auto-discovery key for auto-registration to the panel (optional)"))
+auto_discovery.password = true
+auto_discovery.rmempty = true
+
+local protocol_version = s2:option(ListValue, "protocol_version", translate("Protocol Version"), translate("Protocol version to use (1=legacy, 2=current)"))
+protocol_version.default = "2"
+protocol_version:value("1", translate("v1 (Legacy)"))
+protocol_version:value("2", translate("v2 (Current)"))
+
 local max_retries = s2:option(Value, "max_retries", translate("Maximum Retries"), translate("Maximum number of connection retry attempts"))
 max_retries.datatype = "uinteger"
 max_retries.default = "5"
@@ -121,35 +130,45 @@ function info_interval.validate(self, value, section)
     return value
 end
 
--- Web SSH Settings
-local s3 = m:section(TypedSection, "komari-agent-c", translate("Web SSH Settings"))
+-- Language Settings
+local s3 = m:section(TypedSection, "komari-agent-c", translate("Language Settings"))
 s3.anonymous = true
 
-local disable_ssh = s3:option(Flag, "disable_web_ssh", translate("Disable Web SSH"), translate("Disable the Web SSH terminal feature for security"))
+local language = s3:option(ListValue, "language", translate("Interface Language"), translate("Language for agent logs and communication (auto = follow system)"))
+language.default = "auto"
+language:value("auto", translate("Auto (System Default)"))
+language:value("zh", translate("Chinese"))
+language:value("en", translate("English"))
+
+-- Web SSH Settings
+local s4 = m:section(TypedSection, "komari-agent-c", translate("Web SSH Settings"))
+s4.anonymous = true
+
+local disable_ssh = s4:option(Flag, "disable_web_ssh", translate("Disable Web SSH"), translate("Disable the Web SSH terminal feature for security"))
 disable_ssh.default = 0
 
 -- Network Interface Settings
-local s4 = m:section(TypedSection, "komari-agent-c", translate("Network Interface Settings"))
-s4.anonymous = true
+local s5 = m:section(TypedSection, "komari-agent-c", translate("Network Interface Settings"))
+s5.anonymous = true
 
-local include_nics = s4:option(Value, "include_nics", translate("Include Network Interfaces"), translate("Comma-separated list of network interfaces to monitor (empty = all)"))
+local include_nics = s5:option(Value, "include_nics", translate("Include Network Interfaces"), translate("Comma-separated list of network interfaces to monitor (empty = all)"))
 include_nics.rmempty = true
 
-local exclude_nics = s4:option(Value, "exclude_nics", translate("Exclude Network Interfaces"), translate("Comma-separated list of network interfaces to exclude from monitoring"))
+local exclude_nics = s5:option(Value, "exclude_nics", translate("Exclude Network Interfaces"), translate("Comma-separated list of network interfaces to exclude from monitoring"))
 exclude_nics.rmempty = true
 
 -- Disk Settings
-local s5 = m:section(TypedSection, "komari-agent-c", translate("Disk Settings"))
-s5.anonymous = true
+local s6 = m:section(TypedSection, "komari-agent-c", translate("Disk Settings"))
+s6.anonymous = true
 
-local include_mountpoints = s5:option(Value, "include_mountpoints", translate("Include Mount Points"), translate("Comma-separated list of mount points to monitor (empty = all)"))
+local include_mountpoints = s6:option(Value, "include_mountpoints", translate("Include Mount Points"), translate("Comma-separated list of mount points to monitor (empty = all)"))
 include_mountpoints.rmempty = true
 
 -- Traffic Statistics
-local s6 = m:section(TypedSection, "komari-agent-c", translate("Traffic Statistics"))
-s6.anonymous = true
+local s7 = m:section(TypedSection, "komari-agent-c", translate("Traffic Statistics"))
+s7.anonymous = true
 
-local month_rotate = s6:option(Value, "month_rotate", translate("Month Rotate Day"), translate("Day of month for traffic statistics rotation (0 = disabled, 1-28)"))
+local month_rotate = s7:option(Value, "month_rotate", translate("Month Rotate Day"), translate("Day of month for traffic statistics rotation (0 = disabled, 1-28)"))
 month_rotate.datatype = "uinteger"
 month_rotate.default = "1"
 
@@ -168,10 +187,10 @@ function month_rotate.validate(self, value, section)
 end
 
 -- Custom IP Addresses
-local s7 = m:section(TypedSection, "komari-agent-c", translate("Custom IP Addresses"))
-s7.anonymous = true
+local s8 = m:section(TypedSection, "komari-agent-c", translate("Custom IP Addresses"))
+s8.anonymous = true
 
-local custom_ipv4 = s7:option(Value, "custom_ipv4", translate("Custom IPv4 Address"), translate("Override detected IPv4 address (optional)"))
+local custom_ipv4 = s8:option(Value, "custom_ipv4", translate("Custom IPv4 Address"), translate("Override detected IPv4 address (optional)"))
 custom_ipv4.datatype = "ip4addr"
 custom_ipv4.rmempty = true
 
@@ -189,7 +208,7 @@ function custom_ipv4.validate(self, value, section)
     return value
 end
 
-local custom_ipv6 = s7:option(Value, "custom_ipv6", translate("Custom IPv6 Address"), translate("Override detected IPv6 address (optional)"))
+local custom_ipv6 = s8:option(Value, "custom_ipv6", translate("Custom IPv6 Address"), translate("Override detected IPv6 address (optional)"))
 custom_ipv6.datatype = "ip6addr"
 custom_ipv6.rmempty = true
 
@@ -204,10 +223,16 @@ function custom_ipv6.validate(self, value, section)
 end
 
 -- Advanced Settings
-local s8 = m:section(TypedSection, "komari-agent-c", translate("Advanced Settings"))
-s8.anonymous = true
+local s9 = m:section(TypedSection, "komari-agent-c", translate("Advanced Settings"))
+s9.anonymous = true
 
-local enable_gpu = s8:option(Flag, "enable_gpu", translate("Enable GPU Monitoring"), translate("Enable GPU usage monitoring (if supported by hardware)"))
+local enable_gpu = s9:option(Flag, "enable_gpu", translate("Enable GPU Monitoring"), translate("Enable GPU usage monitoring (if supported by hardware)"))
 enable_gpu.default = 0
+
+local disable_compression = s9:option(Flag, "disable_compression", translate("Disable Compression"), translate("Disable data compression for protocol communication"))
+disable_compression.default = 0
+
+local disable_auto_update = s9:option(Flag, "disable_auto_update", translate("Disable Auto Update Check"), translate("Disable automatic update checking on startup"))
+disable_auto_update.default = 0
 
 return m
