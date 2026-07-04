@@ -20,6 +20,10 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+/* resolv.h functions (res_mkquery, ns_initparse, ns_parserr) live in libc on
+ * glibc >= 2.34, but on older glibc (e.g. Ubuntu 22.04) and some other libc
+ * implementations ns_initparse/ns_parserr are only in libresolv. CMake's
+ * Dependencies.cmake detects this and links libresolv when needed. */
 #include <resolv.h>
 #include <arpa/nameser.h>
 

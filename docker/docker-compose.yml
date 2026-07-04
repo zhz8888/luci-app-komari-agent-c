@@ -1,3 +1,11 @@
+# Build matrix for cross-compilation. Two Dockerfiles are used:
+# - Dockerfile.build  (ubuntu:24.04): amd64, arm64, armhf, riscv64, i386
+#   Ubuntu 24.04 ports repo provides cross-toolchains and target libraries
+#   for these architectures.
+# - Dockerfile.legacy (debian:bookworm-slim): armel, mipsel, mips64el
+#   Ubuntu 24.04 lacks libc6-dev-*-cross packages and ports support for
+#   these architectures, so we fall back to Debian bookworm which still
+#   ships them. See docker/README.md for the rationale.
 name: komari-agent-c
 
 services:

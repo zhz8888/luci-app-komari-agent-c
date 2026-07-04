@@ -1,3 +1,8 @@
+# Base image for amd64, arm64, armhf, riscv64, i386 cross-compilation.
+# Ubuntu 24.04 (noble) ports repo provides libc6-dev-*-cross and target
+# libraries for these architectures. For armel/mipsel/mips64el use the
+# companion Dockerfile.legacy (debian:bookworm-slim) instead, because
+# Ubuntu 24.04 lacks cross support for those targets.
 FROM ubuntu:24.04
 
 ARG DEBIAN_ARCH=amd64

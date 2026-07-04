@@ -10,13 +10,11 @@
 
 set -e
 
-# Color output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No color
 
-# Info print function
 info() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -30,11 +28,9 @@ error() {
     exit 1
 }
 
-# Get the directory where the script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-# Build configuration
 BUILD_TYPE="release"
 BUILD_DIR="$PROJECT_ROOT/build"
 OUTPUT_DIR="$PROJECT_ROOT/output"
@@ -42,7 +38,6 @@ CLEAN_BUILD=false
 SHOW_HELP=false
 RUN_TESTS=false
 
-# Parse command-line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --debug)
@@ -71,7 +66,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Show help information
 if [ "$SHOW_HELP" = true ]; then
     echo "Usage: $0 [options]"
     echo ""
@@ -93,7 +87,6 @@ if [ "$SHOW_HELP" = true ]; then
     exit 0
 fi
 
-# Detect operating system
 detect_os() {
     local os_name
     os_name=$(uname -s)
@@ -108,7 +101,6 @@ detect_os() {
     esac
 }
 
-# Detect architecture
 detect_arch() {
     local arch
     arch=$(uname -m)
@@ -133,14 +125,13 @@ detect_arch() {
     esac
 }
 
-# Detect platform (used for output filename)
+# Used to name the output binary, e.g. komari-agent-c-Linux-x86_64
 detect_platform() {
     local platform=$(uname -s)
     local arch=$(uname -m)
     echo "$platform-$arch"
 }
 
-# Check dependencies
 check_dependencies() {
     local os=$1
 
@@ -158,6 +149,8 @@ check_dependencies() {
 
     # Check OpenSSL development library
     if [ "$os" = "linux" ]; then
+        # Distributions install headers under /usr/include (packaged) or
+        # /usr/local/include (manual build); check both to avoid false negatives.
         if [ ! -f "/usr/include/openssl/ssl.h" ] && [ ! -f "/usr/local/include/openssl/ssl.h" ]; then
             warn "OpenSSL development headers not found. Build may fail"
             warn "Please install libssl-dev (Debian/Ubuntu) or openssl-devel (RHEL/Fedora)"
@@ -173,7 +166,6 @@ check_dependencies() {
     info "All required dependencies found"
 }
 
-# Install dependencies (optional)
 install_dependencies() {
     local os=$1
 
@@ -205,7 +197,6 @@ install_dependencies() {
     info "Dependencies installed successfully"
 }
 
-# Clean build directory
 clean_build() {
     info "Cleaning build directory..."
     if [ -d "$BUILD_DIR" ]; then
@@ -220,7 +211,6 @@ clean_build() {
     fi
 }
 
-# Execute build
 do_build() {
     local os=$1
     local arch=$2
@@ -272,7 +262,6 @@ do_build() {
     fi
 }
 
-# Run tests
 do_test() {
     info "Running tests..."
 
@@ -300,7 +289,6 @@ do_test() {
     fi
 }
 
-# Main function
 main() {
     info "=== Linux Build Script (CMake) ==="
     info "Project root: $PROJECT_ROOT"
@@ -336,5 +324,4 @@ main() {
     info "Binary: $BUILD_DIR/bin/komari-agent-c"
 }
 
-# Execute main function
 main "$@"

@@ -106,6 +106,8 @@ if [ ! -f "${BINARY}" ]; then
     exit 1
 fi
 
+# stat -c%s (GNU/Linux) and stat -f%z (BSD/macOS) differ; try GNU form first
+# and fall back to BSD form so the script works on both host families.
 BINARY_SIZE=$(stat -c%s "${BINARY}" 2>/dev/null || stat -f%z "${BINARY}" 2>/dev/null)
 echo ""
 echo "Binary: ${BINARY}"

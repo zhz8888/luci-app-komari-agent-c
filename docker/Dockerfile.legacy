@@ -1,3 +1,8 @@
+# Base image for armel, mipsel, mips64el cross-compilation.
+# Ubuntu 24.04 ports repo and libc6-dev-*-cross packages do not cover these
+# architectures, so we fall back to Debian bookworm-slim which still ships
+# full cross-toolchain and target library support. The companion
+# Dockerfile.build (ubuntu:24.04) handles amd64/arm64/armhf/riscv64/i386.
 FROM debian:bookworm-slim
 
 ARG DEBIAN_ARCH=amd64

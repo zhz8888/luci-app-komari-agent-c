@@ -8,14 +8,12 @@
 
 set -e
 
-# Color output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Info print function
 info() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -53,6 +51,8 @@ pkg_appears_sane() {
 
 	PKG_ERROR=0
 	pkg="$(required_field Package)"
+	# Strip any "Version:" prefix and a leading dot that some control files
+	# include, leaving the bare version string.
 	version="$(required_field Version | sed 's/Version://; s/^.://g;')"
 	arch="$(required_field Architecture)"
 
@@ -61,6 +61,9 @@ pkg_appears_sane() {
 		PKG_ERROR=1
 	fi
 
+	# Resolve conffiles: rewrite each absolute path under pkg_dir, drop entries
+	# whose target file does not exist, then sort and write back as the
+	# authoritative conffiles list.
 	if [ -f "$CONTROL/conffiles" ]; then
 		rm -f "$CONTROL/conffiles.resolved"
 
@@ -80,9 +83,6 @@ pkg_appears_sane() {
 	return $PKG_ERROR
 }
 
-###
-# ipkg-build "main function"
-###
 file_modes=""
 usage="Usage: $0 [-v] [-h] [-m] <pkg_directory> [<destination_directory>]"
 while getopts "hvm:" opt; do
@@ -98,8 +98,6 @@ while getopts "hvm:" opt; do
 done
 
 shift $((OPTIND - 1))
-
-# Continue processing additional arguments
 
 case $# in
 1)
@@ -143,6 +141,9 @@ mkdir "$tmp_dir"
 echo $CONTROL >"$tmp_dir"/tarX
 cd "$pkg_dir"
 
+# Reproducible archive options: fixed mtime, numeric owner, sorted entry
+# order, GNU format. gzip -n strips the embedded timestamp and filename so
+# the archive hash is stable across builds.
 $TAR -X "$tmp_dir"/tarX --format=gnu --numeric-owner --sort=name -cpf - --mtime="$TIMESTAMP" . | gzip -n - >"$tmp_dir"/data.tar.gz
 
 installed_size=$(zcat <"$tmp_dir"/data.tar.gz | wc -c)
@@ -157,6 +158,7 @@ fi
 (cd "$pkg_dir"/$CONTROL && $TAR --format=gnu --numeric-owner --sort=name -cf - --mtime="$TIMESTAMP" . | gzip -n - >"$tmp_dir"/control.tar.gz)
 rm "$tmp_dir"/tarX
 
+# ar-based .ipk format version (2.0 = current deb-based ipk layout)
 echo "2.0" >"$tmp_dir"/debian-binary
 
 pkg_file=$dest_dir/${pkg}_${version}_${arch}.ipk

@@ -9,14 +9,12 @@
 
 set -e
 
-# Color output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Info print function
 info() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -32,7 +30,6 @@ error() {
 
 version=1.0
 
-# Check if OpenWrt SDK's apk tool is available
 APK="$(command -v apk)"
 if [ -z "$APK" ]; then
 	cat >&2 <<EOF
@@ -66,7 +63,6 @@ done
 
 shift $((OPTIND - 1))
 
-# Process arguments
 case $# in
 1)
 	dest_dir=$PWD
@@ -93,17 +89,17 @@ fi
 CONTROL=
 [ -d "$pkg_dir"/CONTROL ] && CONTROL=CONTROL
 if [ -z "$CONTROL" ]; then
-	error "Directory $pkg_dir has no CONTROL subdirectory"
+    error "Directory $pkg_dir has no CONTROL subdirectory"
 fi
 
 info "Starting APK build for $pkg_dir"
 info "Using apk tool: $APK"
 
-# Use OpenWrt SDK's apk tool to create APK package
-# OpenWrt SDK provides 'apk mkpkg' command to build APK v3 format package from a directory
 cd "$pkg_dir"
 
-# Calculate installed-size (in KB) from package contents and update APKINDEX
+# The APKINDEX template ships with a placeholder installed-size; apk mkpkg
+# does not compute it, so we measure the on-disk footprint (KB) and patch
+# the field before packaging, otherwise the package manager shows "-".
 installed_size=$(du -sk "$pkg_dir" 2>/dev/null | cut -f1)
 if [ -n "$installed_size" ] && [ -f "$pkg_dir"/CONTROL/APKINDEX ]; then
     sed -i -e "s/^installed-size: .*/installed-size: $installed_size/" \
