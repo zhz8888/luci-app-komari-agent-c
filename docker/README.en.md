@@ -11,7 +11,7 @@ This directory contains the Docker-based build environment for **komari-agent-c*
 | File | Description |
 |------|-------------|
 | `Dockerfile.build` | Build environment image based on Ubuntu 24.04, supports amd64/arm64/armhf/riscv64/i386 |
-| `Dockerfile.legacy` | Build environment image based on Debian 12 (bookworm), supports armel/mipsel/mips64el |
+| `Dockerfile.legacy` | Build environment image based on Debian 12 (bookworm-slim), supports armel/mipsel/mips64el (these architectures are unavailable in Ubuntu 24.04 ports repo) |
 | `docker-compose.yml` | Service definitions for 8 architecture builds + 1 test service |
 | `build.sh` | Build script executed inside the container |
 | `test.sh` | Unit test script executed inside the container |
@@ -64,14 +64,14 @@ APT_MIRROR=cn ./scripts/docker-build.sh amd64
 |---------|--------|-------------|----------|------------|-------------|
 | `build-amd64` | amd64 | amd64 | gcc | Ubuntu 24.04 | x86-64 64-bit |
 | `build-arm64` | arm64 | arm64 | aarch64-linux-gnu-gcc | Ubuntu 24.04 | ARM 64-bit |
-| `build-arm` | arm | armel | arm-linux-gnueabi-gcc | Debian 12 | ARM soft-float |
+| `build-arm` | arm | armel | arm-linux-gnueabi-gcc | Debian 12 (bookworm-slim) | ARM soft-float |
 | `build-armv7` | armv7 | armhf | arm-linux-gnueabihf-gcc | Ubuntu 24.04 | ARM hard-float |
-| `build-mipsel` | mipsel | mipsel | mipsel-linux-gnu-gcc | Debian 12 | MIPS little-endian |
-| `build-mips64` | mips64 | mips64el | mips64el-linux-gnuabi64-gcc | Debian 12 | MIPS64 little-endian |
+| `build-mipsel` | mipsel | mipsel | mipsel-linux-gnu-gcc | Debian 12 (bookworm-slim) | MIPS little-endian |
+| `build-mips64` | mips64 | mips64el | mips64el-linux-gnuabi64-gcc | Debian 12 (bookworm-slim) | MIPS64 little-endian |
 | `build-riscv64` | riscv64 | riscv64 | riscv64-linux-gnu-gcc | Ubuntu 24.04 | RISC-V 64-bit |
 | `build-386` | 386 | i386 | i686-linux-gnu-gcc | Ubuntu 24.04 | x86 32-bit |
 
-> **Note**: armel, mipsel, and mips64el are not available in Ubuntu 24.04 ports repository, so Debian 12 (bookworm-slim) is used as the base image for these architectures.
+> **Note**: armel, mipsel, and mips64el are not available in Ubuntu 24.04 ports repository (missing libc6-dev-*-cross packages), so Debian 12 (bookworm-slim) is used as the base image for these architectures.
 
 ## Build Output
 

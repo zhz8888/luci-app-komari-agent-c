@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![OpenWrt](https://img.shields.io/badge/platform-OpenWrt-orange.svg)](https://openwrt.org/)
 [![Language](https://img.shields.io/badge/language-C-blue.svg)](https://en.wikipedia.org/wiki/C_(programming_language))
-[![Build Status](https://github.com/zhz8888/luci-app-komari-agent-c/actions/workflows/build.yml/badge.svg)](https://github.com/zhz8888/luci-app-komari-agent-c/actions/workflows/build.yml)
+[![CI](https://github.com/zhz8888/luci-app-komari-agent-c/actions/workflows/ci.yml/badge.svg)](https://github.com/zhz8888/luci-app-komari-agent-c/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/zhz8888/luci-app-komari-agent-c)](https://github.com/zhz8888/luci-app-komari-agent-c/releases)
 
 [English](README.en.md) | **中文**
@@ -20,45 +20,96 @@
 - 📈 **流量统计**：按月统计网卡流量
 - 🏓 **Ping 任务**：支持 ICMP、TCP、HTTP 三种模式
 - 🔄 **自动重连**：网络断开后自动恢复连接
+- 🖥️ **LuCI 前端**：提供 Web 配置界面，支持配置管理、实时状态监控、日志查看和连接测试
 
 ## 📦 快速安装
 
 ### OpenWrt 系统（推荐）
 
 ```bash
-# OpenWrt > 24.10（使用 APK）
-apk add komari-agent-1.0.1-1-<arch>.apk
+# OpenWrt >= 24.10（使用 APK）
+apk add komari-agent-c-1.0.1-1-<arch>.apk
 
-# OpenWrt <= 24.10（使用 IPK）
+# OpenWrt < 24.10（使用 IPK）
 opkg install komari-agent-c_1.0.1-1_<arch>.ipk
+```
+
+安装 LuCI 前端界面（可选）：
+
+```bash
+# OpenWrt >= 24.10
+apk add luci-app-komari-agent-c-1.0.0-1-<arch>.apk
+
+# OpenWrt < 24.10
+opkg install luci-app-komari-agent-c_1.0.0-1_<arch>.ipk
 ```
 
 ### 其他 Linux 系统
 
 ```bash
 # 下载并解压二进制文件
-wget https://github.com/zhz8888/luci-app-komari-agent-c/releases/download/v1.0.1/komari-agent-1.0.1-linux-<arch>.tar.gz
-tar -xzf komari-agent-1.0.1-linux-<arch>.tar.gz
+wget https://github.com/zhz8888/luci-app-komari-agent-c/releases/download/v1.0.1/komari-agent-c-1.0.1-linux-<arch>.tar.gz
+tar -xzf komari-agent-c-1.0.1-linux-<arch>.tar.gz
 sudo cp komari-agent-c /usr/local/bin/
 ```
 
-## 📚 详细文档
+## 🛠️ 本地构建
 
-完整的使用说明、配置指南和构建文档已移至 [docs](docs/) 目录：
+### 标准构建（CMake）
 
-| 文档 | 说明 |
-|------|------|
-| [OpenWrt 软件包使用指南](docs/openwrt-package.md) | IPK/APK 软件包安装、配置和管理指南 |
-| [二进制文件使用指南](docs/binary-usage.md) | 独立二进制文件的下载、安装和使用说明 |
-| [构建与调试指南](docs/build-debug.md) | 本地编译、交叉编译和调试的完整指南 |
-| [配置指南](docs/configuration.md) | UCI 配置、环境变量和命令行参数的详细说明 |
-| [功能说明](docs/features.md) | 监控数据、Ping 任务、虚拟化检测等功能的详细说明 |
+```bash
+# 配置并构建（默认 Release）
+cmake -B build && cmake --build build
+
+# 调试模式构建
+cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build
+
+# 构建产物位于 build/bin/komari-agent-c
+```
+
+### CMake 预设
+
+项目提供 9 个标准化预设（见 `CMakePresets.json`），简化常见构建场景：
+
+```bash
+cmake --preset default      # 默认 Release + 测试
+cmake --preset debug        # Debug + 详细诊断
+cmake --preset release      # Release + LTO，无测试
+cmake --preset sanitize     # ASan + UBSan
+cmake --preset coverage     # 代码覆盖率
+cmake --preset openwrt      # OpenWrt 交叉编译（需 SDK 环境）
+cmake --preset analyze      # clang-tidy 静态分析
+```
+
+### Docker 交叉编译
+
+支持 8 种 CPU 架构的 Docker 化交叉编译，无需本地安装工具链：
+
+```bash
+# 构建单架构
+./scripts/docker-build.sh amd64
+
+# 构建所有架构
+./scripts/docker-build.sh all
+
+# 运行单元测试
+./scripts/docker-build.sh test
+```
+
+详见 [docker/README.md](docker/README.md)。
+
+### 运行测试
+
+```bash
+cmake -B build -DBUILD_TESTING=ON && cmake --build build
+ctest --test-dir build --output-on-failure
+```
 
 ## 📋 系统要求
 
-- OpenWrt 21.02 或更高版本（推荐 23.05 或 24.10）
+- OpenWrt 21.02 或更高版本（CI 测试覆盖 24.10.x 和 25.12.x）
 - 最低内存：64MB
-- 必需依赖：`libpthread`、`libopenssl`、`libm`
+- 必需依赖：`libpthread`、`libopenssl`、`librt`、`zlib`
 
 ## 🔐 安全建议
 

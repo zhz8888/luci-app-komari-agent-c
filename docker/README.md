@@ -11,7 +11,7 @@
 | 文件 | 说明 |
 |------|------|
 | `Dockerfile.build` | 基于 Ubuntu 24.04 的构建环境镜像，支持 amd64/arm64/armhf/riscv64/i386 |
-| `Dockerfile.legacy` | 基于 Debian 12 (bookworm) 的构建环境镜像，支持 armel/mipsel/mips64el |
+| `Dockerfile.legacy` | 基于 Debian 12 (bookworm-slim) 的构建环境镜像，支持 armel/mipsel/mips64el（这三种架构在 Ubuntu 24.04 ports 仓库中不可用） |
 | `docker-compose.yml` | 8 个架构构建服务 + 1 个测试服务的定义 |
 | `build.sh` | 容器内执行的构建脚本 |
 | `test.sh` | 容器内执行的单元测试脚本 |
@@ -64,14 +64,14 @@ APT_MIRROR=cn ./scripts/docker-build.sh amd64
 |------|--------|------------|--------|---------|------|
 | `build-amd64` | amd64 | amd64 | gcc | Ubuntu 24.04 | x86-64 64 位 |
 | `build-arm64` | arm64 | arm64 | aarch64-linux-gnu-gcc | Ubuntu 24.04 | ARM 64 位 |
-| `build-arm` | arm | armel | arm-linux-gnueabi-gcc | Debian 12 | ARM 软浮点 |
+| `build-arm` | arm | armel | arm-linux-gnueabi-gcc | Debian 12 (bookworm-slim) | ARM 软浮点 |
 | `build-armv7` | armv7 | armhf | arm-linux-gnueabihf-gcc | Ubuntu 24.04 | ARM 硬浮点 |
-| `build-mipsel` | mipsel | mipsel | mipsel-linux-gnu-gcc | Debian 12 | MIPS 小端 |
-| `build-mips64` | mips64 | mips64el | mips64el-linux-gnuabi64-gcc | Debian 12 | MIPS64 小端 |
+| `build-mipsel` | mipsel | mipsel | mipsel-linux-gnu-gcc | Debian 12 (bookworm-slim) | MIPS 小端 |
+| `build-mips64` | mips64 | mips64el | mips64el-linux-gnuabi64-gcc | Debian 12 (bookworm-slim) | MIPS64 小端 |
 | `build-riscv64` | riscv64 | riscv64 | riscv64-linux-gnu-gcc | Ubuntu 24.04 | RISC-V 64 位 |
 | `build-386` | 386 | i386 | i686-linux-gnu-gcc | Ubuntu 24.04 | x86 32 位 |
 
-> **说明**：armel、mipsel、mips64el 三种架构在 Ubuntu 24.04 ports 仓库中不可用，因此使用 Debian 12 (bookworm-slim) 作为基础镜像。
+> **说明**：armel、mipsel、mips64el 三种架构在 Ubuntu 24.04 ports 仓库中不可用（缺少 libc6-dev-*-cross 包），因此使用 Debian 12 (bookworm-slim) 作为基础镜像。
 
 ## 构建输出
 
