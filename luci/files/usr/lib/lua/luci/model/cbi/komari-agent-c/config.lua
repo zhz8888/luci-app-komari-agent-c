@@ -130,15 +130,13 @@ function info_interval.validate(self, value, section)
     return value
 end
 
--- Language Settings
+-- Language Settings (read-only: follows system language)
 local s3 = m:section(TypedSection, "komari-agent-c", translate("Language Settings"))
 s3.anonymous = true
 
-local language = s3:option(ListValue, "language", translate("Interface Language"), translate("Language for agent logs and communication (auto = follow system)"))
-language.default = "auto"
-language:value("auto", translate("Auto (System Default)"))
-language:value("zh", translate("Chinese"))
-language:value("en", translate("English"))
+local lang_note = s3:option(DummyValue, "_lang_note", translate("Interface Language"))
+lang_note.default = translate("Auto (follows system)")
+lang_note.description = translate("Interface language follows the system language setting. To switch languages, install the corresponding luci-i18n-komari-agent-c-* package and configure the system language in System → System → Language.")
 
 -- Web SSH Settings
 local s4 = m:section(TypedSection, "komari-agent-c", translate("Web SSH Settings"))

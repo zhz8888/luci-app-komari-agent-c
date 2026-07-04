@@ -334,16 +334,10 @@ msgstr ""
 msgid "Interface Language"
 msgstr ""
 
-msgid "Language for agent logs and communication (auto = follow system)"
+msgid "Auto (follows system)"
 msgstr ""
 
-msgid "Auto (System Default)"
-msgstr ""
-
-msgid "Chinese"
-msgstr ""
-
-msgid "English"
+msgid "Interface language follows the system language setting. To switch languages, install the corresponding luci-i18n-komari-agent-c-* package and configure the system language in System → System → Language."
 msgstr ""
 
 msgid "Auto Discovery Key"

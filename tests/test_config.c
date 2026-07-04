@@ -33,7 +33,6 @@ void setUp(void) {
     unsetenv("AGENT_EXCLUDE_NICS");
     unsetenv("AGENT_CUSTOM_IPV4");
     unsetenv("AGENT_CUSTOM_IPV6");
-    unsetenv("AGENT_LANGUAGE");
     unsetenv("AGENT_INTERVAL");
     unsetenv("AGENT_MAX_RETRIES");
     unsetenv("AGENT_RECONNECT_INTERVAL");
@@ -55,7 +54,6 @@ void tearDown(void) {
     unsetenv("AGENT_EXCLUDE_NICS");
     unsetenv("AGENT_CUSTOM_IPV4");
     unsetenv("AGENT_CUSTOM_IPV6");
-    unsetenv("AGENT_LANGUAGE");
     unsetenv("AGENT_INTERVAL");
     unsetenv("AGENT_MAX_RETRIES");
     unsetenv("AGENT_RECONNECT_INTERVAL");
@@ -98,7 +96,6 @@ void test_config_init_defaults(void) {
     TEST_ASSERT_EQUAL_STRING("", config.exclude_nics);
     TEST_ASSERT_EQUAL_STRING("", config.custom_ipv4);
     TEST_ASSERT_EQUAL_STRING("", config.custom_ipv6);
-    TEST_ASSERT_EQUAL_STRING("auto", config.language);
 }
 
 /* Test config_init with NULL: should not crash */
@@ -115,7 +112,6 @@ void test_config_load_from_env_strings(void) {
     setenv("AGENT_TOKEN", "test_token_12345", 1);
     setenv("AGENT_ENDPOINT", "wss://example.com/api/ws", 1);
     setenv("AGENT_CUSTOM_DNS", "8.8.8.8", 1);
-    setenv("AGENT_LANGUAGE", "zh-CN", 1);
 
     int ret = config_load_from_env(&config);
     TEST_ASSERT_EQUAL_INT(0, ret);
@@ -123,7 +119,6 @@ void test_config_load_from_env_strings(void) {
     TEST_ASSERT_EQUAL_STRING("test_token_12345", config.token);
     TEST_ASSERT_EQUAL_STRING("wss://example.com/api/ws", config.endpoint);
     TEST_ASSERT_EQUAL_STRING("8.8.8.8", config.custom_dns);
-    TEST_ASSERT_EQUAL_STRING("zh-CN", config.language);
 }
 
 /* Test config_load_from_env: numeric and boolean field loading */
@@ -208,7 +203,6 @@ void test_config_load_from_env_keep_defaults(void) {
     /* Without environment variables set, default values should remain unchanged */
     TEST_ASSERT_EQUAL_DOUBLE(1.0, config.interval);
     TEST_ASSERT_EQUAL_INT(5, config.max_retries);
-    TEST_ASSERT_EQUAL_STRING("auto", config.language);
 }
 
 /* Test config_load_from_file: create a temporary JSON config file and verify fields are loaded correctly */
@@ -224,8 +218,7 @@ void test_config_load_from_file_basic(void) {
         "\"info_report_interval\": 45,"
         "\"disable_web_ssh\": true,"
         "\"enable_gpu\": false,"
-        "\"ignore_unsafe_cert\": true,"
-        "\"language\": \"en\""
+        "\"ignore_unsafe_cert\": true"
         "}";
 
     FILE *f = fopen(TEST_CONFIG_FILE_PATH, "w");
@@ -243,7 +236,6 @@ void test_config_load_from_file_basic(void) {
     TEST_ASSERT_EQUAL_STRING("file_token_abc", config.token);
     TEST_ASSERT_EQUAL_STRING("wss://file.example.com/api", config.endpoint);
     TEST_ASSERT_EQUAL_STRING("1.1.1.1", config.custom_dns);
-    TEST_ASSERT_EQUAL_STRING("en", config.language);
 
     /* Verify numeric fields */
     TEST_ASSERT_EQUAL_DOUBLE(3.5, config.interval);
@@ -302,7 +294,6 @@ void test_config_load_from_file_empty_object(void) {
     /* Empty JSON should not change default values */
     TEST_ASSERT_EQUAL_DOUBLE(1.0, config.interval);
     TEST_ASSERT_EQUAL_INT(5, config.max_retries);
-    TEST_ASSERT_EQUAL_STRING("auto", config.language);
 
     remove(TEST_CONFIG_FILE_PATH);
 }
@@ -328,8 +319,7 @@ void test_config_priority_env_over_file(void) {
         "{"
         "\"token\": \"file_token\","
         "\"endpoint\": \"wss://file.example.com\","
-        "\"max_retries\": 20,"
-        "\"language\": \"en\""
+        "\"max_retries\": 20"
         "}";
 
     FILE *f = fopen(TEST_CONFIG_PRIORITY_PATH, "w");
@@ -345,7 +335,6 @@ void test_config_priority_env_over_file(void) {
     TEST_ASSERT_EQUAL_INT(0, ret);
     TEST_ASSERT_EQUAL_STRING("file_token", config.token);
     TEST_ASSERT_EQUAL_INT(20, config.max_retries);
-    TEST_ASSERT_EQUAL_STRING("en", config.language);
 
     /* Step 2: set environment variables to simulate command-line or runtime override */
     setenv("AGENT_TOKEN", "env_token_override", 1);
@@ -360,7 +349,6 @@ void test_config_priority_env_over_file(void) {
 
     /* Fields not overridden by environment variables keep config file values */
     TEST_ASSERT_EQUAL_STRING("wss://file.example.com", config.endpoint);
-    TEST_ASSERT_EQUAL_STRING("en", config.language);
 
     remove(TEST_CONFIG_PRIORITY_PATH);
 }
@@ -445,7 +433,6 @@ void test_config_parse_uci_line_multiple_fields(void) {
     TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.interval=2.5"));
     TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.disable_web_ssh='1'"));
     TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.enable_gpu='true'"));
-    TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.language='zh-CN'"));
     TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.max_retries=10"));
     TEST_ASSERT_EQUAL_INT(0, config_parse_uci_line(&config, "komari-agent-c.komari-agent-c.custom_dns='1.1.1.1'"));
 
@@ -453,7 +440,6 @@ void test_config_parse_uci_line_multiple_fields(void) {
     TEST_ASSERT_EQUAL_DOUBLE(2.5, config.interval);
     TEST_ASSERT_TRUE(config.disable_web_ssh);
     TEST_ASSERT_TRUE(config.enable_gpu);
-    TEST_ASSERT_EQUAL_STRING("zh-CN", config.language);
     TEST_ASSERT_EQUAL_INT(10, config.max_retries);
     TEST_ASSERT_EQUAL_STRING("1.1.1.1", config.custom_dns);
 }

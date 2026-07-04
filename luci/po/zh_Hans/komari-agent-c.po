@@ -337,17 +337,11 @@ msgstr "语言设置"
 msgid "Interface Language"
 msgstr "界面语言"
 
-msgid "Language for agent logs and communication (auto = follow system)"
-msgstr "代理日志和通信使用的语言（auto = 跟随系统）"
+msgid "Auto (follows system)"
+msgstr "自动（跟随系统）"
 
-msgid "Auto (System Default)"
-msgstr "自动（系统默认）"
-
-msgid "Chinese"
-msgstr "中文"
-
-msgid "English"
-msgstr "英文"
+msgid "Interface language follows the system language setting. To switch languages, install the corresponding luci-i18n-komari-agent-c-* package and configure the system language in System → System → Language."
+msgstr "界面语言跟随系统语言设置。如需切换语言，请安装对应的 luci-i18n-komari-agent-c-* 语言包，并在 系统 → 系统 → 语言 中配置系统语言。"
 
 msgid "Auto Discovery Key"
 msgstr "自动发现密钥"

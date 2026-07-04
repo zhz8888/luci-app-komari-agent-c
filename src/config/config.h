@@ -23,7 +23,6 @@
 #define MAX_IPV6_LEN 128
 #define MAX_DISCOVERY_KEY_LEN 256
 #define MAX_CONFIG_FILE_LEN 512
-#define MAX_LANGUAGE_LEN 16
 
 typedef struct {
     char token[MAX_TOKEN_LEN];
@@ -38,7 +37,6 @@ typedef struct {
     char custom_ipv6[MAX_IPV6_LEN];
     char auto_discovery_key[MAX_DISCOVERY_KEY_LEN];
     char config_file[MAX_CONFIG_FILE_LEN];
-    char language[MAX_LANGUAGE_LEN];
     
     double interval;
     int max_retries;

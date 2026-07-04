@@ -48,7 +48,7 @@ define Package/komari-agent-c/description
 	- Monthly traffic statistics
 	- Auto-discovery registration
 	- UCI configuration support
-	- Multi-language support (English, Chinese)
+	- Interface language follows system setting
 endef
 
 define Package/komari-agent-c/conffiles

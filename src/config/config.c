@@ -121,9 +121,6 @@ void config_init(agent_config_t *config) {
     config->get_ip_addr_from_nic = false;
     config->show_warning = false;
     config->disable_compression = false;
-
-    strncpy(config->language, "auto", sizeof(config->language) - 1);
-    config->language[sizeof(config->language) - 1] = '\0';
 }
 
 /* Look up an environment variable and copy its value into `buf`.
@@ -202,7 +199,6 @@ int config_load_from_env(agent_config_t *config) {
     get_env_or_empty("AGENT_CUSTOM_IPV6", config->custom_ipv6, sizeof(config->custom_ipv6));
     get_env_or_empty("AGENT_AUTO_DISCOVERY_KEY", config->auto_discovery_key, sizeof(config->auto_discovery_key));
     get_env_or_empty("AGENT_CONFIG_FILE", config->config_file, sizeof(config->config_file));
-    get_env_or_empty("AGENT_LANGUAGE", config->language, sizeof(config->language));
     
     config->interval = get_env_double("AGENT_INTERVAL", config->interval);
     config->max_retries = get_env_int("AGENT_MAX_RETRIES", config->max_retries);
@@ -315,11 +311,6 @@ int config_load_from_file(agent_config_t *config, const char *path) {
     if ((item = cJSON_GetObjectItem(root, "auto_discovery_key")) && item->valuestring) {
         strncpy(config->auto_discovery_key, item->valuestring, sizeof(config->auto_discovery_key) - 1);
         config->auto_discovery_key[sizeof(config->auto_discovery_key) - 1] = '\0';
-    }
-
-    if ((item = cJSON_GetObjectItem(root, "language")) && item->valuestring) {
-        strncpy(config->language, item->valuestring, sizeof(config->language) - 1);
-        config->language[sizeof(config->language) - 1] = '\0';
     }
 
     if ((item = cJSON_GetObjectItem(root, "interval")) && item->valuedouble > 0) {
@@ -480,9 +471,6 @@ int config_parse_uci_line(agent_config_t *config, const char *raw_line) {
     } else if (strcmp(key, "custom_dns") == 0) {
         strncpy(config->custom_dns, value, sizeof(config->custom_dns) - 1);
         config->custom_dns[sizeof(config->custom_dns) - 1] = '\0';
-    } else if (strcmp(key, "language") == 0) {
-        strncpy(config->language, value, sizeof(config->language) - 1);
-        config->language[sizeof(config->language) - 1] = '\0';
     } else if (strcmp(key, "max_retries") == 0) {
         config->max_retries = atoi(value);
     } else if (strcmp(key, "reconnect_interval") == 0) {
@@ -536,7 +524,6 @@ void config_print(const agent_config_t *config) {
     printf("Ignore Unsafe Cert: %s\n", config->ignore_unsafe_cert ? "yes" : "no");
     printf("Max Retries: %d\n", config->max_retries);
     printf("Reconnect Interval: %d seconds\n", config->reconnect_interval);
-    printf("Language: %s\n", config->language);
     printf("=================================\n");
 }
 

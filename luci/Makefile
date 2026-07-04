@@ -25,7 +25,7 @@ define Package/luci-app-komari-agent-c/description
   - Real-time status monitoring
   - Log viewer with auto-refresh
   - Connection testing
-  - Multi-language support (English, Chinese)
+  - Interface language follows system setting (i18n packages available)
 endef
 
 $(eval $(call BuildPackage,luci-app-komari-agent-c))
