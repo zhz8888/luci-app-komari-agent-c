@@ -62,7 +62,7 @@ endif()
 # ---------------------------------------------------------------------------
 set(CMAKE_C_COMPILER "$ENV{TARGET_CC}" CACHE PATH "C compiler" FORCE)
 
-if(DEFINED ENV{TARGET_CXX})
+if(DEFINED ENV{TARGET_CXX} AND NOT "$ENV{TARGET_CXX}" STREQUAL "")
     set(CMAKE_CXX_COMPILER "$ENV{TARGET_CXX}" CACHE PATH "C++ compiler" FORCE)
 endif()
 

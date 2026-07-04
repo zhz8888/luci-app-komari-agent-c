@@ -116,6 +116,7 @@ jobs:
           ARCH: ${{ matrix.arch }}-${{ matrix.version }}
           FEEDNAME: ${{ env.FEED_NAME }}
           PACKAGES: komari-agent-c
+          KOMARI_VERBOSE_CMAKE: ON
 
       - name: Rename packages with arch suffix
         run: |
