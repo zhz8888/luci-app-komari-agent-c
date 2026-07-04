@@ -1,20 +1,23 @@
 /*
- * test_websocket.c - WebSocket 客户端单元测试
+ * test_websocket.c - WebSocket client unit tests
  *
- * 测试内容：
- *   - ws_client_create / ws_client_destroy 生命周期管理
- *   - ws_client_set_handler / ws_client_set_raw_handler / ws_client_set_user_data 设置器
- *   - ws_message_t JSON 消息解析（验证字段提取逻辑）
- *   - WebSocket 握手验证（Sec-WebSocket-Accept 计算，基于 RFC 6455）
- *   - 掩码计算验证
- *   - RFC 6455 §5.4 分片消息累积逻辑（ws_fragment_accumulate）
- *   - v2 JSON-RPC 事件处理（ws_handle_v2_event）：去重、method 分发、ACK 累积
+ * Test coverage:
+ *   - ws_client_create / ws_client_destroy lifecycle management
+ *   - ws_client_set_handler / ws_client_set_raw_handler / ws_client_set_user_data setters
+ *   - ws_message_t JSON message parsing (verify field extraction logic)
+ *   - WebSocket handshake validation (Sec-WebSocket-Accept computation, based on RFC 6455)
+ *   - Mask computation validation
+ *   - RFC 6455 §5.4 fragmented message accumulation logic (ws_fragment_accumulate)
+ *   - v2 JSON-RPC event handling (ws_handle_v2_event): deduplication, method dispatch, ACK accumulation
  *
- * 注意：帧解析（ws_recv_frame）、握手（ws_handshake）等内部函数为 static，
- * 无法直接单元测试。实际网络连接不在测试范围内。
- * JSON 消息解析逻辑在 ws_recv_thread 中实现，此处通过复现解析逻辑验证正确性。
- * 分片累积逻辑（ws_fragment_accumulate）通过头文件公开声明，可直接测试。
- * v2 事件处理逻辑（ws_handle_v2_event）同样通过头文件公开声明，可直接测试。
+ * Note: Frame parsing (ws_recv_frame), handshake (ws_handshake) and other internal functions
+ * are static and cannot be unit tested directly. Real network connections are out of scope.
+ * JSON message parsing logic is implemented in ws_recv_thread; here we reproduce the parsing
+ * logic to verify correctness.
+ * Fragment accumulation logic (ws_fragment_accumulate) is exposed via the header file and
+ * can be tested directly.
+ * v2 event handling logic (ws_handle_v2_event) is also exposed via the header file and can
+ * be tested directly.
  */
 
 #include "unity.h"
@@ -28,11 +31,11 @@
 #include <stdint.h>
 #include <openssl/sha.h>
 
-/* Base64 编码表 */
+/* Base64 encoding table */
 static const char base64_table[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/* 复现 websocket.c 中的 base64_encode 实现，用于测试 */
+/* Reproduce the base64_encode implementation from websocket.c for testing */
 static void test_base64_encode(const unsigned char *data, size_t len, char *out) {
     size_t i, j;
     for (i = 0, j = 0; i < len; i += 3, j += 4) {
@@ -49,8 +52,8 @@ static void test_base64_encode(const unsigned char *data, size_t len, char *out)
 }
 
 /*
- * 复现 websocket.c 中的 compute_accept_key 实现
- * 将 Sec-WebSocket-Key 与魔术字符串拼接，计算 SHA1，再 Base64 编码
+ * Reproduce the compute_accept_key implementation from websocket.c
+ * Concatenate Sec-WebSocket-Key with the magic string, compute SHA1, then Base64 encode
  */
 static void test_compute_accept_key(const char *key, char *accept_key) {
     unsigned char hash[SHA_DIGEST_LENGTH];
@@ -63,8 +66,8 @@ static void test_compute_accept_key(const char *key, char *accept_key) {
 }
 
 /*
- * 应用 WebSocket 掩码（复现 ws_recv_frame 中的掩码逻辑）
- * 掩码规则：data[i] ^= mask[i % 4]
+ * Apply WebSocket mask (reproduce the mask logic from ws_recv_frame)
+ * Mask rule: data[i] ^= mask[i % 4]
  */
 static void test_apply_mask(unsigned char *data, size_t len, const unsigned char *mask) {
     for (size_t i = 0; i < len; i++) {
@@ -78,9 +81,9 @@ void setUp(void) {
 void tearDown(void) {
 }
 
-/* ====== ws_client_create / ws_client_destroy 测试 ====== */
+/* ====== ws_client_create / ws_client_destroy tests ====== */
 
-/* 测试 ws_client_create：使用有效配置创建客户端 */
+/* Test ws_client_create: create client with valid config */
 void test_ws_client_create_with_config(void) {
     ws_client_config_t config;
     memset(&config, 0, sizeof(config));
@@ -94,7 +97,7 @@ void test_ws_client_create_with_config(void) {
     ws_client_t *client = ws_client_create(&config);
     TEST_ASSERT_NOT_NULL(client);
 
-    /* 验证配置被正确复制 */
+    /* Verify config is correctly copied */
     TEST_ASSERT_EQUAL_STRING("ws://example.com/api", client->config.endpoint);
     TEST_ASSERT_EQUAL_STRING("test_token", client->config.token);
     TEST_ASSERT_FALSE(client->config.ignore_cert);
@@ -102,7 +105,7 @@ void test_ws_client_create_with_config(void) {
     TEST_ASSERT_EQUAL_INT(10, client->config.reconnect_interval);
     TEST_ASSERT_EQUAL_DOUBLE(1.0, client->config.report_interval);
 
-    /* 验证初始状态 */
+    /* Verify initial state */
     TEST_ASSERT_FALSE(client->connected);
     TEST_ASSERT_FALSE(client->should_stop);
     TEST_ASSERT_FALSE(client->use_tls);
@@ -114,12 +117,12 @@ void test_ws_client_create_with_config(void) {
     free(config.token);
 }
 
-/* 测试 ws_client_create：使用 NULL 配置创建客户端 */
+/* Test ws_client_create: create client with NULL config */
 void test_ws_client_create_null_config(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
 
-    /* 验证初始状态 */
+    /* Verify initial state */
     TEST_ASSERT_FALSE(client->connected);
     TEST_ASSERT_FALSE(client->should_stop);
     TEST_ASSERT_EQUAL_INT(-1, client->fd);
@@ -127,85 +130,85 @@ void test_ws_client_create_null_config(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_client_destroy 传入 NULL */
+/* Test ws_client_destroy with NULL */
 void test_ws_client_destroy_null(void) {
-    /* 不崩溃即通过 */
+    /* Passing means no crash */
     ws_client_destroy(NULL);
     TEST_PASS();
 }
 
-/* ====== 设置器测试 ====== */
+/* ====== Setter tests ====== */
 
-/* 测试 ws_client_set_handler */
+/* Test ws_client_set_handler */
 void test_ws_client_set_handler(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
 
-    /* 初始 handler 应为 NULL */
+    /* Initial handler should be NULL */
     TEST_ASSERT_NULL(client->handler);
 
-    /* 设置 handler（使用一个非 NULL 函数指针） */
+    /* Set handler (using a non-NULL function pointer) */
     ws_client_set_handler(client, (ws_message_handler_t)0x1234);
     TEST_ASSERT_EQUAL_PTR((void *)0x1234, (void *)client->handler);
 
-    /* 设置为 NULL */
+    /* Set to NULL */
     ws_client_set_handler(client, NULL);
     TEST_ASSERT_NULL(client->handler);
 
     ws_client_destroy(client);
 }
 
-/* 测试 ws_client_set_raw_handler */
+/* Test ws_client_set_raw_handler */
 void test_ws_client_set_raw_handler(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
 
-    /* 初始 raw_handler 应为 NULL */
+    /* Initial raw_handler should be NULL */
     TEST_ASSERT_NULL(client->raw_handler);
 
-    /* 设置 raw_handler */
+    /* Set raw_handler */
     ws_client_set_raw_handler(client, (ws_raw_handler_t)0x5678);
     TEST_ASSERT_EQUAL_PTR((void *)0x5678, (void *)client->raw_handler);
 
-    /* 设置为 NULL */
+    /* Set to NULL */
     ws_client_set_raw_handler(client, NULL);
     TEST_ASSERT_NULL(client->raw_handler);
 
     ws_client_destroy(client);
 }
 
-/* 测试 ws_client_set_user_data */
+/* Test ws_client_set_user_data */
 void test_ws_client_set_user_data(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
 
-    /* 初始 user_data 应为 NULL */
+    /* Initial user_data should be NULL */
     TEST_ASSERT_NULL(client->user_data);
 
-    /* 设置 user_data */
+    /* Set user_data */
     int user_data = 42;
     ws_client_set_user_data(client, &user_data);
     TEST_ASSERT_EQUAL_PTR(&user_data, client->user_data);
 
-    /* 设置为 NULL */
+    /* Set to NULL */
     ws_client_set_user_data(client, NULL);
     TEST_ASSERT_NULL(client->user_data);
 
     ws_client_destroy(client);
 }
 
-/* 测试 ws_client_set_handler 传入 NULL 客户端 */
+/* Test ws_client_set_handler with NULL client */
 void test_ws_client_set_handler_null_client(void) {
-    /* 不崩溃即通过 */
+    /* Passing means no crash */
     ws_client_set_handler(NULL, (ws_message_handler_t)0x1234);
     ws_client_set_raw_handler(NULL, (ws_raw_handler_t)0x5678);
     ws_client_set_user_data(NULL, (void *)0x9ABC);
     TEST_PASS();
 }
 
-/* ====== ws_client_stop / ws_client_disconnect 测试 ====== */
+/* ====== ws_client_stop / ws_client_disconnect tests ====== */
 
-/* 测试 ws_client_stop：设置 should_stop 标志 */
+/* Test ws_client_stop: sets the should_stop flag */
 void test_ws_client_stop(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -217,27 +220,27 @@ void test_ws_client_stop(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_client_stop 传入 NULL */
+/* Test ws_client_stop with NULL */
 void test_ws_client_stop_null(void) {
     ws_client_stop(NULL);
     TEST_PASS();
 }
 
-/* 测试 ws_client_disconnect：未连接状态下断开 */
+/* Test ws_client_disconnect: disconnect when not connected */
 void test_ws_client_disconnect_not_connected(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
 
-    /* 未连接状态下断开，不应崩溃 */
+    /* Disconnect when not connected should not crash */
     ws_client_disconnect(client);
     TEST_ASSERT_FALSE(client->connected);
 
     ws_client_destroy(client);
 }
 
-/* ====== ws_client_send 测试 ====== */
+/* ====== ws_client_send tests ====== */
 
-/* 测试 ws_client_send_text 未连接时返回错误 */
+/* Test ws_client_send_text returns error when not connected */
 void test_ws_client_send_text_not_connected(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -249,7 +252,7 @@ void test_ws_client_send_text_not_connected(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_client_send_text 传入 NULL 参数 */
+/* Test ws_client_send_text with NULL arguments */
 void test_ws_client_send_text_null_args(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -260,7 +263,7 @@ void test_ws_client_send_text_null_args(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_client_send_ping 未连接时返回错误 */
+/* Test ws_client_send_ping returns error when not connected */
 void test_ws_client_send_ping_not_connected(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -271,13 +274,13 @@ void test_ws_client_send_ping_not_connected(void) {
     ws_client_destroy(client);
 }
 
-/* ====== WebSocket 握手测试 ====== */
+/* ====== WebSocket handshake tests ====== */
 
 /*
- * 测试 Sec-WebSocket-Accept 计算
- * 使用 RFC 6455 Section 4.1 中的示例：
+ * Test Sec-WebSocket-Accept computation
+ * Uses the example from RFC 6455 Section 4.1:
  *   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
- *   预期 Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+ *   Expected Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
  */
 void test_ws_handshake_accept_key_rfc6455(void) {
     const char *key = "dGhlIHNhbXBsZSBub25jZQ==";
@@ -285,24 +288,24 @@ void test_ws_handshake_accept_key_rfc6455(void) {
 
     test_compute_accept_key(key, accept_key);
 
-    /* RFC 6455 规定的预期值 */
+    /* Expected value per RFC 6455 */
     TEST_ASSERT_EQUAL_STRING("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accept_key);
 }
 
-/* 测试 Sec-WebSocket-Accept 计算使用不同的 Key */
+/* Test Sec-WebSocket-Accept computation with a different Key */
 void test_ws_handshake_accept_key_custom(void) {
     const char *key = "YWJjZGVmZ2hpamtsbW5vcA==";
     char accept_key[64];
 
     test_compute_accept_key(key, accept_key);
 
-    /* 验证输出非空且长度合理（Base64 编码 SHA1 = 28 字符） */
+    /* Verify output is non-empty and has reasonable length (Base64-encoded SHA1 = 28 chars) */
     TEST_ASSERT_TRUE(strlen(accept_key) == 28);
 }
 
-/* ====== WebSocket 帧掩码测试 ====== */
+/* ====== WebSocket frame mask tests ====== */
 
-/* 测试 WebSocket 客户端掩码应用：验证掩码可逆性 */
+/* Test WebSocket client mask application: verify mask reversibility */
 void test_ws_frame_mask_reversible(void) {
     unsigned char data[] = "Hello, WebSocket!";
     size_t data_len = strlen((char *)data);
@@ -311,28 +314,28 @@ void test_ws_frame_mask_reversible(void) {
 
     unsigned char mask[4] = {0x12, 0x34, 0x56, 0x78};
 
-    /* 应用掩码 */
+    /* Apply mask */
     test_apply_mask(data, data_len, mask);
 
-    /* 掩码后数据应与原始数据不同 */
+    /* Masked data should differ from original data */
     TEST_ASSERT_NOT_EQUAL(0, memcmp(data, original, data_len));
 
-    /* 再次应用相同掩码应恢复原始数据 */
+    /* Applying the same mask again should restore original data */
     test_apply_mask(data, data_len, mask);
     TEST_ASSERT_EQUAL(0, memcmp(data, original, data_len));
 }
 
-/* 测试 WebSocket 帧掩码：空数据 */
+/* Test WebSocket frame mask: empty data */
 void test_ws_frame_mask_empty(void) {
     unsigned char data[] = "";
     unsigned char mask[4] = {0xFF, 0xFF, 0xFF, 0xFF};
 
-    /* 空数据掩码不应崩溃 */
+    /* Masking empty data should not crash */
     test_apply_mask(data, 0, mask);
     TEST_PASS();
 }
 
-/* 测试 WebSocket 帧掩码：数据长度非 4 的倍数 */
+/* Test WebSocket frame mask: data length not a multiple of 4 */
 void test_ws_frame_mask_non_aligned(void) {
     unsigned char data[] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07};
     size_t data_len = 7;
@@ -341,20 +344,20 @@ void test_ws_frame_mask_non_aligned(void) {
 
     unsigned char mask[4] = {0xAA, 0xBB, 0xCC, 0xDD};
 
-    /* 应用掩码 */
+    /* Apply mask */
     test_apply_mask(data, data_len, mask);
 
-    /* 验证每个字节被正确掩码 */
+    /* Verify each byte is correctly masked */
     for (size_t i = 0; i < data_len; i++) {
         TEST_ASSERT_EQUAL_UINT8(original[i] ^ mask[i % 4], data[i]);
     }
 }
 
-/* ====== ws_message_t JSON 消息解析测试 ====== */
+/* ====== ws_message_t JSON message parsing tests ====== */
 
 /*
- * 测试 WebSocket 消息 JSON 解析：构造包含 message 字段的消息
- * 此测试复现 ws_recv_thread 中的 JSON 解析逻辑
+ * Test WebSocket message JSON parsing: construct a message with the message field
+ * This test reproduces the JSON parsing logic in ws_recv_thread
  */
 void test_ws_message_parse_message_field(void) {
     const char *json_str = "{\"message\": \"hello world\"}";
@@ -374,9 +377,9 @@ void test_ws_message_parse_message_field(void) {
     cJSON_Delete(root);
 }
 
-/* 测试 WebSocket 消息 JSON 解析：terminal_id 字段（兼容 request_id） */
+/* Test WebSocket message JSON parsing: terminal_id field (compatible with request_id) */
 void test_ws_message_parse_terminal_id(void) {
-    /* 测试 terminal_id 字段 */
+    /* Test terminal_id field */
     const char *json_str1 = "{\"terminal_id\": \"term-123\"}";
     cJSON *root1 = cJSON_Parse(json_str1);
     TEST_ASSERT_NOT_NULL(root1);
@@ -393,7 +396,7 @@ void test_ws_message_parse_terminal_id(void) {
     TEST_ASSERT_EQUAL_STRING("term-123", msg.terminal_id);
     cJSON_Delete(root1);
 
-    /* 测试 request_id 字段（兼容） */
+    /* Test request_id field (compatibility) */
     const char *json_str2 = "{\"request_id\": \"req-456\"}";
     cJSON *root2 = cJSON_Parse(json_str2);
     TEST_ASSERT_NOT_NULL(root2);
@@ -409,9 +412,9 @@ void test_ws_message_parse_terminal_id(void) {
     cJSON_Delete(root2);
 }
 
-/* 测试 WebSocket 消息 JSON 解析：exec_command 字段（兼容 command） */
+/* Test WebSocket message JSON parsing: exec_command field (compatible with command) */
 void test_ws_message_parse_exec_command(void) {
-    /* 测试 exec_command 字段 */
+    /* Test exec_command field */
     const char *json_str1 = "{\"exec_command\": \"ls -la\"}";
     cJSON *root1 = cJSON_Parse(json_str1);
     TEST_ASSERT_NOT_NULL(root1);
@@ -428,7 +431,7 @@ void test_ws_message_parse_exec_command(void) {
     TEST_ASSERT_EQUAL_STRING("ls -la", msg.exec_command);
     cJSON_Delete(root1);
 
-    /* 测试 command 字段（兼容） */
+    /* Test command field (compatibility) */
     const char *json_str2 = "{\"command\": \"uname -a\"}";
     cJSON *root2 = cJSON_Parse(json_str2);
     TEST_ASSERT_NOT_NULL(root2);
@@ -444,7 +447,7 @@ void test_ws_message_parse_exec_command(void) {
     cJSON_Delete(root2);
 }
 
-/* 测试 WebSocket 消息 JSON 解析：exec_task_id 字段（兼容 task_id） */
+/* Test WebSocket message JSON parsing: exec_task_id field (compatible with task_id) */
 void test_ws_message_parse_exec_task_id(void) {
     const char *json_str = "{\"exec_task_id\": \"task-789\"}";
     cJSON *root = cJSON_Parse(json_str);
@@ -463,7 +466,7 @@ void test_ws_message_parse_exec_task_id(void) {
     cJSON_Delete(root);
 }
 
-/* 测试 WebSocket 消息 JSON 解析：ping 相关字段 */
+/* Test WebSocket message JSON parsing: ping-related fields */
 void test_ws_message_parse_ping_fields(void) {
     const char *json_str =
         "{\"ping_type\": \"icmp\", \"ping_target\": \"8.8.8.8\", \"ping_task_id\": 42}";
@@ -475,17 +478,17 @@ void test_ws_message_parse_ping_fields(void) {
 
     cJSON *item;
 
-    /* 解析 ping_type */
+    /* Parse ping_type */
     if ((item = cJSON_GetObjectItem(root, "ping_type")) && cJSON_IsString(item)) {
         strncpy(msg.ping_type, item->valuestring, sizeof(msg.ping_type) - 1);
     }
 
-    /* 解析 ping_target */
+    /* Parse ping_target */
     if ((item = cJSON_GetObjectItem(root, "ping_target")) && cJSON_IsString(item)) {
         strncpy(msg.ping_target, item->valuestring, sizeof(msg.ping_target) - 1);
     }
 
-    /* 解析 ping_task_id */
+    /* Parse ping_task_id */
     if ((item = cJSON_GetObjectItem(root, "ping_task_id")) && cJSON_IsNumber(item)) {
         msg.ping_task_id = (uint32_t)item->valuedouble;
     }
@@ -497,7 +500,7 @@ void test_ws_message_parse_ping_fields(void) {
     cJSON_Delete(root);
 }
 
-/* 测试 WebSocket 消息 JSON 解析：包含所有字段的完整消息 */
+/* Test WebSocket message JSON parsing: full message with all fields */
 void test_ws_message_parse_full_message(void) {
     const char *json_str =
         "{"
@@ -562,14 +565,14 @@ void test_ws_message_parse_full_message(void) {
     cJSON_Delete(root);
 }
 
-/* 测试 WebSocket 消息 JSON 解析：无效 JSON */
+/* Test WebSocket message JSON parsing: invalid JSON */
 void test_ws_message_parse_invalid_json(void) {
     const char *json_str = "{ invalid json }";
     cJSON *root = cJSON_Parse(json_str);
     TEST_ASSERT_NULL(root);
 }
 
-/* 测试 ws_message_t 结构体大小 */
+/* Test ws_message_t struct size */
 void test_ws_message_struct_size(void) {
     TEST_ASSERT_TRUE(sizeof(ws_message_t) > 0);
     /* message[32] + terminal_id[64] + exec_command[1024] + exec_task_id[64] +
@@ -577,9 +580,9 @@ void test_ws_message_struct_size(void) {
     TEST_ASSERT_TRUE(sizeof(ws_message_t) >= 32 + 64 + 1024 + 64 + 4 + 16 + 256);
 }
 
-/* ====== RFC 6455 §5.4 分片消息累积逻辑测试 ====== */
+/* ====== RFC 6455 §5.4 fragmented message accumulation logic tests ====== */
 
-/* 测试 ws_fragment_accumulate：单帧（未分片）文本消息直接返回 */
+/* Test ws_fragment_accumulate: single-frame (unfragmented) text message returns directly */
 void test_ws_fragment_unfragmented_text(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -604,7 +607,7 @@ void test_ws_fragment_unfragmented_text(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_fragment_accumulate：单帧（未分片）二进制消息直接返回 */
+/* Test ws_fragment_accumulate: single-frame (unfragmented) binary message returns directly */
 void test_ws_fragment_unfragmented_binary(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -625,9 +628,9 @@ void test_ws_fragment_unfragmented_binary(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_fragment_accumulate：多分片文本消息累积
- * 模拟服务端发送 3 个分片：首片 (FIN=0, opcode=0x01)、
- * 中间片 (FIN=0, opcode=0x00)、末片 (FIN=1, opcode=0x00)
+/* Test ws_fragment_accumulate: multi-fragment text message accumulation
+ * Simulate the server sending 3 fragments: first (FIN=0, opcode=0x01),
+ * middle (FIN=0, opcode=0x00), last (FIN=1, opcode=0x00)
  */
 void test_ws_fragment_multi_text(void) {
     ws_client_t *client = ws_client_create(NULL);
@@ -673,7 +676,7 @@ void test_ws_fragment_multi_text(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_fragment_accumulate：多分片二进制消息累积 */
+/* Test ws_fragment_accumulate: multi-fragment binary message accumulation */
 void test_ws_fragment_multi_binary(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -709,7 +712,7 @@ void test_ws_fragment_multi_binary(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_fragment_accumulate：分片累积超过 WS_FRAGMENT_MAX_SIZE 时返回错误 */
+/* Test ws_fragment_accumulate: returns error when accumulation exceeds WS_FRAGMENT_MAX_SIZE */
 void test_ws_fragment_oversize(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -747,7 +750,7 @@ void test_ws_fragment_oversize(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_fragment_accumulate：无起始分片时收到 continuation 帧返回错误 */
+/* Test ws_fragment_accumulate: returns error when continuation frame received without a start fragment */
 void test_ws_fragment_continuation_without_start(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -765,7 +768,7 @@ void test_ws_fragment_continuation_without_start(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_fragment_accumulate：分片进行中收到新的非 continuation 帧返回错误 */
+/* Test ws_fragment_accumulate: returns error when a new non-continuation frame arrives during fragmentation */
 void test_ws_fragment_new_opcode_during_fragment(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -790,7 +793,7 @@ void test_ws_fragment_new_opcode_during_fragment(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_fragment_accumulate：完成一条分片消息后可立即开始下一条（缓冲区复用） */
+/* Test ws_fragment_accumulate: a new fragmented message can start immediately after completing one (buffer reuse) */
 void test_ws_fragment_reset_after_complete(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -837,7 +840,7 @@ void test_ws_fragment_reset_after_complete(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_fragment_accumulate：空分片（零长度 payload）正确累积 */
+/* Test ws_fragment_accumulate: empty fragments (zero-length payload) accumulate correctly */
 void test_ws_fragment_empty_payloads(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -868,7 +871,7 @@ void test_ws_fragment_empty_payloads(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_fragment_accumulate：NULL 参数返回错误 */
+/* Test ws_fragment_accumulate: NULL arguments return error */
 void test_ws_fragment_null_args(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -887,8 +890,8 @@ void test_ws_fragment_null_args(void) {
     ws_client_destroy(client);
 }
 
-/* 测试 ws_fragment_accumulate：单分片二进制消息（首片即为末片，FIN=0+1 不可能）。
- * 此测试验证 FIN=0 + opcode=0x00（continuation 但 fin=0）在无前序分片时返回错误 */
+/* Test ws_fragment_accumulate: single-fragment binary message (first fragment is also last, FIN=0+1 impossible).
+ * This test verifies that FIN=0 + opcode=0x00 (continuation but fin=0) returns an error without a prior fragment */
 void test_ws_fragment_invalid_continuation_fin0(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
@@ -1236,37 +1239,37 @@ void test_ws_handle_v2_event_ack_snapshot_clear(void) {
 int main(void) {
     UNITY_BEGIN();
 
-    /* 客户端创建/销毁测试 */
+    /* Client create/destroy tests */
     RUN_TEST(test_ws_client_create_with_config);
     RUN_TEST(test_ws_client_create_null_config);
     RUN_TEST(test_ws_client_destroy_null);
 
-    /* 设置器测试 */
+    /* Setter tests */
     RUN_TEST(test_ws_client_set_handler);
     RUN_TEST(test_ws_client_set_raw_handler);
     RUN_TEST(test_ws_client_set_user_data);
     RUN_TEST(test_ws_client_set_handler_null_client);
 
-    /* 停止/断开测试 */
+    /* Stop/disconnect tests */
     RUN_TEST(test_ws_client_stop);
     RUN_TEST(test_ws_client_stop_null);
     RUN_TEST(test_ws_client_disconnect_not_connected);
 
-    /* 发送测试 */
+    /* Send tests */
     RUN_TEST(test_ws_client_send_text_not_connected);
     RUN_TEST(test_ws_client_send_text_null_args);
     RUN_TEST(test_ws_client_send_ping_not_connected);
 
-    /* 握手测试 */
+    /* Handshake tests */
     RUN_TEST(test_ws_handshake_accept_key_rfc6455);
     RUN_TEST(test_ws_handshake_accept_key_custom);
 
-    /* 掩码测试 */
+    /* Mask tests */
     RUN_TEST(test_ws_frame_mask_reversible);
     RUN_TEST(test_ws_frame_mask_empty);
     RUN_TEST(test_ws_frame_mask_non_aligned);
 
-    /* JSON 消息解析测试 */
+    /* JSON message parsing tests */
     RUN_TEST(test_ws_message_parse_message_field);
     RUN_TEST(test_ws_message_parse_terminal_id);
     RUN_TEST(test_ws_message_parse_exec_command);
@@ -1276,7 +1279,7 @@ int main(void) {
     RUN_TEST(test_ws_message_parse_invalid_json);
     RUN_TEST(test_ws_message_struct_size);
 
-    /* RFC 6455 §5.4 分片消息累积测试 */
+    /* RFC 6455 §5.4 fragmented message accumulation tests */
     RUN_TEST(test_ws_fragment_unfragmented_text);
     RUN_TEST(test_ws_fragment_unfragmented_binary);
     RUN_TEST(test_ws_fragment_multi_text);

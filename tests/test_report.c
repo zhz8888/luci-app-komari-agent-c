@@ -1,14 +1,14 @@
 /*
- * test_report.c - 报告生成模块单元测试
+ * test_report.c - Report generation module unit tests
  *
- * 测试内容：
- *   - report_generate 生成的 JSON 包含所有必需字段（cpu/ram/swap/load/disk/network/connections/uptime/process）
- *   - report_generate_basic_info 生成的 JSON 包含所有基础信息字段
- *   - 验证 JSON 格式有效性（使用 cJSON_Parse 验证）
- *   - 验证字段类型正确（数值字段为数值，字符串字段为字符串）
+ * Test scope:
+ *   - report_generate produces JSON containing all required fields (cpu/ram/swap/load/disk/network/connections/uptime/process)
+ *   - report_generate_basic_info produces JSON containing all basic info fields
+ *   - Verify JSON format validity (using cJSON_Parse)
+ *   - Verify field types are correct (numeric fields are numbers, string fields are strings)
  *
- * 注意：report_generate 和 report_generate_basic_info 调用 monitoring 函数
- * 读取 /proc 文件系统，测试在真实 Linux 系统上运行。
+ * Note: report_generate and report_generate_basic_info invoke monitoring functions
+ * to read the /proc filesystem; tests run on a real Linux system.
  */
 
 #include "unity.h"
@@ -22,11 +22,11 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* 报告缓冲区大小 */
+/* Report buffer size */
 #define REPORT_BUF_SIZE 8192
 
 void setUp(void) {
-    /* 设置全局配置指针，供 monitoring 模块使用 */
+    /* Set global config pointer for use by the monitoring module */
     monitoring_set_config(NULL);
 }
 
@@ -34,9 +34,9 @@ void tearDown(void) {
     monitoring_set_config(NULL);
 }
 
-/* ====== report_generate 测试 ====== */
+/* ====== report_generate tests ====== */
 
-/* 测试 report_generate：验证返回值和 JSON 格式有效性 */
+/* Test report_generate: verify return value and JSON format validity */
 void test_report_generate_valid_json(void) {
     agent_config_t config;
     config_init(&config);
@@ -46,7 +46,7 @@ void test_report_generate_valid_json(void) {
 
     TEST_ASSERT_TRUE(len > 0);
 
-    /* 使用 cJSON_Parse 验证 JSON 格式有效 */
+    /* Use cJSON_Parse to verify JSON format validity */
     cJSON *root = cJSON_Parse(buf);
     TEST_ASSERT_NOT_NULL(root);
     TEST_ASSERT_TRUE(cJSON_IsObject(root));
@@ -54,7 +54,7 @@ void test_report_generate_valid_json(void) {
     cJSON_Delete(root);
 }
 
-/* 测试 report_generate：验证包含所有必需字段 */
+/* Test report_generate: verify all required fields are present */
 void test_report_generate_required_fields(void) {
     agent_config_t config;
     config_init(&config);
@@ -66,22 +66,22 @@ void test_report_generate_required_fields(void) {
     cJSON *root = cJSON_Parse(buf);
     TEST_ASSERT_NOT_NULL(root);
 
-    /* 验证 cpu 字段存在且为对象 */
+    /* Verify cpu field exists and is an object */
     cJSON *cpu = cJSON_GetObjectItem(root, "cpu");
     TEST_ASSERT_NOT_NULL(cpu);
     TEST_ASSERT_TRUE(cJSON_IsObject(cpu));
 
-    /* 验证 cpu.usage 存在且为数值 */
+    /* Verify cpu.usage exists and is a number */
     cJSON *cpu_usage = cJSON_GetObjectItem(cpu, "usage");
     TEST_ASSERT_NOT_NULL(cpu_usage);
     TEST_ASSERT_TRUE(cJSON_IsNumber(cpu_usage));
 
-    /* 验证 ram 字段存在且为对象 */
+    /* Verify ram field exists and is an object */
     cJSON *ram = cJSON_GetObjectItem(root, "ram");
     TEST_ASSERT_NOT_NULL(ram);
     TEST_ASSERT_TRUE(cJSON_IsObject(ram));
 
-    /* 验证 ram.total 和 ram.used 为数值 */
+    /* Verify ram.total and ram.used are numbers */
     cJSON *ram_total = cJSON_GetObjectItem(ram, "total");
     TEST_ASSERT_NOT_NULL(ram_total);
     TEST_ASSERT_TRUE(cJSON_IsNumber(ram_total));
@@ -90,47 +90,47 @@ void test_report_generate_required_fields(void) {
     TEST_ASSERT_NOT_NULL(ram_used);
     TEST_ASSERT_TRUE(cJSON_IsNumber(ram_used));
 
-    /* 验证 swap 字段存在且为对象 */
+    /* Verify swap field exists and is an object */
     cJSON *swap = cJSON_GetObjectItem(root, "swap");
     TEST_ASSERT_NOT_NULL(swap);
     TEST_ASSERT_TRUE(cJSON_IsObject(swap));
 
-    /* 验证 load 字段存在且为对象 */
+    /* Verify load field exists and is an object */
     cJSON *load = cJSON_GetObjectItem(root, "load");
     TEST_ASSERT_NOT_NULL(load);
     TEST_ASSERT_TRUE(cJSON_IsObject(load));
 
-    /* 验证 load.load1/load5/load15 为数值 */
+    /* Verify load.load1/load5/load15 are numbers */
     cJSON *load1 = cJSON_GetObjectItem(load, "load1");
     TEST_ASSERT_NOT_NULL(load1);
     TEST_ASSERT_TRUE(cJSON_IsNumber(load1));
 
-    /* 验证 disk 字段存在且为对象 */
+    /* Verify disk field exists and is an object */
     cJSON *disk = cJSON_GetObjectItem(root, "disk");
     TEST_ASSERT_NOT_NULL(disk);
     TEST_ASSERT_TRUE(cJSON_IsObject(disk));
 
-    /* 验证 network 字段存在且为对象 */
+    /* Verify network field exists and is an object */
     cJSON *network = cJSON_GetObjectItem(root, "network");
     TEST_ASSERT_NOT_NULL(network);
     TEST_ASSERT_TRUE(cJSON_IsObject(network));
 
-    /* 验证 connections 字段存在且为对象 */
+    /* Verify connections field exists and is an object */
     cJSON *connections = cJSON_GetObjectItem(root, "connections");
     TEST_ASSERT_NOT_NULL(connections);
     TEST_ASSERT_TRUE(cJSON_IsObject(connections));
 
-    /* 验证 uptime 为数值 */
+    /* Verify uptime is a number */
     cJSON *uptime = cJSON_GetObjectItem(root, "uptime");
     TEST_ASSERT_NOT_NULL(uptime);
     TEST_ASSERT_TRUE(cJSON_IsNumber(uptime));
 
-    /* 验证 process 为数值 */
+    /* Verify process is a number */
     cJSON *process = cJSON_GetObjectItem(root, "process");
     TEST_ASSERT_NOT_NULL(process);
     TEST_ASSERT_TRUE(cJSON_IsNumber(process));
 
-    /* 验证 message 为字符串 */
+    /* Verify message is a string */
     cJSON *message = cJSON_GetObjectItem(root, "message");
     TEST_ASSERT_NOT_NULL(message);
     TEST_ASSERT_TRUE(cJSON_IsString(message));
@@ -138,7 +138,7 @@ void test_report_generate_required_fields(void) {
     cJSON_Delete(root);
 }
 
-/* 测试 report_generate：验证字段值合理性 */
+/* Test report_generate: verify field value sanity */
 void test_report_generate_field_values(void) {
     agent_config_t config;
     config_init(&config);
@@ -149,7 +149,7 @@ void test_report_generate_field_values(void) {
     cJSON *root = cJSON_Parse(buf);
     TEST_ASSERT_NOT_NULL(root);
 
-    /* CPU 使用率应在 [0, 100] 范围内 */
+    /* CPU usage should be in [0, 100] range */
     cJSON *cpu_obj = cJSON_GetObjectItem(root, "cpu");
     TEST_ASSERT_NOT_NULL(cpu_obj);
     cJSON *cpu_usage = cJSON_GetObjectItem(cpu_obj, "usage");
@@ -157,32 +157,32 @@ void test_report_generate_field_values(void) {
     TEST_ASSERT_TRUE(cpu_usage->valuedouble >= 0.0);
     TEST_ASSERT_TRUE(cpu_usage->valuedouble <= 100.0);
 
-    /* 内存总量应 >= 0 */
+    /* Total memory should be >= 0 */
     cJSON *ram = cJSON_GetObjectItem(root, "ram");
     cJSON *ram_total = cJSON_GetObjectItem(ram, "total");
     TEST_ASSERT_TRUE(ram_total->valuedouble >= 0.0);
 
-    /* 已用内存应 <= 总内存 */
+    /* Used memory should be <= total memory */
     cJSON *ram_used = cJSON_GetObjectItem(ram, "used");
     TEST_ASSERT_TRUE(ram_used->valuedouble <= ram_total->valuedouble);
 
-    /* TCP 连接数应 >= 0 */
+    /* TCP connection count should be >= 0 */
     cJSON *connections = cJSON_GetObjectItem(root, "connections");
     cJSON *tcp = cJSON_GetObjectItem(connections, "tcp");
     TEST_ASSERT_TRUE(tcp->valuedouble >= 0.0);
 
-    /* uptime 应 >= 0 */
+    /* uptime should be >= 0 */
     cJSON *uptime = cJSON_GetObjectItem(root, "uptime");
     TEST_ASSERT_TRUE(uptime->valuedouble >= 0.0);
 
-    /* process 应 >= 0 */
+    /* process should be >= 0 */
     cJSON *process = cJSON_GetObjectItem(root, "process");
     TEST_ASSERT_TRUE(process->valuedouble >= 0.0);
 
     cJSON_Delete(root);
 }
 
-/* 测试 report_generate 传入 NULL 参数 */
+/* Test report_generate with NULL arguments */
 void test_report_generate_null_args(void) {
     agent_config_t config;
     config_init(&config);
@@ -193,7 +193,7 @@ void test_report_generate_null_args(void) {
     TEST_ASSERT_EQUAL_INT(-1, report_generate(&config, buf, 0));
 }
 
-/* 测试 report_generate：验证 network 子字段 */
+/* Test report_generate: verify network subfields */
 void test_report_generate_network_fields(void) {
     agent_config_t config;
     config_init(&config);
@@ -207,7 +207,7 @@ void test_report_generate_network_fields(void) {
     cJSON *network = cJSON_GetObjectItem(root, "network");
     TEST_ASSERT_NOT_NULL(network);
 
-    /* 验证 up/down/totalUp/totalDown 字段存在且为数值 */
+    /* Verify up/down/totalUp/totalDown fields exist and are numbers */
     const char *net_fields[] = {"up", "down", "totalUp", "totalDown"};
     for (size_t i = 0; i < sizeof(net_fields) / sizeof(net_fields[0]); i++) {
         cJSON *field = cJSON_GetObjectItem(network, net_fields[i]);
@@ -218,7 +218,7 @@ void test_report_generate_network_fields(void) {
     cJSON_Delete(root);
 }
 
-/* 测试 report_generate：验证 connections 子字段 */
+/* Test report_generate: verify connections subfields */
 void test_report_generate_connections_fields(void) {
     agent_config_t config;
     config_init(&config);
@@ -232,7 +232,7 @@ void test_report_generate_connections_fields(void) {
     cJSON *connections = cJSON_GetObjectItem(root, "connections");
     TEST_ASSERT_NOT_NULL(connections);
 
-    /* 验证 tcp 和 udp 字段存在且为数值 */
+    /* Verify tcp and udp fields exist and are numbers */
     cJSON *tcp = cJSON_GetObjectItem(connections, "tcp");
     TEST_ASSERT_NOT_NULL(tcp);
     TEST_ASSERT_TRUE(cJSON_IsNumber(tcp));
@@ -244,7 +244,7 @@ void test_report_generate_connections_fields(void) {
     cJSON_Delete(root);
 }
 
-/* 测试 report_generate：验证 load 子字段 */
+/* Test report_generate: verify load subfields */
 void test_report_generate_load_fields(void) {
     agent_config_t config;
     config_init(&config);
@@ -258,7 +258,7 @@ void test_report_generate_load_fields(void) {
     cJSON *load = cJSON_GetObjectItem(root, "load");
     TEST_ASSERT_NOT_NULL(load);
 
-    /* 验证 load1/load5/load15 字段存在且为数值 */
+    /* Verify load1/load5/load15 fields exist and are numbers */
     const char *load_fields[] = {"load1", "load5", "load15"};
     for (size_t i = 0; i < sizeof(load_fields) / sizeof(load_fields[0]); i++) {
         cJSON *field = cJSON_GetObjectItem(load, load_fields[i]);
@@ -269,9 +269,9 @@ void test_report_generate_load_fields(void) {
     cJSON_Delete(root);
 }
 
-/* ====== report_generate_basic_info 测试 ====== */
+/* ====== report_generate_basic_info tests ====== */
 
-/* 测试 report_generate_basic_info：验证 JSON 格式有效性 */
+/* Test report_generate_basic_info: verify JSON format validity */
 void test_report_generate_basic_info_valid_json(void) {
     agent_config_t config;
     config_init(&config);
@@ -281,7 +281,7 @@ void test_report_generate_basic_info_valid_json(void) {
 
     TEST_ASSERT_TRUE(len > 0);
 
-    /* 使用 cJSON_Parse 验证 JSON 格式有效 */
+    /* Use cJSON_Parse to verify JSON format validity */
     cJSON *root = cJSON_Parse(buf);
     TEST_ASSERT_NOT_NULL(root);
     TEST_ASSERT_TRUE(cJSON_IsObject(root));
@@ -289,7 +289,7 @@ void test_report_generate_basic_info_valid_json(void) {
     cJSON_Delete(root);
 }
 
-/* 测试 report_generate_basic_info：验证包含所有必需字段 */
+/* Test report_generate_basic_info: verify all required fields are present */
 void test_report_generate_basic_info_required_fields(void) {
     agent_config_t config;
     config_init(&config);
@@ -301,7 +301,7 @@ void test_report_generate_basic_info_required_fields(void) {
     cJSON *root = cJSON_Parse(buf);
     TEST_ASSERT_NOT_NULL(root);
 
-    /* 验证字符串字段存在且为字符串类型 */
+    /* Verify string fields exist and are of string type */
     const char *string_fields[] = {
         "cpu_name", "arch", "os", "kernel_version",
         "ipv4", "ipv6", "gpu_name", "virtualization", "version"
@@ -312,7 +312,7 @@ void test_report_generate_basic_info_required_fields(void) {
         TEST_ASSERT_TRUE(cJSON_IsString(field));
     }
 
-    /* 验证数值字段存在且为数值类型 */
+    /* Verify numeric fields exist and are of numeric type */
     const char *number_fields[] = {
         "cpu_cores", "mem_total", "swap_total", "disk_total"
     };
@@ -325,7 +325,7 @@ void test_report_generate_basic_info_required_fields(void) {
     cJSON_Delete(root);
 }
 
-/* 测试 report_generate_basic_info：验证字段值合理性 */
+/* Test report_generate_basic_info: verify field value sanity */
 void test_report_generate_basic_info_field_values(void) {
     agent_config_t config;
     config_init(&config);
@@ -336,38 +336,38 @@ void test_report_generate_basic_info_field_values(void) {
     cJSON *root = cJSON_Parse(buf);
     TEST_ASSERT_NOT_NULL(root);
 
-    /* CPU 名称应非空 */
+    /* CPU name should be non-empty */
     cJSON *cpu_name = cJSON_GetObjectItem(root, "cpu_name");
     TEST_ASSERT_TRUE(strlen(cpu_name->valuestring) > 0);
 
-    /* 架构应非空 */
+    /* Architecture should be non-empty */
     cJSON *arch = cJSON_GetObjectItem(root, "arch");
     TEST_ASSERT_TRUE(strlen(arch->valuestring) > 0);
 
-    /* OS 应非空 */
+    /* OS should be non-empty */
     cJSON *os = cJSON_GetObjectItem(root, "os");
     TEST_ASSERT_TRUE(strlen(os->valuestring) > 0);
 
-    /* 内核版本应非空 */
+    /* Kernel version should be non-empty */
     cJSON *kernel = cJSON_GetObjectItem(root, "kernel_version");
     TEST_ASSERT_TRUE(strlen(kernel->valuestring) > 0);
 
-    /* CPU 核心数应 > 0 */
+    /* CPU core count should be > 0 */
     cJSON *cpu_cores = cJSON_GetObjectItem(root, "cpu_cores");
     TEST_ASSERT_TRUE(cpu_cores->valueint > 0);
 
-    /* 内存总量应 >= 0 */
+    /* Total memory should be >= 0 */
     cJSON *mem_total = cJSON_GetObjectItem(root, "mem_total");
     TEST_ASSERT_TRUE(mem_total->valuedouble >= 0.0);
 
-    /* 版本应为非空字符串 */
+    /* Version should be a non-empty string */
     cJSON *version = cJSON_GetObjectItem(root, "version");
     TEST_ASSERT_TRUE(strlen(version->valuestring) > 0);
 
     cJSON_Delete(root);
 }
 
-/* 测试 report_generate_basic_info 传入 NULL 参数 */
+/* Test report_generate_basic_info with NULL arguments */
 void test_report_generate_basic_info_null_args(void) {
     agent_config_t config;
     config_init(&config);
@@ -378,7 +378,7 @@ void test_report_generate_basic_info_null_args(void) {
     TEST_ASSERT_EQUAL_INT(-1, report_generate_basic_info(&config, buf, 0));
 }
 
-/* 测试 report_generate_basic_info：使用自定义 IPv4/IPv6 */
+/* Test report_generate_basic_info: with custom IPv4/IPv6 */
 void test_report_generate_basic_info_custom_ip(void) {
     agent_config_t config;
     config_init(&config);
@@ -391,7 +391,7 @@ void test_report_generate_basic_info_custom_ip(void) {
     cJSON *root = cJSON_Parse(buf);
     TEST_ASSERT_NOT_NULL(root);
 
-    /* 验证自定义 IP 被使用 */
+    /* Verify custom IP is used */
     cJSON *ipv4 = cJSON_GetObjectItem(root, "ipv4");
     TEST_ASSERT_EQUAL_STRING("10.0.0.1", ipv4->valuestring);
 
