@@ -103,6 +103,14 @@ info "Using apk tool: $APK"
 # OpenWrt SDK provides 'apk mkpkg' command to build APK v3 format package from a directory
 cd "$pkg_dir"
 
+# Calculate installed-size (in KB) from package contents and update APKINDEX
+installed_size=$(du -sk "$pkg_dir" 2>/dev/null | cut -f1)
+if [ -n "$installed_size" ] && [ -f "$pkg_dir"/CONTROL/APKINDEX ]; then
+    sed -i -e "s/^installed-size: .*/installed-size: $installed_size/" \
+        "$pkg_dir"/CONTROL/APKINDEX
+    info "Updated installed-size to ${installed_size} KB"
+fi
+
 if ! "$APK" mkpkg --output "$dest_dir" "$pkg_dir"; then
 	error "apk mkpkg failed to build package from $pkg_dir"
 fi

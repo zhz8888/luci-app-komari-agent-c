@@ -146,8 +146,13 @@ cd "$pkg_dir"
 $TAR -X "$tmp_dir"/tarX --format=gnu --numeric-owner --sort=name -cpf - --mtime="$TIMESTAMP" . | gzip -n - >"$tmp_dir"/data.tar.gz
 
 installed_size=$(zcat <"$tmp_dir"/data.tar.gz | wc -c)
-sed -i -e "s/^Installed-Size: .*/Installed-Size: $installed_size/" \
-	"$pkg_dir"/$CONTROL/control
+if grep -q "^Installed-Size:" "$pkg_dir"/$CONTROL/control; then
+	sed -i -e "s/^Installed-Size: .*/Installed-Size: $installed_size/" \
+		"$pkg_dir"/$CONTROL/control
+else
+	sed -i -e "/^Description:/i Installed-Size: $installed_size" \
+		"$pkg_dir"/$CONTROL/control
+fi
 
 (cd "$pkg_dir"/$CONTROL && $TAR --format=gnu --numeric-owner --sort=name -cf - --mtime="$TIMESTAMP" . | gzip -n - >"$tmp_dir"/control.tar.gz)
 rm "$tmp_dir"/tarX
