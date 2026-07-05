@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* UCI line parser helper (extracted from config.c for testability).
  * Not declared in config.h to keep the public API unchanged. */
@@ -223,6 +224,7 @@ void test_config_load_from_file_basic(void) {
 
     FILE *f = fopen(TEST_CONFIG_FILE_PATH, "w");
     TEST_ASSERT_NOT_NULL(f);
+    fchmod(fileno(f), 0600);
     fputs(json_content, f);
     fclose(f);
 
@@ -265,6 +267,7 @@ void test_config_load_from_file_invalid_json(void) {
     const char *json_content = "{ invalid json content !!! }";
     FILE *f = fopen(TEST_CONFIG_FILE_PATH, "w");
     TEST_ASSERT_NOT_NULL(f);
+    fchmod(fileno(f), 0600);
     fputs(json_content, f);
     fclose(f);
 
@@ -282,6 +285,7 @@ void test_config_load_from_file_empty_object(void) {
     const char *json_content = "{}";
     FILE *f = fopen(TEST_CONFIG_FILE_PATH, "w");
     TEST_ASSERT_NOT_NULL(f);
+    fchmod(fileno(f), 0600);
     fputs(json_content, f);
     fclose(f);
 
@@ -324,6 +328,7 @@ void test_config_priority_env_over_file(void) {
 
     FILE *f = fopen(TEST_CONFIG_PRIORITY_PATH, "w");
     TEST_ASSERT_NOT_NULL(f);
+    fchmod(fileno(f), 0600);
     fputs(json_content, f);
     fclose(f);
 
@@ -363,6 +368,7 @@ void test_config_priority_file_over_defaults(void) {
 
     FILE *f = fopen(TEST_CONFIG_PRIORITY_PATH, "w");
     TEST_ASSERT_NOT_NULL(f);
+    fchmod(fileno(f), 0600);
     fputs(json_content, f);
     fclose(f);
 

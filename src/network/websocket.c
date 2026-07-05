@@ -67,8 +67,19 @@ static void base64_encode(const unsigned char *data, size_t len, char *out) {
     out[j] = '\0';
 }
 
+/* Detect CR/LF in a string to prevent HTTP header injection via panel-
+ * controlled fields (terminal_id, ping_target). Returns 1 if found, 0
+ * otherwise. Mirrors the helper in config.c and main.c. */
+static int contains_crlf(const char *s) {
+    if (!s) return 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == '\r' || *p == '\n') return 1;
+    }
+    return 0;
+}
+
 /* Internal helper: percent-encode a string for safe inclusion in a URL query
- * component (MAJ-08). Mirrors the behavior of the url_encode helpers in
+ * component. Mirrors the behavior of the url_encode helpers in
  * src/autodiscovery/autodiscovery.c and src/report/report.c for consistency.
  *
  * Unreserved characters per RFC 3986 (A-Z, a-z, 0-9, '-', '_', '.', '~') are
@@ -804,7 +815,16 @@ static void *ws_recv_thread(void *arg) {
                         }
 
                         cJSON_Delete(root);
-                        client->handler(client, &msg);
+
+                        /* Reject messages with CR/LF in panel-controlled fields
+                         * to prevent HTTP header injection via the terminal
+                         * handshake or HTTP ping request line. */
+                        if (contains_crlf(msg.terminal_id) ||
+                            contains_crlf(msg.ping_target)) {
+                            KOMARI_LOG_WARN("[ws] Rejected message with CR/LF in terminal_id or ping_target");
+                        } else {
+                            client->handler(client, &msg);
+                        }
                     }
                 } else {
                     KOMARI_LOG_WARN("Failed to parse WebSocket JSON message");
@@ -1075,7 +1095,11 @@ int ws_handle_v2_event(ws_client_t *client, cJSON *root) {
                 v2_extract_string(event.params, "ping_target",
                                   msg.ping_target, sizeof(msg.ping_target));
             }
-            if (client->handler) client->handler(client, &msg);
+            if (contains_crlf(msg.ping_target)) {
+                KOMARI_LOG_WARN("[v2] Rejected ping_target containing CR/LF");
+            } else if (client->handler) {
+                client->handler(client, &msg);
+            }
             processed = 1;
         } else if (strcmp(event.method, AGENT_TERMINAL_REQUEST) == 0) {
             /* agent.terminal.request: params = { request_id }
@@ -1085,7 +1109,11 @@ int ws_handle_v2_event(ws_client_t *client, cJSON *root) {
                 v2_extract_string(event.params, "request_id",
                                   msg.terminal_id, sizeof(msg.terminal_id));
             }
-            if (client->handler) client->handler(client, &msg);
+            if (contains_crlf(msg.terminal_id)) {
+                KOMARI_LOG_WARN("[v2] Rejected terminal_id containing CR/LF");
+            } else if (client->handler) {
+                client->handler(client, &msg);
+            }
             processed = 1;
         } else if (strcmp(event.method, AGENT_MESSAGE) == 0 ||
                    strcmp(event.method, AGENT_EVENT) == 0) {

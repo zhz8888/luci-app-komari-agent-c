@@ -50,6 +50,9 @@ start_instance() {
 
 	procd_open_instance
 	procd_set_param command "$PROG"
+	# Drop root privileges to the dedicated komari system user/group.
+	procd_set_param user komari
+	procd_set_param group komari
 	procd_append_param command --token "$token"
 	procd_append_param command --endpoint "$endpoint"
 	procd_append_param command --interval "$interval"

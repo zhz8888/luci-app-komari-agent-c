@@ -32,6 +32,16 @@
 #include "logger.h"
 #include "dns_resolver.h"
 
+/* Detect CR/LF in a string to prevent HTTP header injection via
+ * ping_target. Mirrors the helper in config.c and autodiscovery.c. */
+static int contains_crlf(const char *s) {
+    if (!s) return 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == '\r' || *p == '\n') return 1;
+    }
+    return 0;
+}
+
 /* Compute the IP checksum (one's complement of the one's complement sum). */
 static uint16_t compute_checksum(uint16_t *addr, int len) {
     unsigned long sum = 0;
@@ -459,7 +469,7 @@ int ping_task_tcp(const char *target, int timeout_ms, const char *custom_dns) {
     return (int)(end_time - start_time);
 }
 
-int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
+int ping_task_http(const char *target, int timeout_ms, const char *custom_dns, int ignore_cert) {
     /* If the target is a bare IPv6 literal (no scheme, no brackets), wrap it
      * in [] so the resulting URL has a valid authority. Mirrors Go httpPing:
      *   if ip := net.ParseIP(target); ip != nil && ip.To4() == nil {
@@ -632,7 +642,17 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
             return -1;
         }
 
-        SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
+        /* Verify the peer certificate by default. Only disable verification
+         * when the caller explicitly sets ignore_cert, matching the behavior
+         * of websocket.c and report.c. Previously this path unconditionally
+         * called SSL_CTX_set_verify(SSL_VERIFY_NONE), which allowed MITM
+         * attacks against HTTPS ping targets. */
+        if (ignore_cert) {
+            SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
+        } else {
+            SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
+            SSL_CTX_set_default_verify_paths(ssl_ctx);
+        }
 
         ssl = SSL_new(ssl_ctx);
         if (!ssl) {
@@ -642,6 +662,23 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
         }
 
         SSL_set_fd(ssl, fd);
+
+        /* Enable hostname verification so the certificate CN/SAN must match
+         * the host portion of the target URL. */
+        if (!ignore_cert) {
+            /* Strip [] from IPv6 literal for SNI/hostname verification. */
+            const char *verify_host = host_header;
+            char stripped[256];
+            size_t hlen = strlen(host_header);
+            if (hlen >= 2 && host_header[0] == '[' && host_header[hlen - 1] == ']') {
+                size_t inner = hlen - 2;
+                if (inner >= sizeof(stripped)) inner = sizeof(stripped) - 1;
+                memcpy(stripped, host_header + 1, inner);
+                stripped[inner] = '\0';
+                verify_host = stripped;
+            }
+            SSL_set1_host(ssl, verify_host);
+        }
 
         /* Restore blocking mode for the TLS handshake. SSL_connect on a
            non-blocking socket may return -1 with SSL_ERROR_WANT_READ or
@@ -765,6 +802,25 @@ int ping_task_execute(const char *target, const char *type, ping_task_config_t *
         return -1;
     }
 
+    /* Reject targets containing CR/LF to prevent HTTP header injection
+     * when ping_task_http embeds the host in a request line. Also
+     * validates ping_type against the whitelist so an unknown type
+     * cannot bypass the check below. */
+    if (contains_crlf(target)) {
+        KOMARI_LOG_WARN("ping target rejected: contains CR/LF (header injection)");
+        memset(result, 0, sizeof(*result));
+        result->result = -1;
+        return -1;
+    }
+    if (strcmp(type, PING_TYPE_ICMP) != 0 &&
+        strcmp(type, PING_TYPE_TCP) != 0 &&
+        strcmp(type, PING_TYPE_HTTP) != 0) {
+        KOMARI_LOG_WARN("ping type rejected: not in {icmp,tcp,http}: %s", type);
+        memset(result, 0, sizeof(*result));
+        result->result = -1;
+        return -1;
+    }
+
     memset(result, 0, sizeof(*result));
     strncpy(result->ping_target, target, sizeof(result->ping_target) - 1);
     result->ping_target[sizeof(result->ping_target) - 1] = '\0';
@@ -775,6 +831,7 @@ int ping_task_execute(const char *target, const char *type, ping_task_config_t *
     const char *custom_dns = config ? config->custom_dns : NULL;
     int high_latency_threshold = config ? config->high_latency_threshold_ms : PING_HIGH_LATENCY_THRESHOLD_MS;
     int high_latency_retries = config ? config->high_latency_retries : PING_HIGH_LATENCY_RETRIES;
+    int ignore_cert = config ? config->ignore_cert : 0;
 
     int64_t latency = -1;
 
@@ -783,7 +840,7 @@ int ping_task_execute(const char *target, const char *type, ping_task_config_t *
     } else if (strcmp(type, PING_TYPE_TCP) == 0) {
         latency = ping_task_tcp(target, timeout_ms, custom_dns);
     } else if (strcmp(type, PING_TYPE_HTTP) == 0) {
-        latency = ping_task_http(target, timeout_ms, custom_dns);
+        latency = ping_task_http(target, timeout_ms, custom_dns, ignore_cert);
     } else {
         KOMARI_LOG_ERROR("Unsupported ping type: %s", type);
         result->result = -1;
@@ -802,7 +859,7 @@ int ping_task_execute(const char *target, const char *type, ping_task_config_t *
             } else if (strcmp(type, PING_TYPE_TCP) == 0) {
                 retry_latency = ping_task_tcp(target, timeout_ms, custom_dns);
             } else if (strcmp(type, PING_TYPE_HTTP) == 0) {
-                retry_latency = ping_task_http(target, timeout_ms, custom_dns);
+                retry_latency = ping_task_http(target, timeout_ms, custom_dns, ignore_cert);
             }
 
             if (retry_latency >= 0 && retry_latency <= high_latency_threshold) {

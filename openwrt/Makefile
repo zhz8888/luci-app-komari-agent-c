@@ -98,6 +98,15 @@ endef
 define Package/komari-agent-c/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] || {
+	# Create a dedicated system user/group so the agent can drop root
+	# privileges via procd_set_param user/group in the init script.
+	if ! id komari >/dev/null 2>&1; then
+		groupadd -r komari 2>/dev/null || groupadd komari 2>/dev/null || true
+		useradd -r -g komari -d / -s /bin/false komari 2>/dev/null || \
+			useradd -g komari -d / -s /bin/false komari 2>/dev/null || true
+	fi
+	# Grant CAP_NET_RAW so non-root ICMP ping still works after dropping root.
+	setcap cap_net_raw+ep /usr/bin/komari-agent-c 2>/dev/null || true
 	/etc/init.d/komari-agent-c enable
 }
 exit 0

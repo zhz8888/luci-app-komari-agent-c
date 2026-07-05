@@ -545,6 +545,15 @@ int autodiscovery_register(const char *endpoint,
         return -1;
     }
 
+    /* Enforce HTTPS for the registration endpoint. The auto_discovery_key
+     * is sent in an Authorization: Bearer header; transmitting it over plain
+     * HTTP would expose the credential to network sniffing. Reject non-HTTPS
+     * endpoints before constructing the request. */
+    if (strncmp(endpoint, "https://", 8) != 0) {
+        KOMARI_LOG_ERROR("Auto-discovery: endpoint must use HTTPS to protect the registration key");
+        return -1;
+    }
+
     /*
      * Design note: Unlike the authenticated endpoints (which pass the agent
      * token via URL query string, see websocket.c and report.c), the

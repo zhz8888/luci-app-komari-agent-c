@@ -43,6 +43,41 @@ static agent_config_t g_config;
 static ws_client_t *g_ws_client = NULL;
 static netstatic_t *g_netstatic = NULL;
 
+/* Detect CR/LF in a string to prevent HTTP header injection via panel-
+ * controlled fields (terminal_id, ping_target). Mirrors the helper in
+ * config.c and autodiscovery.c. */
+static int contains_crlf(const char *s) {
+    if (!s) return 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == '\r' || *p == '\n') return 1;
+    }
+    return 0;
+}
+
+/* Percent-encode a string for safe inclusion in a URL query parameter
+ * value. Encodes all characters except unreserved (A-Za-z0-9-_.~) as %XX.
+ * Returns the encoded length on success, -1 on buffer overflow. */
+static int url_encode_query(const char *in, char *out, size_t out_size) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t j = 0;
+    for (size_t i = 0; in[i]; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            if (j + 1 >= out_size) return -1;
+            out[j++] = (char)c;
+        } else {
+            if (j + 3 >= out_size) return -1;
+            out[j++] = '%';
+            out[j++] = hex[(c >> 4) & 0x0F];
+            out[j++] = hex[c & 0x0F];
+        }
+    }
+    out[j] = '\0';
+    return (int)j;
+}
+
 /**
  * Signal handler for graceful shutdown (SIGINT, SIGTERM).
  *
@@ -101,7 +136,7 @@ typedef struct {
                                  * across the WS receive thread and the monitor
                                  * thread to prevent use-after-free. */
     char ws_endpoint[512];     /* WebSocket endpoint URL (must match ws lifetime) */
-    char extra_query[80];      /* Extra query parameters (must match ws lifetime) */
+    char extra_query[256];     /* Extra query parameters (must match ws lifetime) */
 } terminal_session_t;
 
 /* Global registry of active terminal sessions so the main shutdown path can
@@ -315,6 +350,14 @@ static void *terminal_monitor_thread(void *arg) {
 
 /* Establish dedicated WebSocket connection for terminal and start pseudo-terminal session */
 static int establish_terminal_connection(const char *token, const char *request_id, const char *endpoint) {
+    /* Reject CR/LF in request_id to prevent HTTP header injection via the
+     * terminal WebSocket handshake query string. The panel-controlled
+     * terminal_id flows into the HTTP request line as &id=<request_id>. */
+    if (contains_crlf(request_id)) {
+        KOMARI_LOG_WARN("[Terminal] Rejected request_id containing CR/LF");
+        return -1;
+    }
+
     /* Enforce the concurrent session limit before allocating any resources so
      * that rejected requests do not leak memory or file descriptors. */
     if (terminal_acquire_session() != 0) {
@@ -366,8 +409,18 @@ static int establish_terminal_connection(const char *token, const char *request_
         session->ws_endpoint[sizeof(session->ws_endpoint) - 1] = '\0';
     }
 
-    /* Build extra query parameters */
-    snprintf(session->extra_query, sizeof(session->extra_query), "&id=%s", request_id);
+    /* Build extra query parameters. URL-encode request_id before splicing
+     * to satisfy the "already-encoded by caller" contract of ws_client and
+     * prevent query parameter injection via '&', '=', etc. */
+    char encoded_id[256];
+    if (url_encode_query(request_id, encoded_id, sizeof(encoded_id)) < 0) {
+        KOMARI_LOG_WARN("[Terminal] Failed to URL-encode request_id");
+        pthread_mutex_destroy(&session->term_mutex);
+        terminal_release_session();
+        free(session);
+        return -1;
+    }
+    snprintf(session->extra_query, sizeof(session->extra_query), "&id=%s", encoded_id);
 
     /* Create WebSocket client */
     ws_client_config_t ws_config = {0};
@@ -578,8 +631,6 @@ static void handle_ws_message(ws_client_t *client, const ws_message_t *msg) {
             KOMARI_LOG_INFO("[Terminal] Web SSH is disabled");
         }
     } else if (strcmp(msg->message, "exec") == 0) {
-        KOMARI_LOG_INFO("[Task] Executing command: %s (Task ID: %s)", msg->exec_command, msg->exec_task_id);
-
         char output[8192] = "";
         int exit_code = 0;
 
@@ -589,7 +640,19 @@ static void handle_ws_message(ws_client_t *client, const ws_message_t *msg) {
         char *argv_buf = NULL;
         char **argv = parse_exec_command_argv(msg->exec_command, &argv_buf);
         if (argv) {
-            if (utils_exec_command_argv(argv, output, sizeof(output), &exit_code) == 0) {
+            /* Log only the command name at DEBUG level to avoid leaking
+             * sensitive parameters into syslog. */
+            KOMARI_LOG_DEBUG("[Task] Executing: %s (Task ID: %s)", argv[0], msg->exec_task_id);
+
+            /* Reject execution from sensitive or traversed paths to shrink
+             * the attack surface (e.g. /proc/self/exe, ../tmp/payload). */
+            const char *cmd_path = argv[0];
+            if (strncmp(cmd_path, "/proc/", 6) == 0 ||
+                strncmp(cmd_path, "/sys/", 5) == 0 ||
+                strstr(cmd_path, "..") != NULL) {
+                KOMARI_LOG_WARN("[Task] Rejected exec from restricted path (Task ID: %s)",
+                                msg->exec_task_id);
+            } else if (utils_exec_command_argv(argv, output, sizeof(output), &exit_code) == 0) {
                 report_upload_task_result(&g_config, msg->exec_task_id, output, exit_code,
                                            utils_get_current_timestamp());
             }
@@ -608,6 +671,9 @@ static void handle_ws_message(ws_client_t *client, const ws_message_t *msg) {
             ping_config.timeout_ms = PING_DEFAULT_TIMEOUT_MS;
             ping_config.high_latency_threshold_ms = PING_HIGH_LATENCY_THRESHOLD_MS;
             ping_config.high_latency_retries = PING_HIGH_LATENCY_RETRIES;
+            /* Forward the agent's ignore_unsafe_cert setting so HTTPS ping
+             * targets verify certificates by default. */
+            ping_config.ignore_cert = g_config.ignore_unsafe_cert ? 1 : 0;
             if (g_config.custom_dns[0] != '\0') {
                 strncpy(ping_config.custom_dns, g_config.custom_dns, sizeof(ping_config.custom_dns) - 1);
             }

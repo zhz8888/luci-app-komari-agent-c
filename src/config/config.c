@@ -12,6 +12,7 @@
 #include <strings.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <sys/stat.h>
 
 #include "config.h"
 #include "utils.h"
@@ -224,10 +225,21 @@ int config_load_from_env(agent_config_t *config) {
 
 int config_load_from_file(agent_config_t *config, const char *path) {
     if (!config || !path) return -1;
-    
+
     FILE *f = fopen(path, "r");
     if (!f) return -1;
-    
+
+    /* Reject world/group-accessible config files to prevent token and
+     * auto_discovery_key leakage to local users. Only the owner should be
+     * able to read the file. */
+    struct stat st;
+    if (fstat(fileno(f), &st) == 0 && (st.st_mode & 077) != 0) {
+        KOMARI_LOG_WARN("Config file %s is group/world accessible (mode %03o); refusing to load. Use 'chmod 600 %s' to fix.",
+                        path, st.st_mode & 0777, path);
+        fclose(f);
+        return -1;
+    }
+
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     if (size < 0) {
