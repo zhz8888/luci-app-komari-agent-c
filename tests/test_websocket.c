@@ -935,13 +935,22 @@ static void reset_v2_handler_state(void) {
     g_v2_handler_calls = 0;
 }
 
+/* Helper to call ws_handle_v2_event with a JSON string. Parses the string
+ * and transfers ownership of the cJSON tree to ws_handle_v2_event, matching
+ * the production recv-thread call path. NULL json_str produces a NULL root.
+ * Invalid JSON also produces a NULL root, which the function rejects with -1. */
+static int ws_handle_v2_event_from_str(ws_client_t *client, const char *json_str) {
+    cJSON *root = json_str ? cJSON_Parse(json_str) : NULL;
+    return ws_handle_v2_event(client, root);
+}
+
 /* Test ws_handle_v2_event with NULL arguments returns -1. */
 void test_ws_handle_v2_event_null_args(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
 
-    TEST_ASSERT_EQUAL_INT(-1, ws_handle_v2_event(NULL, "{}"));
-    TEST_ASSERT_EQUAL_INT(-1, ws_handle_v2_event(client, NULL));
+    TEST_ASSERT_EQUAL_INT(-1, ws_handle_v2_event_from_str(NULL, "{}"));
+    TEST_ASSERT_EQUAL_INT(-1, ws_handle_v2_event_from_str(client, NULL));
 
     ws_client_destroy(client);
 }
@@ -951,7 +960,7 @@ void test_ws_handle_v2_event_invalid_json(void) {
     ws_client_t *client = ws_client_create(NULL);
     TEST_ASSERT_NOT_NULL(client);
 
-    TEST_ASSERT_EQUAL_INT(-1, ws_handle_v2_event(client, "not json"));
+    TEST_ASSERT_EQUAL_INT(-1, ws_handle_v2_event_from_str(client, "not json"));
 
     ws_client_destroy(client);
 }
@@ -969,7 +978,7 @@ void test_ws_handle_v2_event_dispatch_exec(void) {
         "\"method\":\"agent.exec\","
         "\"params\":{\"task_id\":\"task-001\",\"command\":\"uname -a\"}}";
 
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, event_json));
 
     /* Handler must have been called once with exec fields populated */
     TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);
@@ -998,7 +1007,7 @@ void test_ws_handle_v2_event_dispatch_ping(void) {
         "\"params\":{\"ping_task_id\":99,\"ping_type\":\"icmp\","
         "\"ping_target\":\"8.8.8.8\"}}";
 
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, event_json));
 
     TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);
     TEST_ASSERT_EQUAL_STRING("ping", g_v2_last_msg.message);
@@ -1026,7 +1035,7 @@ void test_ws_handle_v2_event_dispatch_terminal(void) {
         "\"method\":\"agent.terminal.request\","
         "\"params\":{\"request_id\":\"term-abc-123\"}}";
 
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, event_json));
 
     TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);
     TEST_ASSERT_EQUAL_STRING("term-abc-123", g_v2_last_msg.terminal_id);
@@ -1051,7 +1060,7 @@ void test_ws_handle_v2_event_dispatch_message_event(void) {
         "{\"jsonrpc\":\"2.0\",\"id\":\"55\","
         "\"method\":\"agent.message\","
         "\"params\":{\"text\":\"hello\"}}";
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, msg_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, msg_json));
     TEST_ASSERT_EQUAL_INT(0, g_v2_handler_calls);
     TEST_ASSERT_EQUAL_INT(1, client->v2_state.ack_count);
     TEST_ASSERT_EQUAL_INT(55, client->v2_state.ack_ids[0]);
@@ -1061,7 +1070,7 @@ void test_ws_handle_v2_event_dispatch_message_event(void) {
         "{\"jsonrpc\":\"2.0\",\"id\":\"56\","
         "\"method\":\"agent.event\","
         "\"params\":{\"type\":\"custom\"}}";
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, evt_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, evt_json));
     TEST_ASSERT_EQUAL_INT(0, g_v2_handler_calls);
     TEST_ASSERT_EQUAL_INT(2, client->v2_state.ack_count);
     TEST_ASSERT_EQUAL_INT(56, client->v2_state.ack_ids[1]);
@@ -1081,7 +1090,7 @@ void test_ws_handle_v2_event_unknown_method(void) {
         "\"method\":\"agent.unknown\","
         "\"params\":{}}";
 
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, event_json));
     TEST_ASSERT_EQUAL_INT(0, g_v2_handler_calls);
     /* Unknown method: not processed, no ACK */
     TEST_ASSERT_EQUAL_INT(0, client->v2_state.ack_count);
@@ -1103,13 +1112,13 @@ void test_ws_handle_v2_event_dedup(void) {
         "\"params\":{\"task_id\":\"t1\",\"command\":\"echo hi\"}}";
 
     /* First call: dispatched + ACKed */
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, event_json));
     TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);
     TEST_ASSERT_EQUAL_INT(1, client->v2_state.ack_count);
     TEST_ASSERT_EQUAL_INT(200, client->v2_state.ack_ids[0]);
 
     /* Second call with the same id: dedup skips dispatch but still ACKs */
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, event_json));
     TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);  /* still 1, not 2 */
     TEST_ASSERT_EQUAL_INT(2, client->v2_state.ack_count);
     TEST_ASSERT_EQUAL_INT(200, client->v2_state.ack_ids[1]);
@@ -1132,7 +1141,7 @@ void test_ws_handle_v2_event_numeric_id_ack(void) {
         "\"method\":\"agent.exec\","
         "\"params\":{\"task_id\":\"t2\",\"command\":\"echo num\"}}";
 
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, event_json));
     TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);
     TEST_ASSERT_EQUAL_STRING("t2", g_v2_last_msg.exec_task_id);
 
@@ -1141,7 +1150,7 @@ void test_ws_handle_v2_event_numeric_id_ack(void) {
     TEST_ASSERT_EQUAL_INT(333, client->v2_state.ack_ids[0]);
 
     /* Dedup also works for numeric IDs (string form "333") */
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, event_json));
     TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);  /* deduped */
     TEST_ASSERT_EQUAL_INT(2, client->v2_state.ack_count);
 
@@ -1161,12 +1170,12 @@ void test_ws_handle_v2_event_non_numeric_id_no_ack(void) {
         "\"method\":\"agent.message\","
         "\"params\":{}}";
 
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, event_json));
     /* agent.message: processed=true (logged), but ID is non-numeric -> no ACK */
     TEST_ASSERT_EQUAL_INT(0, client->v2_state.ack_count);
 
     /* Dedup still works for non-numeric IDs */
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, event_json));
     TEST_ASSERT_EQUAL_INT(0, client->v2_state.ack_count);
 
     ws_client_destroy(client);
@@ -1185,12 +1194,12 @@ void test_ws_handle_v2_event_no_id(void) {
         "\"params\":{\"task_id\":\"t3\",\"command\":\"echo noid\"}}";
 
     /* First call: dispatched, no ACK (no id) */
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, event_json));
     TEST_ASSERT_EQUAL_INT(1, g_v2_handler_calls);
     TEST_ASSERT_EQUAL_INT(0, client->v2_state.ack_count);
 
     /* Second call: also dispatched (no dedup without id), still no ACK */
-    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, event_json));
+    TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, event_json));
     TEST_ASSERT_EQUAL_INT(2, g_v2_handler_calls);
     TEST_ASSERT_EQUAL_INT(0, client->v2_state.ack_count);
 
@@ -1213,7 +1222,7 @@ void test_ws_handle_v2_event_ack_snapshot_clear(void) {
     };
 
     for (int i = 0; i < 3; i++) {
-        TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event(client, events[i]));
+        TEST_ASSERT_EQUAL_INT(0, ws_handle_v2_event_from_str(client, events[i]));
     }
     TEST_ASSERT_EQUAL_INT(3, client->v2_state.ack_count);
 

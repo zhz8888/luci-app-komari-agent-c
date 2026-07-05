@@ -35,57 +35,99 @@
 
 static const agent_config_t *g_config = NULL;
 
+/* Cross-call CPU sampling state. Previously monitoring_get_cpu_info blocked
+ * for 100ms on every call to measure a CPU usage delta inside the function.
+ * Since report_thread already invokes this once per second, we instead sample
+ * /proc/stat once per call and compute the delta against the previous call's
+ * snapshot. This removes the 100ms blocking and lets the thread respond to
+ * shutdown signals promptly. */
+static unsigned long long g_last_cpu_total = 0;
+static unsigned long long g_last_cpu_used = 0;
+static int g_cpu_sample_initialized = 0;
+
+/* Cached invariant CPU fields. cpu_name, cpu_cores and cpu_arch only change
+ * on reboot or CPU hotplug; re-reading /proc/cpuinfo every second is pure
+ * waste. Populate once on the first call. */
+static cpu_info_t g_cpu_invariants;
+static int g_cpu_invariants_cached = 0;
+
+/* Tiered sampling caches. disk/connections/process_count change slowly and
+ * require scanning multiple /proc files or all of /proc; refresh them every
+ * MONITORING_SLOW_TTL seconds instead of every report cycle. */
+#define MONITORING_SLOW_TTL_SEC 5
+static disk_info_t g_disk_cache;
+static conn_info_t g_conn_cache;
+static int g_process_count_cache = 0;
+static time_t g_disk_cache_ts = 0;
+static time_t g_conn_cache_ts = 0;
+static time_t g_process_count_ts = 0;
+
 void monitoring_set_config(const agent_config_t *config) {
     g_config = config;
 }
 
 int monitoring_get_cpu_info(cpu_info_t *info) {
     if (!info) return -1;
-    
+
     memset(info, 0, sizeof(cpu_info_t));
-    
-    info->cpu_cores = sysconf(_SC_NPROCESSORS_ONLN);
-    if (info->cpu_cores <= 0) info->cpu_cores = 1;
-    
+
+    /* Populate invariant fields (cpu_cores, cpu_arch, cpu_name) from cache
+     * on subsequent calls; refresh from /proc/cpuinfo only on the first
+     * call. These fields do not change at runtime. */
+    if (!g_cpu_invariants_cached) {
+        g_cpu_invariants.cpu_cores = sysconf(_SC_NPROCESSORS_ONLN);
+        if (g_cpu_invariants.cpu_cores <= 0) g_cpu_invariants.cpu_cores = 1;
+
 #if defined(__aarch64__)
-    strcpy(info->cpu_arch, "arm64");
+        strcpy(g_cpu_invariants.cpu_arch, "arm64");
 #elif defined(__arm__)
-    strcpy(info->cpu_arch, "arm");
+        strcpy(g_cpu_invariants.cpu_arch, "arm");
 #elif defined(__x86_64__)
-    strcpy(info->cpu_arch, "x86_64");
+        strcpy(g_cpu_invariants.cpu_arch, "x86_64");
 #elif defined(__i386__)
-    strcpy(info->cpu_arch, "i386");
+        strcpy(g_cpu_invariants.cpu_arch, "i386");
 #else
-    strcpy(info->cpu_arch, "unknown");
+        strcpy(g_cpu_invariants.cpu_arch, "unknown");
 #endif
 
-    FILE *fp = fopen("/proc/cpuinfo", "r");
-    if (fp) {
-        char line[256];
-        while (fgets(line, sizeof(line), fp)) {
-            if (strncmp(line, "model name", 10) == 0 ||
-                strncmp(line, "Model", 5) == 0 ||
-                strncmp(line, "cpu model", 9) == 0) {
-                char *colon = strchr(line, ':');
-                if (colon) {
-                    colon++;
-                    while (*colon == ' ') colon++;
-                    char *nl = strchr(colon, '\n');
-                    if (nl) *nl = '\0';
-                    strncpy(info->cpu_name, colon, sizeof(info->cpu_name) - 1);
-                    /* Explicit NUL termination in case source fills the buffer (MIN-50/51). */
-                    info->cpu_name[sizeof(info->cpu_name) - 1] = '\0';
+        FILE *fp = fopen("/proc/cpuinfo", "r");
+        if (fp) {
+            char line[256];
+            while (fgets(line, sizeof(line), fp)) {
+                if (strncmp(line, "model name", 10) == 0 ||
+                    strncmp(line, "Model", 5) == 0 ||
+                    strncmp(line, "cpu model", 9) == 0) {
+                    char *colon = strchr(line, ':');
+                    if (colon) {
+                        colon++;
+                        while (*colon == ' ') colon++;
+                        char *nl = strchr(colon, '\n');
+                        if (nl) *nl = '\0';
+                        strncpy(g_cpu_invariants.cpu_name, colon, sizeof(g_cpu_invariants.cpu_name) - 1);
+                        /* Explicit NUL termination in case source fills the buffer. */
+                        g_cpu_invariants.cpu_name[sizeof(g_cpu_invariants.cpu_name) - 1] = '\0';
+                    }
+                    break;
                 }
-                break;
             }
+            fclose(fp);
         }
-        fclose(fp);
+
+        if (g_cpu_invariants.cpu_name[0] == '\0') {
+            strcpy(g_cpu_invariants.cpu_name, "Unknown CPU");
+        }
+        g_cpu_invariants_cached = 1;
     }
-    
-    if (info->cpu_name[0] == '\0') {
-        strcpy(info->cpu_name, "Unknown CPU");
-    }
-    
+
+    info->cpu_cores = g_cpu_invariants.cpu_cores;
+    strncpy(info->cpu_arch, g_cpu_invariants.cpu_arch, sizeof(info->cpu_arch) - 1);
+    info->cpu_arch[sizeof(info->cpu_arch) - 1] = '\0';
+    strncpy(info->cpu_name, g_cpu_invariants.cpu_name, sizeof(info->cpu_name) - 1);
+    info->cpu_name[sizeof(info->cpu_name) - 1] = '\0';
+
+    /* Sample /proc/stat once and compute CPU usage against the previous
+     * call's snapshot, instead of blocking for 100ms inside this function.
+     * The first call has no baseline and reports 0.0% usage. */
     FILE *stat_fp = fopen("/proc/stat", "r");
     if (stat_fp) {
         unsigned long long user, nice, system, idle, iowait, irq, softirq;
@@ -93,69 +135,51 @@ int monitoring_get_cpu_info(cpu_info_t *info) {
                    &user, &nice, &system, &idle, &iowait, &irq, &softirq) == 7) {
             unsigned long long total = user + nice + system + idle + iowait + irq + softirq;
             unsigned long long used = user + nice + system + irq + softirq;
-            
-            /* Sleep in smaller increments for responsiveness.
-               Use nanosleep instead of the deprecated usleep (MIN-26).
-               Restart on EINTR to honor the configured 100ms sampling
-               window so the CPU usage delta is measured accurately. */
-            struct timespec sleep_ts;
-            sleep_ts.tv_sec = 0;
-            sleep_ts.tv_nsec = 10 * 1000 * 1000;  /* 10ms */
-            for (int i = 0; i < 10; i++) {
-                struct timespec req = sleep_ts;
-                while (nanosleep(&req, &req) == -1 && errno == EINTR) {
-                    /* Retry with remaining time updated by nanosleep. */
+
+            if (g_cpu_sample_initialized) {
+                /* Guard against counter wraparound or reset to avoid a
+                 * bogus spike when /proc/stat counters go backwards. */
+                unsigned long long total_diff = (total >= g_last_cpu_total) ? (total - g_last_cpu_total) : 0;
+                unsigned long long used_diff = (used >= g_last_cpu_used) ? (used - g_last_cpu_used) : 0;
+
+                if (total_diff > 0) {
+                    info->cpu_usage = (double)used_diff / (double)total_diff * 100.0;
                 }
             }
-            
-            /* MIN-68: Check fseek return value. If rewinding /proc/stat fails
-             * (e.g. on a transient I/O error or a sealed file descriptor),
-             * the second fscanf would re-read the already-consumed line and
-             * produce a zero delta. Skip the second sample so CPU usage
-             * falls back to 0.0% for this cycle instead of reporting a
-             * misleading value. */
-            if (fseek(stat_fp, 0, SEEK_SET) != 0) {
-                KOMARI_LOG_WARN("monitoring: fseek(/proc/stat) failed: %s",
-                                strerror(errno));
-                /* Fall through: cpu_usage stays at 0.0 for this cycle. */
-            } else {
-                unsigned long long user2, nice2, system2, idle2, iowait2, irq2, softirq2;
-                if (fscanf(stat_fp, "cpu %llu %llu %llu %llu %llu %llu %llu",
-                           &user2, &nice2, &system2, &idle2, &iowait2, &irq2, &softirq2) == 7) {
-                    unsigned long long total2 = user2 + nice2 + system2 + idle2 + iowait2 + irq2 + softirq2;
-                    unsigned long long used2 = user2 + nice2 + system2 + irq2 + softirq2;
 
-                    unsigned long long total_diff = total2 - total;
-                    unsigned long long used_diff = used2 - used;
-
-                    if (total_diff > 0) {
-                        info->cpu_usage = (double)used_diff / total_diff * 100.0;
-                    }
-                }
-            }
+            g_last_cpu_total = total;
+            g_last_cpu_used = used;
+            g_cpu_sample_initialized = 1;
         }
         fclose(stat_fp);
     }
-    
+
     return 0;
 }
 
-int monitoring_get_mem_info(mem_info_t *info) {
-    if (!info) return -1;
-    
-    memset(info, 0, sizeof(mem_info_t));
-    
+int monitoring_get_mem_swap_info(mem_info_t *mem, mem_info_t *swap) {
+    /* Parse /proc/meminfo once for both memory and swap fields. Previously
+     * monitoring_get_mem_info and monitoring_get_swap_info each opened and
+     * parsed the file independently, doubling the per-cycle
+     * fopen/fgets/sscanf cost. Either output pointer may be NULL to skip
+     * that portion. */
+    if (!mem && !swap) return -1;
+
+    if (mem) memset(mem, 0, sizeof(mem_info_t));
+    if (swap) memset(swap, 0, sizeof(mem_info_t));
+
     FILE *fp = fopen("/proc/meminfo", "r");
     if (!fp) return -1;
-    
+
     char line[256];
     unsigned long mem_total = 0, mem_free = 0, mem_available = 0;
     unsigned long buffers = 0, cached = 0, shmem = 0, sreclaimable = 0;
-    
+    unsigned long swap_total = 0, swap_free = 0;
+
     while (fgets(line, sizeof(line), fp)) {
         unsigned long value;
         char key[64];
-        
+
         if (sscanf(line, "%63[^:]: %lu", key, &value) == 2) {
             if (strcmp(key, "MemTotal") == 0) {
                 mem_total = value * 1024;
@@ -171,45 +195,7 @@ int monitoring_get_mem_info(mem_info_t *info) {
                 shmem = value * 1024;
             } else if (strcmp(key, "SReclaimable") == 0) {
                 sreclaimable = value * 1024;
-            }
-        }
-    }
-    fclose(fp);
-    
-    info->total = mem_total;
-    info->free = mem_free;
-    info->available = mem_available;
-    info->buffers = buffers;
-    info->cached = cached + sreclaimable;
-    
-    if (g_config && g_config->memory_include_cache) {
-        info->used = mem_total - mem_free;
-    } else if (mem_available > 0) {
-        info->used = mem_total - mem_available;
-    } else {
-        info->used = mem_total - mem_free - buffers - cached;
-    }
-    
-    return 0;
-}
-
-int monitoring_get_swap_info(mem_info_t *info) {
-    if (!info) return -1;
-    
-    memset(info, 0, sizeof(mem_info_t));
-    
-    FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return -1;
-    
-    char line[256];
-    unsigned long swap_total = 0, swap_free = 0;
-    
-    while (fgets(line, sizeof(line), fp)) {
-        unsigned long value;
-        char key[64];
-        
-        if (sscanf(line, "%63[^:]: %lu", key, &value) == 2) {
-            if (strcmp(key, "SwapTotal") == 0) {
+            } else if (strcmp(key, "SwapTotal") == 0) {
                 swap_total = value * 1024;
             } else if (strcmp(key, "SwapFree") == 0) {
                 swap_free = value * 1024;
@@ -217,19 +203,56 @@ int monitoring_get_swap_info(mem_info_t *info) {
         }
     }
     fclose(fp);
-    
-    info->total = swap_total;
-    info->free = swap_free;
-    info->used = swap_total - swap_free;
-    
+
+    if (mem) {
+        mem->total = mem_total;
+        mem->free = mem_free;
+        mem->available = mem_available;
+        mem->buffers = buffers;
+        mem->cached = cached + sreclaimable;
+
+        if (g_config && g_config->memory_include_cache) {
+            mem->used = mem_total - mem_free;
+        } else if (mem_available > 0) {
+            mem->used = mem_total - mem_available;
+        } else {
+            mem->used = mem_total - mem_free - buffers - cached;
+        }
+    }
+
+    if (swap) {
+        swap->total = swap_total;
+        swap->free = swap_free;
+        swap->used = swap_total - swap_free;
+    }
+
     return 0;
+}
+
+int monitoring_get_mem_info(mem_info_t *info) {
+    /* Thin wrapper for backward compatibility; delegates to the combined
+     * parser so /proc/meminfo is read once per cycle when callers invoke
+     * monitoring_get_mem_info and monitoring_get_swap_info back-to-back. */
+    return monitoring_get_mem_swap_info(info, NULL);
+}
+
+int monitoring_get_swap_info(mem_info_t *info) {
+    return monitoring_get_mem_swap_info(NULL, info);
 }
 
 int monitoring_get_disk_info(disk_info_t *info) {
     if (!info) return -1;
-    
+
+    /* Serve cached result if fresh, to avoid scanning /proc/mounts and
+     * statvfs on every mount point every report cycle. */
+    time_t now = time(NULL);
+    if (g_disk_cache_ts != 0 && now - g_disk_cache_ts < MONITORING_SLOW_TTL_SEC) {
+        *info = g_disk_cache;
+        return 0;
+    }
+
     memset(info, 0, sizeof(disk_info_t));
-    
+
     FILE *fp = fopen("/proc/mounts", "r");
     if (!fp) return -1;
     
@@ -293,6 +316,10 @@ int monitoring_get_disk_info(disk_info_t *info) {
      * exceeds total), info->free could be larger than info->total, which
      * would wrap to ~UINT64_MAX and report a nonsensical ~16 EB usage. */
     info->used = (info->free > info->total) ? 0 : (info->total - info->free);
+
+    /* Update cache so subsequent calls within the TTL skip the scan. */
+    g_disk_cache = *info;
+    g_disk_cache_ts = now;
 
     return 0;
 }
@@ -402,9 +429,17 @@ int monitoring_get_load_info(load_info_t *info) {
 
 int monitoring_get_conn_info(conn_info_t *info) {
     if (!info) return -1;
-    
+
+    /* Serve cached result if fresh, to avoid opening 4 /proc/net/* files
+     * and counting lines on every report cycle. */
+    time_t now = time(NULL);
+    if (g_conn_cache_ts != 0 && now - g_conn_cache_ts < MONITORING_SLOW_TTL_SEC) {
+        *info = g_conn_cache;
+        return 0;
+    }
+
     memset(info, 0, sizeof(conn_info_t));
-    
+
     FILE *fp = fopen("/proc/net/tcp", "r");
     if (fp) {
         char line[256];
@@ -414,7 +449,7 @@ int monitoring_get_conn_info(conn_info_t *info) {
         }
         fclose(fp);
     }
-    
+
     fp = fopen("/proc/net/tcp6", "r");
     if (fp) {
         char line[256];
@@ -424,7 +459,7 @@ int monitoring_get_conn_info(conn_info_t *info) {
         }
         fclose(fp);
     }
-    
+
     fp = fopen("/proc/net/udp", "r");
     if (fp) {
         char line[256];
@@ -434,7 +469,7 @@ int monitoring_get_conn_info(conn_info_t *info) {
         }
         fclose(fp);
     }
-    
+
     fp = fopen("/proc/net/udp6", "r");
     if (fp) {
         char line[256];
@@ -444,7 +479,11 @@ int monitoring_get_conn_info(conn_info_t *info) {
         }
         fclose(fp);
     }
-    
+
+    /* Update cache. */
+    g_conn_cache = *info;
+    g_conn_cache_ts = now;
+
     return 0;
 }
 
@@ -468,7 +507,7 @@ int monitoring_get_system_info(system_info_t *info) {
                         end--;
                     }
                     strncpy(info->os_name, eq, sizeof(info->os_name) - 1);
-                    /* Explicit NUL termination in case source fills the buffer (MIN-50/51). */
+                    /* Explicit NUL termination in case source fills the buffer. */
                     info->os_name[sizeof(info->os_name) - 1] = '\0';
                 }
                 break;
@@ -484,7 +523,7 @@ int monitoring_get_system_info(system_info_t *info) {
     struct utsname uts;
     if (uname(&uts) == 0) {
         strncpy(info->kernel_version, uts.release, sizeof(info->kernel_version) - 1);
-        /* Explicit NUL termination in case source fills the buffer (MIN-50/51). */
+        /* Explicit NUL termination in case source fills the buffer. */
         info->kernel_version[sizeof(info->kernel_version) - 1] = '\0';
         strncpy(info->arch, uts.machine, sizeof(info->arch) - 1);
         info->arch[sizeof(info->arch) - 1] = '\0';
@@ -506,10 +545,18 @@ uint64_t monitoring_get_uptime(void) {
 }
 
 int monitoring_get_process_count(void) {
+    /* Serve cached result if fresh, to avoid a full /proc readdir scan on
+     * every report cycle. On busy systems /proc can have thousands of
+     * entries. */
+    time_t now = time(NULL);
+    if (g_process_count_ts != 0 && now - g_process_count_ts < MONITORING_SLOW_TTL_SEC) {
+        return g_process_count_cache;
+    }
+
     int count = 0;
     DIR *dir = opendir("/proc");
-    if (!dir) return 0;
-    
+    if (!dir) return g_process_count_cache;  /* fall back to last known value */
+
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
@@ -526,7 +573,10 @@ int monitoring_get_process_count(void) {
         }
     }
     closedir(dir);
-    
+
+    g_process_count_cache = count;
+    g_process_count_ts = now;
+
     return count;
 }
 
@@ -555,7 +605,7 @@ int monitoring_get_ip_address(char *ipv4, size_t ipv4_len,
             if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
                            host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST) == 0) {
                 strncpy(ipv4, host, ipv4_len - 1);
-                /* Explicit NUL termination in case source fills the buffer (MIN-50/51). */
+                /* Explicit NUL termination in case source fills the buffer. */
                 ipv4[ipv4_len - 1] = '\0';
             }
         } else if (family == AF_INET6 && ipv6 && ipv6[0] == '\0') {

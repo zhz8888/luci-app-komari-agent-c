@@ -154,6 +154,20 @@ int jsonrpc_parse_response(const char *json_str, jsonrpc_response_t *response);
 int jsonrpc_parse_event(const char *json_str, jsonrpc_event_t *event);
 
 /**
+ * Parse a JSON-RPC event from an existing cJSON tree.
+ *
+ * This variant avoids re-parsing the JSON string when the caller already has
+ * a cJSON root (e.g. the WebSocket recv thread that inspects the jsonrpc
+ * field to detect v2 messages). The caller retains ownership of root.
+ *
+ * @param root  Parsed cJSON tree (must not be NULL).
+ * @param event Output parsed event structure. The caller must call
+ *              jsonrpc_free_event to release resources after use.
+ * @return 0 on success, -1 on failure.
+ */
+int jsonrpc_parse_event_from_json(cJSON *root, jsonrpc_event_t *event);
+
+/**
  * Free the request structure and its internal resources.
  *
  * @param req Pointer to the request structure to free.

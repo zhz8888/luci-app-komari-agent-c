@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <openssl/ssl.h>
 
+#include "cJSON.h"
 #include "config.h"
 #include "monitoring.h"
 #include "v2.h"
@@ -264,11 +265,14 @@ int ws_fragment_accumulate(ws_client_t *client, int opcode, int fin,
  * or non-numeric, ACK accumulation is skipped (the C v2 interface uses
  * int ACK IDs, matching v2_add_ack_event).
  *
- * @param client   Pointer to the WebSocket client.
- * @param json_str NUL-terminated JSON-RPC event string.
+ * @param client Pointer to the WebSocket client.
+ * @param root   Parsed cJSON tree of the JSON-RPC event. Ownership is
+ *               transferred to this function, which frees it via cJSON_Delete
+ *               before returning. The caller must not free or reuse root
+ *               after this call. Passing NULL is invalid and returns -1.
  * @return 0 on success (event processed or duplicate skipped),
  *         -1 on parse failure or invalid arguments.
  */
-int ws_handle_v2_event(ws_client_t *client, const char *json_str);
+int ws_handle_v2_event(ws_client_t *client, cJSON *root);
 
 #endif

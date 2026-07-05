@@ -88,6 +88,20 @@ int monitoring_get_mem_info(mem_info_t *info);
 int monitoring_get_swap_info(mem_info_t *info);
 
 /**
+ * Get memory and swap information in a single /proc/meminfo read.
+ *
+ * report_generate calls monitoring_get_mem_info and monitoring_get_swap_info
+ * back-to-back every cycle; each opened /proc/meminfo independently. This
+ * combined interface parses the file once and populates both structures,
+ * halving the per-cycle fopen/parse cost.
+ *
+ * @param mem  Output memory info structure (may be NULL to skip memory)
+ * @param swap Output swap info structure (may be NULL to skip swap)
+ * @return 0 on success, -1 on failure
+ */
+int monitoring_get_mem_swap_info(mem_info_t *mem, mem_info_t *swap);
+
+/**
  * Get disk usage information aggregated across mounted filesystems.
  *
  * @param info Output disk info structure

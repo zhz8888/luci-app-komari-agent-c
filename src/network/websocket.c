@@ -137,7 +137,7 @@ static int compute_accept_key(const char *key, char *accept_key, size_t accept_k
     ret = snprintf(combined, sizeof(combined), "%s%s", key, WS_MAGIC_KEY);
     if (ret < 0 || (size_t)ret >= sizeof(combined)) {
         /* Truncation would produce a wrong SHA1 and break the handshake
-         * verification (MAJ-11). */
+         * verification. */
         return -1;
     }
 
@@ -753,11 +753,10 @@ static void *ws_recv_thread(void *arg) {
                         method && cJSON_IsString(method)) {
                         /* v2 JSON-RPC event: dispatch to the v2 handler which
                          * handles dedup, method-based dispatch and ACK
-                         * accumulation. ws_handle_v2_event re-parses the JSON
-                         * internally via jsonrpc_parse_event, so free root
-                         * here to avoid a leak. */
-                        cJSON_Delete(root);
-                        ws_handle_v2_event(client, msg_data);
+                         * accumulation. ws_handle_v2_event takes ownership of
+                         * root (frees it internally) to avoid re-parsing the
+                         * JSON string. */
+                        ws_handle_v2_event(client, root);
                     } else {
                         /* v1 message: extract fields and invoke handler */
                         ws_message_t msg = {0};
@@ -982,18 +981,28 @@ static uint32_t v2_extract_uint32(const cJSON *obj, const char *field) {
  *
  * Returns 0 on success (event processed or duplicate skipped), -1 on parse
  * failure or invalid arguments. */
-int ws_handle_v2_event(ws_client_t *client, const char *json_str) {
-    if (!client || !json_str) return -1;
+int ws_handle_v2_event(ws_client_t *client, cJSON *root) {
+    /* Accept an already-parsed cJSON tree instead of re-parsing the JSON
+     * string. The recv thread parses once to detect v2 messages; this
+     * function reuses that root for event extraction and numeric id lookup,
+     * eliminating two redundant cJSON_Parse calls per event. Ownership of
+     * root is transferred; this function frees it before returning. */
+    if (!client || !root) {
+        if (root) cJSON_Delete(root);
+        return -1;
+    }
 
     jsonrpc_event_t event;
-    if (jsonrpc_parse_event(json_str, &event) != 0) {
+    if (jsonrpc_parse_event_from_json(root, &event) != 0) {
+        cJSON_Delete(root);
         return -1;
     }
 
     /* Determine the event ID for dedup and ACK.
-     * jsonrpc_parse_event only captures string IDs; when event.id is NULL we
-     * re-parse the raw JSON to check for a numeric ID, so ACK accumulation
-     * works for both string and numeric event IDs (per SubTask 7.4). */
+     * jsonrpc_parse_event_from_json only captures string IDs; when event.id
+     * is NULL we inspect the already-parsed root for a numeric id field, so
+     * ACK accumulation works for both string and numeric event IDs without
+     * a second cJSON_Parse. */
     const char *id_str = NULL;       /* String form of ID, used for dedup */
     char id_buf[32] = {0};           /* Buffer for numeric ID rendered as string */
     int ack_id = 0;                  /* Numeric ID for ACK (0 = skip ACK) */
@@ -1007,27 +1016,23 @@ int ws_handle_v2_event(ws_client_t *client, const char *json_str) {
             ack_id = (int)val;
         }
     } else {
-        /* Fall back to checking the raw JSON for a numeric id field */
-        cJSON *root = cJSON_Parse(json_str);
-        if (root) {
-            cJSON *id_node = cJSON_GetObjectItem(root, "id");
-            if (id_node && cJSON_IsNumber(id_node)) {
-                long val = (long)id_node->valuedouble;
-                if (val > 0) {
-                    int id_ret;
-                    ack_id = (int)val;
-                    id_ret = snprintf(id_buf, sizeof(id_buf), "%ld", val);
-                    if (id_ret < 0 || (size_t)id_ret >= sizeof(id_buf)) {
-                        /* Truncation only happens for values exceeding 31
-                         * digits, which cannot fit in an int anyway. Log and
-                         * skip dedup for this event (MAJ-11). */
-                        KOMARI_LOG_WARN("[v2] Event id %ld truncated for dedup", val);
-                    } else {
-                        id_str = id_buf;
-                    }
+        /* Check the existing root for a numeric id field (no re-parse). */
+        cJSON *id_node = cJSON_GetObjectItem(root, "id");
+        if (id_node && cJSON_IsNumber(id_node)) {
+            long val = (long)id_node->valuedouble;
+            if (val > 0) {
+                int id_ret;
+                ack_id = (int)val;
+                id_ret = snprintf(id_buf, sizeof(id_buf), "%ld", val);
+                if (id_ret < 0 || (size_t)id_ret >= sizeof(id_buf)) {
+                    /* Truncation only happens for values exceeding 31
+                     * digits, which cannot fit in an int anyway. Log and
+                     * skip dedup for this event. */
+                    KOMARI_LOG_WARN("[v2] Event id %ld truncated for dedup", val);
+                } else {
+                    id_str = id_buf;
                 }
             }
-            cJSON_Delete(root);
         }
     }
 
@@ -1105,6 +1110,7 @@ int ws_handle_v2_event(ws_client_t *client, const char *json_str) {
     }
 
     jsonrpc_free_event(&event);
+    cJSON_Delete(root);
     return 0;
 }
 
@@ -1215,14 +1221,14 @@ int ws_client_connect(ws_client_t *client) {
     if (ws_client_should_use_v2(client)) {
         int path_ret = snprintf(path, WS_PATH_MAX, "%s", V2_RPC_ENDPOINT);
         if (path_ret < 0 || (size_t)path_ret >= WS_PATH_MAX) {
-            KOMARI_LOG_WARN("v2 RPC endpoint path truncated (MAJ-11)");
+            KOMARI_LOG_WARN("v2 RPC endpoint path truncated");
             ws_client_note_protocol_result(client, false);
             return -1;
         }
     } else {
         int path_ret = snprintf(path, WS_PATH_MAX, "%s", "/api/clients/report");
         if (path_ret < 0 || (size_t)path_ret >= WS_PATH_MAX) {
-            KOMARI_LOG_WARN("v1 report endpoint path truncated (MAJ-11)");
+            KOMARI_LOG_WARN("v1 report endpoint path truncated");
             ws_client_note_protocol_result(client, false);
             return -1;
         }
@@ -1243,8 +1249,8 @@ int ws_client_connect(ws_client_t *client) {
     int port_ret = snprintf(port_str, sizeof(port_str), "%d", port);
     if (port_ret < 0 || (size_t)port_ret >= sizeof(port_str)) {
         /* Port is validated by parse_url as 1..65535, so at most 5 digits.
-         * Truncation is impossible in practice but check anyway (MAJ-11). */
-        KOMARI_LOG_WARN("Port string truncated (MAJ-11)");
+         * Truncation is impossible in practice but check anyway. */
+        KOMARI_LOG_WARN("Port string truncated");
         ws_client_note_protocol_result(client, false);
         return -1;
     }

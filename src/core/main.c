@@ -703,7 +703,13 @@ static void *report_thread(void *arg) {
          * the agent has already processed. The snapshot is taken under the
          * v2 state mutex, so it is safe even if the recv thread is
          * concurrently adding new ACKs via ws_handle_v2_event. */
-        int ack_buf[256];
+        /* Size the snapshot buffer to V2_ACK_IDS_MAX so the full pending
+         * ACK set is reported in a single cycle. A 256-entry buffer silently
+         * truncated to 256 while v2_clear_acks removed all 1024,
+         * dropping 768 unreported ACKs and causing the server to retransmit
+         * those events every cycle. 4 KB of stack is acceptable for a 1 Hz
+         * report path. */
+        int ack_buf[V2_ACK_IDS_MAX];
         int ack_count = 0;
         int len;
 

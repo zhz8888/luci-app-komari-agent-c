@@ -18,6 +18,12 @@
 #include "logger.h"
 #include "cJSON.h"
 
+/* Hard cap on per-interface sample count. At the default detect_interval=2s
+ * this covers ~4.6 days of raw samples; older samples are dropped via
+ * netstatic_cleanup_old_data and the in-collect overflow path. Prevents the
+ * 31-day buffer from growing to ~32MB per interface. */
+#define NETSTATIC_MAX_SAMPLES_PER_INTERFACE 200000
+
 /* Collect per-interface traffic deltas from /proc/net/dev for tracked interfaces. */
 static void netstatic_collect(netstatic_t *ns) {
     FILE *fp = fopen("/proc/net/dev", "r");
@@ -58,18 +64,31 @@ static void netstatic_collect(netstatic_t *ns) {
                     is->last_rx = rx_bytes;
                     
                     if (is->data_count >= is->data_capacity) {
-                        size_t new_cap = is->data_capacity * 2;
-                        traffic_data_t *new_data = realloc(is->data, new_cap * sizeof(traffic_data_t));
-                        if (new_data) {
-                            memset(new_data + is->data_capacity, 0, (new_cap - is->data_capacity) * sizeof(traffic_data_t));
-                            is->data = new_data;
-                            is->data_capacity = new_cap;
+                        /* Stop growing once we hit the hard cap; instead drop
+                         * the oldest sample to make room for the new one. This
+                         * bounds memory at cap * sizeof(traffic_data_t)
+                         * regardless of how long the worker runs between saves. */
+                        if (is->data_capacity >= NETSTATIC_MAX_SAMPLES_PER_INTERFACE) {
+                            memmove(is->data, is->data + 1,
+                                    (is->data_count - 1) * sizeof(traffic_data_t));
+                            is->data_count--;
                         } else {
-                            fprintf(stderr, "Warning: Failed to realloc network stats data\n");
-                            break;
+                            size_t new_cap = is->data_capacity * 2;
+                            if (new_cap > NETSTATIC_MAX_SAMPLES_PER_INTERFACE) {
+                                new_cap = NETSTATIC_MAX_SAMPLES_PER_INTERFACE;
+                            }
+                            traffic_data_t *new_data = realloc(is->data, new_cap * sizeof(traffic_data_t));
+                            if (new_data) {
+                                memset(new_data + is->data_capacity, 0, (new_cap - is->data_capacity) * sizeof(traffic_data_t));
+                                is->data = new_data;
+                                is->data_capacity = new_cap;
+                            } else {
+                                KOMARI_LOG_ERROR("netstatic: realloc failed for interface %s", is->name);
+                                break;
+                            }
                         }
                     }
-                    
+
                     if (is->data_count < is->data_capacity) {
                         is->data[is->data_count].timestamp = utils_get_current_timestamp();
                         is->data[is->data_count].tx = tx_delta;
@@ -86,49 +105,167 @@ static void netstatic_collect(netstatic_t *ns) {
     fclose(fp);
 }
 
-/* Remove traffic samples older than the configured preserve-days window. */
+/* Remove traffic samples older than the configured preserve-days window.
+ * Also enforces a hard cap on per-interface sample count to prevent unbounded
+ * memory growth when the preserve window is large or the collect interval is
+ * short. When the cap is reached, the oldest samples are dropped to make room
+ * for new ones. */
 static void netstatic_cleanup_old_data(netstatic_t *ns) {
     uint64_t now = utils_get_current_timestamp();
     uint64_t cutoff = now - (uint64_t)(ns->data_preserve_days * 86400);
-    
+
     for (size_t i = 0; i < ns->interface_count; i++) {
         interface_stats_t *is = &ns->interfaces[i];
-        
-        size_t write_idx = 0;
-        for (size_t j = 0; j < is->data_count; j++) {
-            if (is->data[j].timestamp >= cutoff) {
-                if (write_idx != j) {
-                    is->data[write_idx] = is->data[j];
-                }
-                write_idx++;
-            }
+
+        /* Drop samples older than the preserve window. Samples are appended
+         * in chronological order, so we can stop scanning at the first sample
+         * that falls inside the window. */
+        size_t first_valid = 0;
+        while (first_valid < is->data_count && is->data[first_valid].timestamp < cutoff) {
+            first_valid++;
         }
-        is->data_count = write_idx;
+        if (first_valid > 0) {
+            size_t remaining = is->data_count - first_valid;
+            if (remaining > 0) {
+                memmove(is->data, is->data + first_valid, remaining * sizeof(traffic_data_t));
+            }
+            is->data_count = remaining;
+        }
+
+        /* Enforce hard cap: if still over the limit, drop the oldest samples. */
+        size_t cap = NETSTATIC_MAX_SAMPLES_PER_INTERFACE;
+        if (is->data_count > cap) {
+            size_t excess = is->data_count - cap;
+            memmove(is->data, is->data + excess, cap * sizeof(traffic_data_t));
+            is->data_count = cap;
+        }
     }
 }
 
-/* Background worker thread: periodically collects traffic samples and saves to disk. */
+/* Serialize the entire netstatic state to a heap-allocated buffer. This runs
+ * while the caller holds ns->mutex; the resulting buffer is then written to
+ * disk outside the lock so long fprintf/fwrite I/O does not block LuCI
+ * queries (netstatic_get_monthly_traffic). Returns NULL on failure. */
+static char *netstatic_serialize(netstatic_t *ns, size_t *out_len) {
+    char *buf = NULL;
+    size_t buf_len = 0;
+    FILE *mem = open_memstream(&buf, &buf_len);
+    if (!mem) return NULL;
+
+    int rc = 0;
+
+    if (fprintf(mem, "{\n") < 0 ||
+        fprintf(mem, "  \"config\": {\n") < 0 ||
+        fprintf(mem, "    \"data_preserve_day\": %.1f,\n", ns->data_preserve_days) < 0 ||
+        fprintf(mem, "    \"detect_interval\": %.1f,\n", ns->detect_interval) < 0 ||
+        fprintf(mem, "    \"save_interval\": %.1f\n", ns->save_interval) < 0 ||
+        fprintf(mem, "  },\n") < 0 ||
+        fprintf(mem, "  \"interfaces\": {\n") < 0) {
+        rc = -1;
+        goto done;
+    }
+
+    for (size_t i = 0; i < ns->interface_count; i++) {
+        interface_stats_t *is = &ns->interfaces[i];
+
+        char *escaped_name = utils_json_escape(is->name);
+        if (!escaped_name) {
+            rc = -1;
+            goto done;
+        }
+
+        if (fprintf(mem, "    \"%s\": [\n", escaped_name) < 0) {
+            free(escaped_name);
+            rc = -1;
+            goto done;
+        }
+        free(escaped_name);
+
+        for (size_t j = 0; j < is->data_count; j++) {
+            if (fprintf(mem, "      {\"timestamp\": %" PRIu64 ", \"tx\": %" PRIu64 ", \"rx\": %" PRIu64 "}%s\n",
+                        is->data[j].timestamp,
+                        is->data[j].tx,
+                        is->data[j].rx,
+                        (j < is->data_count - 1) ? "," : "") < 0) {
+                rc = -1;
+                goto done;
+            }
+        }
+
+        if (fprintf(mem, "    ]%s\n", (i < ns->interface_count - 1) ? "," : "") < 0) {
+            rc = -1;
+            goto done;
+        }
+    }
+
+    if (fprintf(mem, "  }\n}\n") < 0) {
+        rc = -1;
+    }
+
+done:
+    fclose(mem);
+    if (rc != 0) {
+        free(buf);
+        return NULL;
+    }
+    *out_len = buf_len;
+    return buf;
+}
+
+/* Write a pre-serialized buffer to disk. This runs without holding ns->mutex
+ * so slow disk I/O (especially on flash storage) does not block concurrent
+ * readers. Returns 0 on success, -1 on failure. */
+static int netstatic_write_to_disk(const char *path, const char *buf, size_t buf_len) {
+    if (!path || !path[0] || !buf) return -1;
+
+    FILE *fp = fopen(path, "w");
+    if (!fp) return -1;
+
+    int rc = 0;
+    if (fwrite(buf, 1, buf_len, fp) != buf_len) {
+        rc = -1;
+    }
+    if (fclose(fp) != 0) {
+        rc = -1;
+    }
+    return rc;
+}
+
+/* Background worker thread: periodically collects traffic samples and saves
+ * to disk. Serialization runs under the lock (needed to read interfaces[]),
+ * but the actual disk write happens after unlocking so LuCI queries are not
+ * blocked by flash I/O. */
 static void *netstatic_worker(void *arg) {
     netstatic_t *ns = (netstatic_t *)arg;
-    
+
     useconds_t detect_us = (useconds_t)(ns->detect_interval * 1000000);
     uint64_t last_save = 0;
-    
+
     while (ns->running) {
         pthread_mutex_lock(&ns->mutex);
         netstatic_collect(ns);
-        
+
         uint64_t now = utils_get_current_timestamp();
+        char *snapshot = NULL;
+        size_t snapshot_len = 0;
         if (now - last_save >= (uint64_t)ns->save_interval) {
             netstatic_cleanup_old_data(ns);
-            netstatic_save(ns);
+            /* Serialize under the lock, then write to disk after unlocking. */
+            snapshot = netstatic_serialize(ns, &snapshot_len);
             last_save = now;
         }
         pthread_mutex_unlock(&ns->mutex);
-        
+
+        if (snapshot) {
+            if (netstatic_write_to_disk(ns->save_path, snapshot, snapshot_len) != 0) {
+                KOMARI_LOG_ERROR("netstatic: failed to write %s", ns->save_path);
+            }
+            free(snapshot);
+        }
+
         usleep(detect_us);
     }
-    
+
     return NULL;
 }
 
@@ -303,64 +440,15 @@ int netstatic_get_monthly_traffic(netstatic_t *ns, const char *iface,
 int netstatic_save(netstatic_t *ns) {
     if (!ns || !ns->save_path[0]) return -1;
 
-    FILE *fp = fopen(ns->save_path, "w");
-    if (!fp) return -1;
+    /* Reuse the serialize + write_to_disk split so external callers
+     * (netstatic_stop, etc.) benefit from the same code path. Callers of
+     * netstatic_save must still hold ns->mutex. */
+    size_t buf_len = 0;
+    char *buf = netstatic_serialize(ns, &buf_len);
+    if (!buf) return -1;
 
-    int rc = 0;
-
-    if (fprintf(fp, "{\n") < 0 ||
-        fprintf(fp, "  \"config\": {\n") < 0 ||
-        fprintf(fp, "    \"data_preserve_day\": %.1f,\n", ns->data_preserve_days) < 0 ||
-        fprintf(fp, "    \"detect_interval\": %.1f,\n", ns->detect_interval) < 0 ||
-        fprintf(fp, "    \"save_interval\": %.1f\n", ns->save_interval) < 0 ||
-        fprintf(fp, "  },\n") < 0 ||
-        fprintf(fp, "  \"interfaces\": {\n") < 0) {
-        rc = -1;
-        goto done;
-    }
-
-    for (size_t i = 0; i < ns->interface_count; i++) {
-        interface_stats_t *is = &ns->interfaces[i];
-
-        /* Escape the interface name so quotes/backslashes/control chars in
-           the name cannot break the surrounding JSON structure. */
-        char *escaped_name = utils_json_escape(is->name);
-        if (!escaped_name) {
-            rc = -1;
-            goto done;
-        }
-
-        if (fprintf(fp, "    \"%s\": [\n", escaped_name) < 0) {
-            free(escaped_name);
-            rc = -1;
-            goto done;
-        }
-        free(escaped_name);
-
-        for (size_t j = 0; j < is->data_count; j++) {
-            if (fprintf(fp, "      {\"timestamp\": %" PRIu64 ", \"tx\": %" PRIu64 ", \"rx\": %" PRIu64 "}%s\n",
-                        is->data[j].timestamp,
-                        is->data[j].tx,
-                        is->data[j].rx,
-                        (j < is->data_count - 1) ? "," : "") < 0) {
-                rc = -1;
-                goto done;
-            }
-        }
-
-        if (fprintf(fp, "    ]%s\n", (i < ns->interface_count - 1) ? "," : "") < 0) {
-            rc = -1;
-            goto done;
-        }
-    }
-
-    if (fprintf(fp, "  }\n") < 0 ||
-        fprintf(fp, "}\n") < 0) {
-        rc = -1;
-    }
-
-done:
-    fclose(fp);
+    int rc = netstatic_write_to_disk(ns->save_path, buf, buf_len);
+    free(buf);
     return rc;
 }
 

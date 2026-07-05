@@ -228,18 +228,16 @@ int jsonrpc_parse_response(const char *json_str, jsonrpc_response_t *response)
     return 0;
 }
 
-int jsonrpc_parse_event(const char *json_str, jsonrpc_event_t *event)
+int jsonrpc_parse_event_from_json(cJSON *root, jsonrpc_event_t *event)
 {
-    if (!json_str || !event) {
+    /* Extract event fields from an already-parsed cJSON tree to avoid
+     * re-parsing the JSON string when the caller already has a root. The
+     * caller retains ownership of root. */
+    if (!root || !event) {
         return -1;
     }
 
     memset(event, 0, sizeof(*event));
-
-    cJSON *root = cJSON_Parse(json_str);
-    if (!root) {
-        return -1;
-    }
 
     cJSON *id = cJSON_GetObjectItem(root, "id");
     if (id && cJSON_IsString(id)) {
@@ -266,8 +264,23 @@ int jsonrpc_parse_event(const char *json_str, jsonrpc_event_t *event)
         event->expires_at = jsonrpc_strdup_safe(expires_at->valuestring);
     }
 
-    cJSON_Delete(root);
     return 0;
+}
+
+int jsonrpc_parse_event(const char *json_str, jsonrpc_event_t *event)
+{
+    if (!json_str || !event) {
+        return -1;
+    }
+
+    cJSON *root = cJSON_Parse(json_str);
+    if (!root) {
+        return -1;
+    }
+
+    int ret = jsonrpc_parse_event_from_json(root, event);
+    cJSON_Delete(root);
+    return ret;
 }
 
 void jsonrpc_free_request(jsonrpc_request_t *req)

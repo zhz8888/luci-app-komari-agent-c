@@ -173,8 +173,7 @@ int report_generate(const agent_config_t *config, char *buf, size_t buf_len) {
     conn_info_t conn;
     
     monitoring_get_cpu_info(&cpu);
-    monitoring_get_mem_info(&mem);
-    monitoring_get_swap_info(&swap);
+    monitoring_get_mem_swap_info(&mem, &swap);
     monitoring_get_disk_info(&disk);
     monitoring_get_net_info(&net);
     monitoring_get_load_info(&load);
@@ -289,41 +288,45 @@ int report_generate_v2_with_acks(const agent_config_t *config, char *buf,
     if (v1_len <= 0) return -1;
     v1_buf[sizeof(v1_buf) - 1] = '\0';
 
-    /* Parse the v1 JSON into a cJSON object so jsonrpc_build_report_request
-     * can attach it under params.report. cJSON_Parse is thread-safe.
-     *
-     * Ownership of `data` is transferred to jsonrpc_build_report_request on
-     * success, and the builder also frees `data` on every failure path
-     * (MIN-43). Do NOT free `data` here after a builder failure - that
-     * would be a double-free when the builder already freed it via
-     * cJSON_Delete(params). */
-    cJSON *data = cJSON_Parse(v1_buf);
-    if (!data) return -1;
-
-    /* Build a v2 JSON-RPC request with the ACK IDs. The request id is derived
-     * from the current time so each report cycle uses a distinct value (the
-     * server uses it only for request/response correlation, not for dedup).
-     * jsonrpc_build_report_request takes ownership of `data` on input. */
+    /* Build the v2 JSON-RPC envelope by direct string concatenation instead
+     * of cJSON_Parse(v1) → jsonrpc_build_report_request → cJSON_Print. The v1
+     * JSON produced by report_generate contains only numeric fields and an
+     * empty message string, so it can be embedded verbatim under
+     * params.report without re-escaping. This eliminates 4-6 heap malloc/free
+     * operations per cycle on the 1 Hz report path. */
     int request_id = (int)time(NULL);
-    cJSON *root = jsonrpc_build_report_request(request_id, data, ack_ids, ack_count);
-    if (!root) {
-        /* data has been freed by the builder (MIN-43). */
-        return -1;
+    int offset = 0;
+
+    /* Envelope header up to the report value. */
+    int n = snprintf(buf + offset, buf_len - (size_t)offset,
+                     "{\"jsonrpc\":\"2.0\",\"method\":\"%s\",\"id\":%d,\"params\":{\"report\":",
+                     AGENT_REPORT, request_id);
+    if (n < 0 || (size_t)n >= buf_len - (size_t)offset) return -1;
+    offset += n;
+
+    /* Embed the v1 JSON verbatim — it is already a complete, valid JSON object. */
+    if ((size_t)v1_len >= buf_len - (size_t)offset) return -1;
+    memcpy(buf + offset, v1_buf, (size_t)v1_len);
+    offset += v1_len;
+
+    /* ACK array: always present (empty if no ACKs) for schema consistency
+     * with the previous cJSON-based implementation. */
+    n = snprintf(buf + offset, buf_len - (size_t)offset, ",\"ack_event_ids\":[");
+    if (n < 0 || (size_t)n >= buf_len - (size_t)offset) return -1;
+    offset += n;
+
+    for (int i = 0; i < ack_count && ack_ids; i++) {
+        n = snprintf(buf + offset, buf_len - (size_t)offset, "%s%d",
+                     i > 0 ? "," : "", ack_ids[i]);
+        if (n < 0 || (size_t)n >= buf_len - (size_t)offset) return -1;
+        offset += n;
     }
 
-    char *json_str = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (!json_str) return -1;
+    n = snprintf(buf + offset, buf_len - (size_t)offset, "]}}");
+    if (n < 0 || (size_t)n >= buf_len - (size_t)offset) return -1;
+    offset += n;
 
-    size_t json_len = strlen(json_str);
-    if (json_len >= buf_len) {
-        free(json_str);
-        return -1;
-    }
-    memcpy(buf, json_str, json_len + 1);
-    free(json_str);
-
-    return (int)json_len;
+    return offset;
 }
 
 int report_generate_basic_info(const agent_config_t *config, char *buf, size_t buf_len) {
@@ -336,8 +339,7 @@ int report_generate_basic_info(const agent_config_t *config, char *buf, size_t b
     char ipv4[64] = "", ipv6[128] = "";
     
     monitoring_get_cpu_info(&cpu);
-    monitoring_get_mem_info(&mem);
-    monitoring_get_swap_info(&swap);
+    monitoring_get_mem_swap_info(&mem, &swap);
     monitoring_get_disk_info(&disk);
     monitoring_get_system_info(&sys);
     monitoring_get_ip_address(ipv4, sizeof(ipv4), ipv6, sizeof(ipv6));
