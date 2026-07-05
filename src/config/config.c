@@ -244,9 +244,16 @@ int config_load_from_file(agent_config_t *config, const char *path) {
     
     size_t bytes_read = fread(json, 1, size, f);
     if (bytes_read != (size_t)size) {
+        /* Partial read usually indicates an underlying I/O problem (file
+         * truncated after ftell, NFS interruption, etc.). Treat it as an
+         * error instead of parsing potentially uninitialized memory between
+         * bytes_read and size. */
         fprintf(stderr, "Warning: Config file read incomplete: %zu/%ld bytes\n", bytes_read, size);
+        free(json);
+        fclose(f);
+        return -1;
     }
-    json[size] = '\0';
+    json[bytes_read] = '\0';
     fclose(f);
     
     cJSON *root = cJSON_Parse(json);

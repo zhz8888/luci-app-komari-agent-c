@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <errno.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
@@ -286,35 +287,50 @@ int monitoring_get_disk_info(disk_info_t *info) {
         }
     }
     fclose(fp);
-    
-    info->used = info->total - info->free;
-    
+
+    /* Guard against unsigned underflow: in abnormal filesystem states (e.g.
+     * statvfs returning f_bfree > f_blocks, or aggregated mounts where free
+     * exceeds total), info->free could be larger than info->total, which
+     * would wrap to ~UINT64_MAX and report a nonsensical ~16 EB usage. */
+    info->used = (info->free > info->total) ? 0 : (info->total - info->free);
+
     return 0;
 }
 
 static uint64_t g_last_rx = 0, g_last_tx = 0;
 static uint64_t g_last_time = 0;
+/* Protects g_last_rx/g_last_tx/g_last_time against concurrent access.
+ * monitoring_get_net_info may be called from multiple threads (e.g. the
+ * report thread and a status API handler); without a lock the read-modify-
+ * write cycle on these globals could interleave and produce incorrect
+ * rx_speed/tx_speed values. Mirrors the pattern used in logger.c. */
+static pthread_mutex_t g_net_info_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int monitoring_get_net_info(net_info_t *info) {
     if (!info) return -1;
-    
+
     memset(info, 0, sizeof(net_info_t));
-    
+
     FILE *fp = fopen("/proc/net/dev", "r");
     if (!fp) return -1;
-    
+
     char line[512];
     uint64_t total_rx = 0, total_tx = 0;
     uint64_t total_rx_packets = 0, total_tx_packets = 0;
-    
-    fgets(line, sizeof(line), fp);
-    fgets(line, sizeof(line), fp);
-    
+
+    /* /proc/net/dev starts with two header lines. Check fgets return values
+     * so an empty or unreadable file (e.g. /proc not mounted) is reported as
+     * an error rather than silently returning zero statistics. */
+    if (!fgets(line, sizeof(line), fp) || !fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return -1;
+    }
+
     while (fgets(line, sizeof(line), fp)) {
         char iface[32];
         uint64_t rx_bytes, rx_packets, rx_errs, rx_drop, rx_fifo, rx_frame, rx_compressed, rx_multicast;
         uint64_t tx_bytes, tx_packets, tx_errs, tx_drop, tx_fifo, tx_colls, tx_carrier, tx_compressed;
-        
+
         if (sscanf(line, "%31[^:]: %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
                    " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
                    " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
@@ -322,12 +338,12 @@ int monitoring_get_net_info(net_info_t *info) {
                    iface, &rx_bytes, &rx_packets, &rx_errs, &rx_drop, &rx_fifo, &rx_frame,
                    &rx_compressed, &rx_multicast, &tx_bytes, &tx_packets, &tx_errs, &tx_drop,
                    &tx_fifo, &tx_colls, &tx_carrier, &tx_compressed) >= 10) {
-            
+
             char *p = iface;
             while (*p == ' ') p++;
-            
+
             if (strcmp(p, "lo") == 0) continue;
-            
+
             total_rx += rx_bytes;
             total_tx += tx_bytes;
             total_rx_packets += rx_packets;
@@ -335,12 +351,13 @@ int monitoring_get_net_info(net_info_t *info) {
         }
     }
     fclose(fp);
-    
+
     info->rx_bytes = total_rx;
     info->tx_bytes = total_tx;
     info->rx_packets = total_rx_packets;
     info->tx_packets = total_tx_packets;
-    
+
+    pthread_mutex_lock(&g_net_info_mutex);
     uint64_t now = utils_get_current_timestamp();
     if (g_last_time > 0) {
         uint64_t time_diff = now - g_last_time;
@@ -355,11 +372,12 @@ int monitoring_get_net_info(net_info_t *info) {
             info->tx_speed = (uint64_t)((double)tx_diff / (double)time_diff + 0.5);
         }
     }
-    
+
     g_last_rx = total_rx;
     g_last_tx = total_tx;
     g_last_time = now;
-    
+    pthread_mutex_unlock(&g_net_info_mutex);
+
     return 0;
 }
 
@@ -480,16 +498,11 @@ int monitoring_get_system_info(system_info_t *info) {
 }
 
 uint64_t monitoring_get_uptime(void) {
-    FILE *fp = fopen("/proc/uptime", "r");
-    if (!fp) return 0;
-    
-    double uptime;
-    if (fscanf(fp, "%lf", &uptime) == 1) {
-        fclose(fp);
-        return (uint64_t)uptime;
-    }
-    fclose(fp);
-    return 0;
+    /* Delegate to utils_get_uptime_seconds to avoid duplicating the
+     * /proc/uptime parsing logic. Both functions historically had identical
+     * implementations; keeping a single source of truth makes future
+     * changes (e.g. a fallback to /sys/class/rtc) apply everywhere. */
+    return utils_get_uptime_seconds();
 }
 
 int monitoring_get_process_count(void) {

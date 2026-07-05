@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -23,6 +24,12 @@
 
 #include "utils.h"
 #include "logger.h"
+
+/* PATH_MAX is the kernel-enforced maximum path length on Linux (4096).
+ * Provide a fallback for platforms where <limits.h> does not define it. */
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 /* Maximum fd value to scan when closing inherited descriptors, used as a
  * fallback when sysconf(_SC_OPEN_MAX) is unavailable. */
@@ -322,7 +329,17 @@ int utils_mkdir_p(const char *path) {
 
     KOMARI_LOG_DEBUG("mkdir_p: creating directory tree %s", path);
 
-    char tmp[512];
+    /* Reject overlong paths up front instead of silently truncating them.
+     * A truncated path would create the wrong directory tree with no error
+     * indication to the caller. PATH_MAX matches the kernel limit. */
+    size_t path_len = strlen(path);
+    if (path_len >= PATH_MAX) {
+        KOMARI_LOG_ERROR("mkdir_p: path too long (%zu bytes, max %d)",
+                         path_len, PATH_MAX - 1);
+        return -1;
+    }
+
+    char tmp[PATH_MAX];
     strncpy(tmp, path, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
 

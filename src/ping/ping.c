@@ -268,7 +268,9 @@ int ping_task_icmp(const char *target, int timeout_ms, const char *custom_dns) {
         int n = recvfrom(fd, recv_buf, sizeof(recv_buf), 0,
                          (struct sockaddr *)&src_addr, &src_len);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                /* EINTR: a signal interrupted recvfrom before any packet
+                 * arrived; retry instead of reporting a false ping failure. */
                 continue;
             }
             close(fd);
@@ -397,7 +399,11 @@ int ping_task_tcp(const char *target, int timeout_ms, const char *custom_dns) {
     }
 
     int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        KOMARI_LOG_ERROR("TCP fcntl(O_NONBLOCK) failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
 
     int64_t start_time = get_time_ms();
 
@@ -561,7 +567,11 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
     }
 
     int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        KOMARI_LOG_ERROR("HTTP fcntl(O_NONBLOCK) failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
 
     int64_t start_time = get_time_ms();
 
@@ -672,10 +682,40 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns) {
         return -1;
     }
 
+    /* Send the HTTP request, looping until the full request is written or
+     * an error occurs. SSL_write/send may return fewer bytes than requested
+     * on a small send window or partial network write; treating that as
+     * success would send a truncated request and the server would respond
+     * with an error or time out, producing a false "target unreachable"
+     * ping result. */
+    size_t req_len = strlen(request);
     if (use_tls) {
-        SSL_write(ssl, request, strlen(request));
+        size_t written = 0;
+        while (written < req_len) {
+            int w = SSL_write(ssl, request + written, (int)(req_len - written));
+            if (w <= 0) {
+                int ssl_err = SSL_get_error(ssl, w);
+                if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) {
+                    continue;
+                }
+                SSL_free(ssl);
+                SSL_CTX_free(ssl_ctx);
+                close(fd);
+                return -1;
+            }
+            written += (size_t)w;
+        }
     } else {
-        send(fd, request, strlen(request), 0);
+        size_t sent = 0;
+        while (sent < req_len) {
+            ssize_t s = send(fd, request + sent, req_len - sent, 0);
+            if (s < 0) {
+                if (errno == EINTR) continue;
+                close(fd);
+                return -1;
+            }
+            sent += (size_t)s;
+        }
     }
 
     char recv_buf[1024];

@@ -14,6 +14,7 @@
 #include <strings.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -132,8 +133,14 @@ static int dns_query_server(const char *hostname, const char *dns_server, char *
     memset(&src_addr, 0, sizeof(src_addr));
 
     unsigned char response_buf[1024];
-    ssize_t n = recvfrom(sock, response_buf, sizeof(response_buf), 0,
-                         (struct sockaddr *)&src_addr, &src_len);
+    ssize_t n;
+    /* Retry recvfrom on EINTR so a signal arrival (e.g. SIGCHLD from a
+     * concurrent fork) does not produce a false DNS lookup failure and
+     * trigger an unnecessary 500ms retry delay in the caller. */
+    do {
+        n = recvfrom(sock, response_buf, sizeof(response_buf), 0,
+                     (struct sockaddr *)&src_addr, &src_len);
+    } while (n < 0 && errno == EINTR);
     close(sock);
 
     if (n <= 0) {

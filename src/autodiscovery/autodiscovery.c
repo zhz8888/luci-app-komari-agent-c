@@ -177,8 +177,19 @@ static int http_post_get_body(const char *url,
         host[sizeof(host) - 1] = '\0';
     }
 
-    /* Parse port */
-    char *colon = strchr(host, ':');
+    /* Parse port. For IPv6 URLs the host is bracketed, e.g. [::1]:443.
+     * strchr(host, ':') would match the first colon inside the brackets and
+     * truncate the host to "["; instead look for ']' first and search for
+     * ':' only after it. For plain IPv4/hostname the bracket lookup fails
+     * and we fall back to strrchr which finds the last ':' (the port
+     * separator). */
+    char *colon = NULL;
+    char *bracket = strchr(host, ']');
+    if (bracket) {
+        colon = strchr(bracket + 1, ':');
+    } else {
+        colon = strrchr(host, ':');
+    }
     if (colon) {
         *colon = '\0';
         port = atoi(colon + 1);
@@ -374,8 +385,12 @@ static int http_post_get_body(const char *url,
         return -1;
     }
 
-    /* Validate HTTP status code */
-    if (!strstr(raw_buf, "HTTP/1.1 200") && !strstr(raw_buf, "HTTP/1.0 200")) {
+    /* Validate HTTP status code by checking the start of the response only.
+     * Using strstr would match the status line anywhere in the response
+     * (including the body), so a 404/500 error page that happens to quote
+     * "HTTP/1.1 200" would pass the check incorrectly. */
+    if (strncmp(raw_buf, "HTTP/1.1 200", 12) != 0 &&
+        strncmp(raw_buf, "HTTP/1.0 200", 12) != 0) {
         KOMARI_LOG_ERROR("Auto-discovery: HTTP status code is not 200");
         return -1;
     }
