@@ -28,10 +28,10 @@ A lightweight monitoring agent designed for OpenWrt routers. It is a C language 
 
 ```bash
 # OpenWrt >= 24.10 (using APK)
-apk add komari-agent-c-1.0.1-1-<arch>.apk
+apk add komari-agent-c-1.0.0-1-<arch>.apk
 
 # OpenWrt < 24.10 (using IPK)
-opkg install komari-agent-c_1.0.1-1_<arch>.ipk
+opkg install komari-agent-c_1.0.0-1_<arch>.ipk
 ```
 
 Install the LuCI web interface (optional):
@@ -48,8 +48,8 @@ opkg install luci-app-komari-agent-c_1.0.0-1_<arch>.ipk
 
 ```bash
 # Download and extract the binary
-wget https://github.com/zhz8888/luci-app-komari-agent-c/releases/download/v1.0.1/komari-agent-c-1.0.1-linux-<arch>.tar.gz
-tar -xzf komari-agent-c-1.0.1-linux-<arch>.tar.gz
+wget https://github.com/zhz8888/luci-app-komari-agent-c/releases/download/v1.0.0/komari-agent-c-1.0.0-linux-<arch>.tar.gz
+tar -xzf komari-agent-c-1.0.0-linux-<arch>.tar.gz
 sudo cp komari-agent-c /usr/local/bin/
 ```
 
