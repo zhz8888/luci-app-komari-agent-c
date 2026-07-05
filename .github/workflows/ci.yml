@@ -40,7 +40,7 @@ jobs:
         goarch: [amd64, arm64, arm, armv7, mipsel, mips64, riscv64, 386]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Build binary in Docker
         run: |
@@ -58,7 +58,7 @@ jobs:
           file "$BINARY"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-binary-linux-${{ matrix.goarch }}
           path: output/komari-agent-c-linux-${{ matrix.goarch }}
@@ -88,7 +88,7 @@ jobs:
           - 25.12.2
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib
@@ -142,7 +142,7 @@ jobs:
           find bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/ -name "*.apk" -exec ls -lh {} \; 2>/dev/null || echo "  (none)"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-${{ matrix.arch }}-${{ matrix.version }}
           path: bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/*.*pk
@@ -150,7 +150,7 @@ jobs:
 
       - name: Upload build logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build-logs-test-${{ matrix.arch }}-${{ matrix.version }}
           path: logs/
@@ -169,7 +169,7 @@ jobs:
           - 25.12.2
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib
@@ -227,7 +227,7 @@ jobs:
           ls -lh i18n-artifacts/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-luci-${{ matrix.version }}
           path: i18n-artifacts/*
@@ -235,7 +235,7 @@ jobs:
 
       - name: Upload build logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build-logs-luci-test-${{ matrix.version }}
           path: logs/
@@ -247,10 +247,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.x'
 

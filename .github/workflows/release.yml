@@ -36,7 +36,7 @@ jobs:
           - 25.12.2
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib
@@ -81,7 +81,7 @@ jobs:
           fi
 
       - name: Upload packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: packages-${{ matrix.arch }}-${{ matrix.version }}
           path: bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/*.*pk
@@ -89,7 +89,7 @@ jobs:
 
       - name: Upload build logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build-logs-${{ matrix.arch }}-${{ matrix.version }}
           path: logs/
@@ -104,7 +104,7 @@ jobs:
         goarch: [amd64, arm64, arm, armv7, mipsel, mips64, riscv64, 386]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Build binary in Docker
         run: |
@@ -140,7 +140,7 @@ jobs:
           tar -czf "dist/komari-agent-c-${VERSION}-linux-${GOARCH}.tar.gz" -C output komari-agent-c
 
       - name: Upload binary artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: binary-linux-${{ matrix.goarch }}
           path: dist/*
@@ -157,7 +157,7 @@ jobs:
           - 25.12.2
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib
@@ -190,7 +190,7 @@ jobs:
           PACKAGES: luci-app-komari-agent-c
 
       - name: Upload packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: luci-app-komari-agent-c-${{ matrix.version }}
           path: |
@@ -200,7 +200,7 @@ jobs:
 
       - name: Upload build logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build-logs-luci-${{ matrix.version }}
           path: logs/
@@ -212,11 +212,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Download OpenWrt packages
         if: needs.build-openwrt.result == 'success'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           pattern: packages-*
           path: dist/
@@ -224,7 +224,7 @@ jobs:
 
       - name: Download binary packages
         if: needs.build-binaries.result == 'success'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           pattern: binary-*
           path: dist/
@@ -232,7 +232,7 @@ jobs:
 
       - name: Download LuCI packages
         if: needs.build-luci.result == 'success'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           pattern: luci-app-*
           path: dist/
