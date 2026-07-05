@@ -255,7 +255,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.x'
+          python-version: '3.12'
 
       - name: Install lint tools
         run: |
@@ -270,29 +270,10 @@ jobs:
           find . -name "*.sh" -exec bash -n {} \;
 
       - name: Check YAML syntax
-        run: |
-          python -c "
-          import yaml
-          import sys
-          import os
-          files = ['.github/workflows/ci.yml', '.github/workflows/release.yml', 'docker/docker-compose.yml']
-          for f in files:
-              if not os.path.exists(f):
-                  print(f'⚠️ {f}: File not found, skipping')
-                  continue
-              try:
-                  with open(f) as fh:
-                      yaml.safe_load(fh)
-                  print(f'✅ {f}: Valid')
-              except yaml.YAMLError as e:
-                  print(f'❌ {f}: {e}')
-                  sys.exit(1)
-          "
+        run: python scripts/verify_ci_config.py yaml
 
       - name: Verify CI config
-        run: |
-          chmod +x scripts/verify-ci-config.sh
-          ./scripts/verify-ci-config.sh
+        run: python scripts/verify_ci_config.py config
 
       - name: Run unit tests in Docker
         run: |

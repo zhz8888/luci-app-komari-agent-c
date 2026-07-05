@@ -237,7 +237,7 @@ Linux/OpenWrt 默认启用 5 项硬化选项：
 1. **test-binary-build** — 8 架构 Docker 二进制构建矩阵（amd64/arm64/arm/armv7/mipsel/mips64/riscv64/386）
 2. **test-openwrt-build** — 9 个 OpenWrt 架构 × 2 个版本（24.10.6、25.12.2）矩阵
 3. **test-luci-build** — LuCI 包构建测试（24.10.6、25.12.2）
-4. **lint** — 代码质量检查（codespell、shell 语法、YAML 校验、verify-ci-config.sh、Docker 单元测试）
+4. **lint** — 代码质量检查（codespell、shell 语法、YAML 校验、verify_ci_config.py、Docker 单元测试）
 
 ### Release（`.github/workflows/release.yml`）
 
