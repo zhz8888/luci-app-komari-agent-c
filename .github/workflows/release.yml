@@ -271,70 +271,8 @@ jobs:
       - name: Generate release notes
         run: |
           VERSION="${{ steps.get_version.outputs.VERSION }}"
-          BUILT_BIN="${{ needs.build-binaries.result == 'success' && 'true' || 'false' }}"
-
-          {
-            echo "# Komari Agent v${VERSION}"
-            echo ""
-            echo "## Supported Platforms"
-            echo "- OpenWrt 18.06.x / 24.10.x / 25.12.x"
-            echo "- Architectures: x86_64, aarch64, ARM, MIPS, RISC-V, i386"
-
-            if [ "$BUILT_BIN" = "true" ]; then
-              echo "- Standalone binary: Linux multi-architecture static build"
-            else
-              echo ""
-              echo "> Warning: This release does not include standalone binaries. Please use the OpenWrt packages instead."
-            fi
-
-            echo ""
-            echo "## Quick Installation"
-            echo ""
-            echo '```bash'
-            echo "# OpenWrt >= 24.10 (using apk)"
-            echo "apk add komari-agent-c-<version>-1-<arch>.apk"
-            echo ""
-            echo "# OpenWrt < 24.10 (using opkg)"
-            echo "opkg install komari-agent-c_<version>-1_<arch>.ipk"
-            echo '```'
-            echo ""
-            echo "## Documentation"
-            echo ""
-            echo "For full usage instructions, configuration guides, and build documentation, see:"
-            echo "[Project Docs](https://github.com/${{ github.repository }}/tree/main/docs)"
-            echo ""
-            echo "| Document | Description |"
-            echo "|------|------|"
-            echo "| [OpenWrt Package Guide](https://github.com/${{ github.repository }}/blob/main/docs/openwrt-package.md) | IPK/APK package installation, configuration, and management guide |"
-            echo "| [Binary Usage Guide](https://github.com/${{ github.repository }}/blob/main/docs/binary-usage.md) | Standalone binary download, installation, and usage instructions |"
-            echo "| [Build and Debug Guide](https://github.com/${{ github.repository }}/blob/main/docs/build-debug.md) | Complete guide for local compilation, cross-compilation, and debugging |"
-            echo "| [Configuration Guide](https://github.com/${{ github.repository }}/blob/main/docs/configuration.md) | UCI configuration, environment variables, and command-line options |"
-            echo "| [Features Guide](https://github.com/${{ github.repository }}/blob/main/docs/features.md) | Monitoring data, ping tasks, virtualization detection, and more |"
-            echo ""
-            echo "## Release Assets"
-            echo ""
-            echo "| File | Description |"
-            echo "|--------|------|"
-
-            for file in dist/*; do
-              if [ -f "$file" ]; then
-                filename=$(basename "$file")
-                if [[ "$filename" == luci-app-* ]]; then
-                  if [[ "$filename" == *.apk ]]; then
-                    echo "| \`${filename}\` | LuCI web interface (APK) |"
-                  else
-                    echo "| \`${filename}\` | LuCI web interface (IPK) |"
-                  fi
-                elif [[ "$filename" == *.apk ]]; then
-                  echo "| \`${filename}\` | OpenWrt package (APK) |"
-                elif [[ "$filename" == *.ipk ]]; then
-                  echo "| \`${filename}\` | OpenWrt package (IPK) |"
-                elif [[ "$filename" == *.tar.gz ]]; then
-                  echo "| \`${filename}\` | Standalone binary |"
-                fi
-              fi
-            done
-          } > release_notes.md
+          chmod +x scripts/generate-release-notes.sh
+          scripts/generate-release-notes.sh "$VERSION" "${{ github.repository }}"
 
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -344,6 +282,6 @@ jobs:
           files: dist/*
           draft: false
           prerelease: false
-          generate_release_notes: true
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
