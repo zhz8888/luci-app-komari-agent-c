@@ -91,6 +91,11 @@ typedef struct {
     ws_client_t *ws;           /* Dedicated WebSocket connection for terminal */
     terminal_t *term;          /* Pseudo-terminal */
     volatile bool active;      /* Whether the session is active */
+    volatile bool cleanup_done;/* Set by monitor thread after tearing down
+                                * resources; main shutdown path inspects this
+                                * after pthread_join to know the session memory
+                                * is safe to free. */
+    bool monitor_started;      /* True once monitor_thread is valid */
     pthread_t monitor_thread;  /* Monitor thread for cleanup */
     pthread_mutex_t term_mutex; /* Protects reads/writes of the term pointer
                                  * across the WS receive thread and the monitor
@@ -98,6 +103,87 @@ typedef struct {
     char ws_endpoint[512];     /* WebSocket endpoint URL (must match ws lifetime) */
     char extra_query[80];      /* Extra query parameters (must match ws lifetime) */
 } terminal_session_t;
+
+/* Global registry of active terminal sessions so the main shutdown path can
+ * signal them to exit and join their monitor threads before tearing down
+ * shared resources (g_ws_client, g_netstatic, OpenSSL). Without this, detached
+ * monitor threads would be forcibly killed at process exit, leaking the
+ * session's WS fd/SSL and orphaning the forkpty-spawned shell. The registry is
+ * a fixed-size array because MAX_TERMINAL_SESSIONS is small (8). */
+static terminal_session_t *g_sessions[MAX_TERMINAL_SESSIONS];
+static pthread_mutex_t g_sessions_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Register a terminal session in the global registry. Returns 0 on success,
+ * -1 if the registry is full. Recycles slots whose monitor thread has already
+ * finished (cleanup_done=true): the zombie session is joined and freed
+ * outside the lock so the slot can be reused by the new session. This keeps
+ * the registry from filling up with completed sessions during normal
+ * (non-shutdown) operation. */
+static int sessions_register(terminal_session_t *session) {
+    pthread_mutex_lock(&g_sessions_mutex);
+    int rc = -1;
+    terminal_session_t *zombie = NULL;
+    int zombie_idx = -1;
+    for (int i = 0; i < MAX_TERMINAL_SESSIONS; i++) {
+        if (g_sessions[i] == NULL) {
+            g_sessions[i] = session;
+            rc = 0;
+            break;
+        }
+        if (g_sessions[i] != NULL && g_sessions[i]->cleanup_done && zombie == NULL) {
+            zombie = g_sessions[i];
+            zombie_idx = i;
+        }
+    }
+    if (rc != 0 && zombie != NULL) {
+        g_sessions[zombie_idx] = session;
+        rc = 0;
+    }
+    pthread_mutex_unlock(&g_sessions_mutex);
+
+    if (zombie) {
+        pthread_join(zombie->monitor_thread, NULL);
+        free(zombie);
+    }
+    return rc;
+}
+
+/* Signal every active terminal session to wind down. Called from the main
+ * shutdown path before joining worker threads so that monitor threads stop
+ * touching shared resources (e.g. OpenSSL) before they are torn down. */
+static void sessions_signal_stop(void) {
+    pthread_mutex_lock(&g_sessions_mutex);
+    for (int i = 0; i < MAX_TERMINAL_SESSIONS; i++) {
+        if (g_sessions[i] != NULL) {
+            g_sessions[i]->active = false;
+        }
+    }
+    pthread_mutex_unlock(&g_sessions_mutex);
+}
+
+/* Join all monitor threads that were started, then free their sessions and
+ * clear the registry slots. Called from the main shutdown path after worker
+ * threads have joined. Each monitor thread performs its own teardown
+ * (terminal_terminate, ws_client_disconnect/destroy, mutex destroy, session
+ * release) and only leaves session memory for us to free. */
+static void sessions_join_and_cleanup(void) {
+    pthread_mutex_lock(&g_sessions_mutex);
+    for (int i = 0; i < MAX_TERMINAL_SESSIONS; i++) {
+        terminal_session_t *session = g_sessions[i];
+        if (session == NULL) continue;
+        bool started = session->monitor_started;
+        g_sessions[i] = NULL;
+        pthread_mutex_unlock(&g_sessions_mutex);
+
+        if (started) {
+            pthread_join(session->monitor_thread, NULL);
+        }
+        free(session);
+
+        pthread_mutex_lock(&g_sessions_mutex);
+    }
+    pthread_mutex_unlock(&g_sessions_mutex);
+}
 
 /* Terminal output callback: send pseudo-terminal output via WebSocket (terminal→WS output thread) */
 static void on_terminal_output(terminal_t *term, const char *data, size_t len) {
@@ -154,7 +240,11 @@ static void *terminal_monitor_thread(void *arg) {
     terminal_session_t *session = (terminal_session_t *)arg;
 
     while (session->active) {
+        /* Sleep in 1-second slices so the main shutdown path's
+         * sessions_signal_stop() is observed within ~1 second instead of
+         * blocking pthread_join for the full sleep window. */
         sleep(1);
+        if (!session->active) break;
 
         /* Check if terminal has exited (shell closed). Snapshot term under
          * the mutex because the cleanup path below may NULL it. */
@@ -192,7 +282,13 @@ static void *terminal_monitor_thread(void *arg) {
      *    so there is no concurrent access to the terminal struct. Passing
      *    &session->term NULLs the pointer before the free.
      * 4. ws_client_destroy() frees the WS handle. The read thread is already
-     *    joined, so it can no longer touch the WS client. */
+     *    joined, so it can no longer touch the WS client.
+     *
+     * The session struct itself is NOT freed here: the main shutdown path
+     * joins this thread and then frees the session, so we must leave the
+     * memory valid. On the normal (non-shutdown) exit path the session was
+     * removed from the global registry before the join, so main will not
+     * touch it — but the registry cleanup still owns the free. */
     if (session->term) {
         terminal_terminate(session->term);
     }
@@ -213,7 +309,7 @@ static void *terminal_monitor_thread(void *arg) {
 
     pthread_mutex_destroy(&session->term_mutex);
     terminal_release_session();
-    free(session);
+    session->cleanup_done = true;
     return NULL;
 }
 
@@ -276,7 +372,7 @@ static int establish_terminal_connection(const char *token, const char *request_
     /* Create WebSocket client */
     ws_client_config_t ws_config = {0};
     ws_config.endpoint = session->ws_endpoint;
-    ws_config.token = (char *)token;
+    ws_config.token = token;
     ws_config.extra_query = session->extra_query;
     ws_config.ignore_cert = g_config.ignore_unsafe_cert;
     ws_config.max_retries = 1;
@@ -338,8 +434,29 @@ static int establish_terminal_connection(const char *token, const char *request_
     }
 
     session->active = true;
+    session->cleanup_done = false;
+    session->monitor_started = false;
 
-    /* Start monitor thread (detached, self-cleaning) */
+    /* Register the session before starting the monitor thread so the shutdown
+     * path always sees a consistent registry state. If register fails the
+     * registry is full of non-zombie sessions (should not happen because
+     * terminal_acquire_session enforces the same limit, but guard anyway). */
+    if (sessions_register(session) != 0) {
+        KOMARI_LOG_ERROR("[Terminal] Session registry full");
+        session->active = false;
+        terminal_terminate(session->term);
+        ws_client_stop(session->ws);
+        ws_client_disconnect(session->ws);
+        terminal_destroy(&session->term);
+        ws_client_destroy(session->ws);
+        pthread_mutex_destroy(&session->term_mutex);
+        terminal_release_session();
+        free(session);
+        return -1;
+    }
+
+    /* Start monitor thread (joinable; main shutdown path joins it via
+     * sessions_join_and_cleanup so it is never forcibly killed mid-cleanup). */
     if (pthread_create(&session->monitor_thread, NULL, terminal_monitor_thread, session) != 0) {
         KOMARI_LOG_ERROR("[Terminal] Failed to create monitor thread");
         session->active = false;
@@ -353,10 +470,19 @@ static int establish_terminal_connection(const char *token, const char *request_
         ws_client_destroy(session->ws);
         pthread_mutex_destroy(&session->term_mutex);
         terminal_release_session();
+        /* Remove from registry since monitor thread never started. */
+        pthread_mutex_lock(&g_sessions_mutex);
+        for (int i = 0; i < MAX_TERMINAL_SESSIONS; i++) {
+            if (g_sessions[i] == session) {
+                g_sessions[i] = NULL;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_sessions_mutex);
         free(session);
         return -1;
     }
-    pthread_detach(session->monitor_thread);
+    session->monitor_started = true;
 
     KOMARI_LOG_INFO("[Terminal] Session established: %s", request_id);
     return 0;
@@ -551,7 +677,14 @@ static void *report_thread(void *arg) {
                 
                 retries++;
                 KOMARI_LOG_WARN("[WebSocket] Connection failed, retry %d/%d", retries, g_config.max_retries);
-                sleep(g_config.reconnect_interval);
+                /* Sleep in 1-second slices so the thread observes g_running
+                 * promptly during shutdown. Without this, a 5-second
+                 * reconnect_interval would block pthread_join in the cleanup
+                 * path for the full duration, exceeding procd's 5-second
+                 * stop timeout and forcing SIGKILL (which leaks fd/SSL). */
+                for (int i = 0; i < g_config.reconnect_interval && g_running; i++) {
+                    sleep(1);
+                }
             }
             
             if (retries >= g_config.max_retries) {
@@ -650,7 +783,11 @@ static void *report_thread(void *arg) {
 static void *heartbeat_thread(void *arg) {
     (void)arg;
 
-    while (g_running && g_ws_client) {
+    /* g_ws_client is assigned once in main() before this thread is created and
+     * kept alive until after pthread_join returns; the NULL check is therefore
+     * redundant. Check g_running only so the loop winds down promptly on
+     * SIGTERM/SIGINT. */
+    while (g_running) {
         /* Protect read of connected flag with state_mutex to avoid torn
          * reads on architectures without atomic word loads and to
          * synchronize with writers in websocket.c. */
@@ -660,7 +797,10 @@ static void *heartbeat_thread(void *arg) {
 
         if (connected) {
             if (ws_client_send_ping(g_ws_client) != 0) {
-                printf("[WebSocket] Heartbeat failed\n");
+                /* Use the project logger so the message is subject to log
+                 * level control and written to the log file in daemon mode;
+                 * printf bypasses both and would be lost under procd. */
+                KOMARI_LOG_WARN("[WebSocket] Heartbeat failed");
             }
         }
         /* Sleep in 1-second slices so the thread observes g_running
@@ -921,9 +1061,14 @@ int main(int argc, char *argv[]) {
 
     /* Start background update checker thread (if auto-update not disabled) */
     pthread_t update_tid;
+    bool update_tid_valid = false;
     if (!g_config.disable_auto_update) {
         if (pthread_create(&update_tid, NULL, update_do_check_works, NULL) == 0) {
-            pthread_detach(update_tid);
+            /* Keep the thread joinable so the shutdown path can wait for it
+             * to exit cleanly instead of leaving a detached thread stuck in
+             * popen()/pclose() (which would orphan the opkg/apk child process
+             * as a zombie when the agent is SIGTERM'd). */
+            update_tid_valid = true;
             KOMARI_LOG_INFO("[Update] Background update checker started");
         } else {
             KOMARI_LOG_WARN("[Update] Failed to start update checker thread");
@@ -968,12 +1113,19 @@ int main(int argc, char *argv[]) {
 
     printf("Stopping service...\n");
 
-    /* Signal the detached update checker thread to exit its loop promptly
-     * (within ~1 second). It cannot be joined because it was created with
-     * pthread_detach, so we just flip its running flag and let it wind down
-     * on its own while we tear down the rest of the resources below.
-     */
+    /* Signal the update checker thread to exit its loop promptly
+     * (within ~1 second). The thread is joinable, so we wait for it below
+     * after the worker threads. If it is stuck in popen()/pclose() the
+     * join will block until the opkg/apk child process completes (usually
+     * <5 seconds); on timeout we proceed and let the OS reap the child. */
     update_stop();
+
+    /* Signal every active terminal session to wind down. This must happen
+     * before joining the report/heartbeat threads so that monitor threads
+     * stop touching OpenSSL (via their dedicated ws_client) before main
+     * proceeds to OpenSSL cleanup. Monitor threads are joinable and will
+     * be joined after the worker threads. */
+    sessions_signal_stop();
 
     /* Set the WebSocket client stop flag so its internal recv thread and
      * the report thread's retry loop can wind down. ws_client_stop only
@@ -1005,6 +1157,22 @@ int main(int argc, char *argv[]) {
      * after the surrounding goroutine has stopped using them. */
     pthread_join(report_tid, NULL);
     pthread_join(heartbeat_tid, NULL);
+
+    /* Join the update checker thread if it was started. update_stop() above
+     * flipped its running flag; the thread's 6-hour sleep is already sliced
+     * to 1-second granularity, so it returns within ~1 second. If it is
+     * blocked inside popen()/pclose() (opkg/apk invocation), join waits
+     * for the child process to finish. */
+    if (update_tid_valid) {
+        pthread_join(update_tid, NULL);
+    }
+
+    /* Join all terminal monitor threads and free their sessions. Each
+     * monitor thread tears down its own ws_client/terminal before setting
+     * cleanup_done; join ensures that teardown is complete before main
+     * touches OpenSSL or exits. This avoids the original M1 bug where
+     * detached monitor threads were forcibly killed mid-cleanup. */
+    sessions_join_and_cleanup();
 
     /* All worker threads have exited; it is now safe to free shared
      * resources. netstatic_stop joins its own internal worker thread, so

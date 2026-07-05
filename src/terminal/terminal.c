@@ -330,6 +330,12 @@ void terminal_destroy(terminal_t **term) {
     terminal_t *t = *term;
     *term = NULL;
 
-    terminal_terminate(t);
+    /* Guard the terminate call so we do not invoke it twice on the same
+     * terminal. All current callers already terminal_terminate() before
+     * destroy(); terminal_terminate() is idempotent today, but relying on
+     * that risks a double-free if the implementation ever changes. */
+    if (t->running) {
+        terminal_terminate(t);
+    }
     free(t);
 }

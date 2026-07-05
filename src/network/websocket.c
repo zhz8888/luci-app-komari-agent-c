@@ -1364,8 +1364,29 @@ int ws_client_connect(ws_client_t *client) {
         ws_client_note_protocol_result(client, false);
         return -1;
     }
-    
+
+    /* Re-check should_stop after the handshake: the handshake can block for
+     * up to WS_CONNECT_TIMEOUT_SEC (15s) on SSL_connect. If ws_client_stop
+     * was called during that window (e.g. main shutdown), honor it instead
+     * of overwriting it with connected=true. Without this check, the recv
+     * thread would start on a soon-to-be-destroyed client, racing with
+     * main's ws_client_destroy. */
     pthread_mutex_lock(&client->state_mutex);
+    if (client->should_stop) {
+        pthread_mutex_unlock(&client->state_mutex);
+        if (client->ssl) {
+            SSL_shutdown(client->ssl);
+            SSL_free(client->ssl);
+            client->ssl = NULL;
+        }
+        if (client->ssl_ctx) {
+            SSL_CTX_free(client->ssl_ctx);
+            client->ssl_ctx = NULL;
+        }
+        close(client->fd);
+        client->fd = -1;
+        return -1;
+    }
     client->connected = true;
     pthread_mutex_unlock(&client->state_mutex);
     

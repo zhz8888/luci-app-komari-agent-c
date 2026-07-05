@@ -87,8 +87,15 @@ void tearDown(void) {
 void test_ws_client_create_with_config(void) {
     ws_client_config_t config;
     memset(&config, 0, sizeof(config));
-    config.endpoint = strdup("ws://example.com/api");
-    config.token = strdup("test_token");
+    /* strdup returns char*; store in a local non-const pointer so we can free
+     * it after the test (ws_client_config_t.endpoint/token are const char*
+     * because ws_client only reads them, but the test owns the allocation). */
+    char *endpoint_buf = strdup("ws://example.com/api");
+    char *token_buf = strdup("test_token");
+    TEST_ASSERT_NOT_NULL(endpoint_buf);
+    TEST_ASSERT_NOT_NULL(token_buf);
+    config.endpoint = endpoint_buf;
+    config.token = token_buf;
     config.ignore_cert = false;
     config.max_retries = 5;
     config.reconnect_interval = 10;
@@ -113,8 +120,8 @@ void test_ws_client_create_with_config(void) {
 
     ws_client_destroy(client);
 
-    free(config.endpoint);
-    free(config.token);
+    free(endpoint_buf);
+    free(token_buf);
 }
 
 /* Test ws_client_create: create client with NULL config */

@@ -35,9 +35,9 @@
 #define WS_PENDING_BUF_SIZE 2048
 
 typedef struct {
-    char *endpoint;
-    char *token;
-    char *extra_query;  /* Additional query parameters, e.g., "&id=xxx", appended after token */
+    const char *endpoint;
+    const char *token;
+    const char *extra_query;  /* Additional query parameters, e.g., "&id=xxx", appended after token */
     bool ignore_cert;
     int max_retries;
     int reconnect_interval;
