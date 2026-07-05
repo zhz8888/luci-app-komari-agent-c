@@ -118,12 +118,6 @@ jobs:
           PACKAGES: komari-agent-c
           KOMARI_VERBOSE_CMAKE: ON
 
-      - name: Rename packages with arch suffix
-        run: |
-          cd bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/
-          for f in *.ipk; do mv "$f" "${f/.ipk/-${{ matrix.arch }}.ipk}" 2>/dev/null || true; done
-          for f in *.apk; do mv "$f" "${f/.apk/-${{ matrix.arch }}.apk}" 2>/dev/null || true; done
-
       - name: Verify build
         run: |
           echo "Checking for IPK packages..."
@@ -225,13 +219,18 @@ jobs:
 
           echo "Build successful for OpenWrt ${{ matrix.version }}"
 
+      - name: Collect i18n packages
+        run: |
+          mkdir -p i18n-artifacts
+          find bin/packages/ -name "luci-i18n-komari-agent-c*.*pk" -exec cp {} i18n-artifacts/ \;
+          echo "Collected i18n packages:"
+          ls -lh i18n-artifacts/
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: test-luci-${{ matrix.version }}
-          path: |
-            bin/packages/*/${{ env.FEED_NAME }}/luci-app-komari-agent-c*.*pk
-            bin/packages/*/${{ env.FEED_NAME }}/luci-i18n-komari-agent-c*.*pk
+          path: i18n-artifacts/*
           retention-days: 7
 
       - name: Upload build logs

@@ -65,12 +65,6 @@ jobs:
           FEEDNAME: ${{ env.FEED_NAME }}
           PACKAGES: komari-agent-c
 
-      - name: Rename packages with arch suffix
-        run: |
-          cd bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/
-          for f in *.ipk; do mv "$f" "${f/.ipk/-${{ matrix.arch }}.ipk}" 2>/dev/null || true; done
-          for f in *.apk; do mv "$f" "${f/.apk/-${{ matrix.arch }}.apk}" 2>/dev/null || true; done
-
       - name: Verify package formats
         run: |
           echo "Checking for IPK packages (legacy OpenWrt < 24.10)..."
@@ -199,7 +193,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: luci-app-komari-agent-c-${{ matrix.version }}
-          path: bin/packages/*/${{ env.FEED_NAME }}/luci-app-komari-agent-c*.*pk
+          path: |
+            bin/packages/*/${{ env.FEED_NAME }}/luci-app-komari-agent-c*.*pk
+            bin/packages/*/${{ env.FEED_NAME }}/luci-i18n-komari-agent-c*.*pk
           retention-days: 1
 
       - name: Upload build logs

@@ -133,6 +133,19 @@ else
     exit 1
 fi
 
+# Strip binary to reduce size (match OpenWrt build behavior)
+echo ""
+echo "--- Strip binary ---"
+STRIP_TOOL="${CC/gcc/strip}"
+if command -v "$STRIP_TOOL" &> /dev/null; then
+    "$STRIP_TOOL" "$BUILD_DIR/bin/komari-agent-c"
+    echo "Binary stripped using $STRIP_TOOL"
+    BINARY_SIZE=$(stat -c%s "$BUILD_DIR/bin/komari-agent-c" 2>/dev/null || stat -f%z "$BUILD_DIR/bin/komari-agent-c" 2>/dev/null)
+    echo "Stripped binary size: $((BINARY_SIZE / 1024)) KB"
+else
+    echo "WARN: $STRIP_TOOL not found, skipping strip"
+fi
+
 # Copy to output
 mkdir -p "$OUTPUT_DIR"
 cp "$BUILD_DIR/bin/komari-agent-c" "$OUTPUT_DIR/komari-agent-c-linux-$GOARCH"
