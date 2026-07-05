@@ -40,7 +40,8 @@ jobs:
         goarch: [amd64, arm64, arm, armv7, mipsel, mips64, riscv64, 386]
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout code
+        uses: actions/checkout@v6
 
       - name: Build binary in Docker
         run: |
@@ -58,7 +59,7 @@ jobs:
           file "$BINARY"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: test-binary-linux-${{ matrix.goarch }}
           path: output/komari-agent-c-linux-${{ matrix.goarch }}
@@ -88,7 +89,8 @@ jobs:
           - 25.12.2
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout code
+        uses: actions/checkout@v6
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib
@@ -111,7 +113,7 @@ jobs:
           cp openwrt/files/komari-agent-c.init package/${{ env.PACKAGE_NAME }}/files/
 
       - name: Build
-        uses: openwrt/gh-action-sdk@v9
+        uses: openwrt/gh-action-sdk@v11
         env:
           ARCH: ${{ matrix.arch }}-${{ matrix.version }}
           FEEDNAME: ${{ env.FEED_NAME }}
@@ -142,7 +144,7 @@ jobs:
           find bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/ -name "*.apk" -exec ls -lh {} \; 2>/dev/null || echo "  (none)"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: test-${{ matrix.arch }}-${{ matrix.version }}
           path: bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/*.*pk
@@ -150,7 +152,7 @@ jobs:
 
       - name: Upload build logs
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: build-logs-test-${{ matrix.arch }}-${{ matrix.version }}
           path: logs/
@@ -169,7 +171,8 @@ jobs:
           - 25.12.2
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout code
+        uses: actions/checkout@v6
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib
@@ -193,7 +196,7 @@ jobs:
           cp openwrt/files/komari-agent-c.init package/${{ env.PACKAGE_NAME }}/files/
 
       - name: Build
-        uses: openwrt/gh-action-sdk@v9
+        uses: openwrt/gh-action-sdk@v11
         env:
           ARCH: x86_64-${{ matrix.version }}
           FEEDNAME: ${{ env.FEED_NAME }}
@@ -227,7 +230,7 @@ jobs:
           ls -lh i18n-artifacts/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: test-luci-${{ matrix.version }}
           path: i18n-artifacts/*
@@ -235,7 +238,7 @@ jobs:
 
       - name: Upload build logs
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: build-logs-luci-test-${{ matrix.version }}
           path: logs/

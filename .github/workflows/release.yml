@@ -36,7 +36,8 @@ jobs:
           - 25.12.2
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout code
+        uses: actions/checkout@v6
 
       - name: Sync version from git tag
         if: github.ref_type == 'tag'
@@ -66,7 +67,7 @@ jobs:
           cp openwrt/files/komari-agent-c.init package/${{ env.PACKAGE_NAME }}/files/
 
       - name: Build
-        uses: openwrt/gh-action-sdk@v9
+        uses: openwrt/gh-action-sdk@v11
         env:
           ARCH: ${{ matrix.arch }}-${{ matrix.version }}
           FEEDNAME: ${{ env.FEED_NAME }}
@@ -88,7 +89,7 @@ jobs:
           fi
 
       - name: Upload packages
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: packages-${{ matrix.arch }}-${{ matrix.version }}
           path: bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/*.*pk
@@ -96,7 +97,7 @@ jobs:
 
       - name: Upload build logs
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: build-logs-${{ matrix.arch }}-${{ matrix.version }}
           path: logs/
@@ -111,7 +112,8 @@ jobs:
         goarch: [amd64, arm64, arm, armv7, mipsel, mips64, riscv64, 386]
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout code
+        uses: actions/checkout@v6
 
       - name: Sync version from git tag
         if: github.ref_type == 'tag'
@@ -154,7 +156,7 @@ jobs:
           tar -czf "dist/komari-agent-c-${VERSION}-linux-${GOARCH}.tar.gz" -C output komari-agent-c
 
       - name: Upload binary artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: binary-linux-${{ matrix.goarch }}
           path: dist/*
@@ -171,7 +173,8 @@ jobs:
           - 25.12.2
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout code
+        uses: actions/checkout@v6
 
       - name: Sync version from git tag
         if: github.ref_type == 'tag'
@@ -204,14 +207,14 @@ jobs:
           cp openwrt/files/komari-agent-c.init package/${{ env.PACKAGE_NAME }}/files/
 
       - name: Build
-        uses: openwrt/gh-action-sdk@v9
+        uses: openwrt/gh-action-sdk@v11
         env:
           ARCH: x86_64-${{ matrix.version }}
           FEEDNAME: ${{ env.FEED_NAME }}
           PACKAGES: luci-app-komari-agent-c
 
       - name: Upload packages
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: luci-app-komari-agent-c-${{ matrix.version }}
           path: |
@@ -221,7 +224,7 @@ jobs:
 
       - name: Upload build logs
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: build-logs-luci-${{ matrix.version }}
           path: logs/
@@ -233,11 +236,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout code
+        uses: actions/checkout@v6
 
       - name: Download OpenWrt packages
         if: needs.build-openwrt.result == 'success'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           pattern: packages-*
           path: dist/
@@ -245,7 +249,7 @@ jobs:
 
       - name: Download binary packages
         if: needs.build-binaries.result == 'success'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           pattern: binary-*
           path: dist/
@@ -253,7 +257,7 @@ jobs:
 
       - name: Download LuCI packages
         if: needs.build-luci.result == 'success'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           pattern: luci-app-*
           path: dist/
