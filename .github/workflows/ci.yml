@@ -263,10 +263,11 @@ jobs:
 
       - name: Spell check
         run: |
-          codespell --skip=".git,*.po,*.ipk,*.apk,*.lmo" --ignore-words-list="ba,dne,nce,nam,ot,tht" || true
+          codespell --skip=".git,*.po,*.ipk,*.apk,*.lmo" --ignore-words-list="ba,dne,nce,nam,ot,tht"
 
       - name: Check shell scripts
         run: |
+          set -e
           find . -name "*.sh" -exec bash -n {} \;
 
       - name: Check YAML syntax

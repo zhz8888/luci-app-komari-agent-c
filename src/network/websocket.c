@@ -28,6 +28,7 @@
 #include <pthread.h>
 
 #include "websocket.h"
+#include "websocket_internal.h"
 #include "utils.h"
 #include "cJSON.h"
 #include "logger.h"
@@ -51,8 +52,10 @@
 static const char base64_table[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/* Internal helper: Base64-encode `len` bytes from `data` into `out`. */
-static void base64_encode(const unsigned char *data, size_t len, char *out) {
+/* Base64-encode `len` bytes from `data` into `out`. Exposed via
+ * websocket_internal.h so tests can verify the real encoding path instead of
+ * re-implementing it. */
+void ws_base64_encode(const unsigned char *data, size_t len, char *out) {
     size_t i, j;
     for (i = 0, j = 0; i < len; i += 3, j += 4) {
         unsigned int n = ((unsigned int)data[i]) << 16;
@@ -127,17 +130,19 @@ static int generate_ws_key(char *key, size_t key_len) {
         return -1;
     }
 
-    base64_encode(random_bytes, 16, key);
+    ws_base64_encode(random_bytes, 16, key);
     return 0;
 }
 
-/* Internal helper: compute the Sec-WebSocket-Accept value from the client key.
+/* Compute the Sec-WebSocket-Accept value from the client key.
  *
  * Per RFC 6455 §4.2.2, the server must return Base64(SHA1(key || GUID)). This
  * helper computes that value so ws_handshake can verify the server's response
- * (MAJ-07). Returns 0 on success, -1 on snprintf truncation or if the output
- * buffer is too small to hold the Base64-encoded SHA1 (28 chars + NUL). */
-static int compute_accept_key(const char *key, char *accept_key, size_t accept_key_size) {
+ * (MAJ-07). Exposed via websocket_internal.h so tests can verify the real
+ * computation instead of re-implementing it. Returns 0 on success, -1 on
+ * snprintf truncation or if the output buffer is too small to hold the
+ * Base64-encoded SHA1 (28 chars + NUL). */
+int ws_compute_accept_key(const char *key, char *accept_key, size_t accept_key_size) {
     unsigned char hash[SHA_DIGEST_LENGTH];
     char combined[256];
     int ret;
@@ -153,8 +158,17 @@ static int compute_accept_key(const char *key, char *accept_key, size_t accept_k
     }
 
     SHA1((unsigned char *)combined, strlen(combined), hash);
-    base64_encode(hash, SHA_DIGEST_LENGTH, accept_key);
+    ws_base64_encode(hash, SHA_DIGEST_LENGTH, accept_key);
     return 0;
+}
+
+/* Apply a 4-byte WebSocket mask to `data` in place per RFC 6455 §5.3:
+ * data[i] ^= mask[i % 4]. Extracted from ws_recv_frame so tests can verify
+ * mask reversibility against the real implementation rather than a copy. */
+void ws_apply_mask(unsigned char *data, size_t len, const unsigned char mask[4]) {
+    for (size_t i = 0; i < len; i++) {
+        data[i] ^= mask[i % 4];
+    }
 }
 
 /* Internal helper: parse a ws:// or wss:// URL into scheme/host/port/path components.
@@ -302,7 +316,7 @@ static int ws_handshake(ws_client_t *client, const char *host, const char *path,
      * server's response (RFC 6455 §4.2.2, MAJ-07). A non-compliant or
      * malicious intermediary cannot complete the handshake without producing
      * the correct SHA1+Base64 of (client-key || magic GUID). */
-    if (compute_accept_key(key, expected_accept, sizeof(expected_accept)) != 0) {
+    if (ws_compute_accept_key(key, expected_accept, sizeof(expected_accept)) != 0) {
         return -1;
     }
 
@@ -649,12 +663,69 @@ static int ws_recv_frame(ws_client_t *client, int *opcode, int *fin, char *data,
     if (read_full(client, data, (size_t)payload_len) != 0) return -1;
 
     if (masked) {
-        for (size_t i = 0; i < (size_t)payload_len; i++) {
-            data[i] ^= mask[i % 4];
-        }
+        ws_apply_mask((unsigned char *)data, (size_t)payload_len, mask);
     }
 
     *len = (size_t)payload_len;
+    return 0;
+}
+
+/* Extract v1 message fields from a parsed cJSON tree into a ws_message_t.
+ * All string fields are copied with strncpy(.., sizeof(field) - 1) and the
+ * caller is expected to have zero-initialized `msg` so absent fields remain
+ * empty strings. Exposed via websocket_internal.h for unit testing. */
+int ws_message_parse_from_json(const cJSON *root, ws_message_t *msg) {
+    if (!root || !msg) return -1;
+
+    cJSON *item = NULL;
+
+    /* Extract message field */
+    if ((item = cJSON_GetObjectItem(root, "message")) && cJSON_IsString(item)) {
+        strncpy(msg->message, item->valuestring, sizeof(msg->message) - 1);
+        msg->message[sizeof(msg->message) - 1] = '\0';
+    }
+
+    /* Extract terminal_id field (compatible with request_id) */
+    item = cJSON_GetObjectItem(root, "terminal_id");
+    if (!item) item = cJSON_GetObjectItem(root, "request_id");
+    if (item && cJSON_IsString(item)) {
+        strncpy(msg->terminal_id, item->valuestring, sizeof(msg->terminal_id) - 1);
+        msg->terminal_id[sizeof(msg->terminal_id) - 1] = '\0';
+    }
+
+    /* Extract exec_command field (compatible with command) */
+    item = cJSON_GetObjectItem(root, "exec_command");
+    if (!item) item = cJSON_GetObjectItem(root, "command");
+    if (item && cJSON_IsString(item)) {
+        strncpy(msg->exec_command, item->valuestring, sizeof(msg->exec_command) - 1);
+        msg->exec_command[sizeof(msg->exec_command) - 1] = '\0';
+    }
+
+    /* Extract exec_task_id field (compatible with task_id) */
+    item = cJSON_GetObjectItem(root, "exec_task_id");
+    if (!item) item = cJSON_GetObjectItem(root, "task_id");
+    if (item && cJSON_IsString(item)) {
+        strncpy(msg->exec_task_id, item->valuestring, sizeof(msg->exec_task_id) - 1);
+        msg->exec_task_id[sizeof(msg->exec_task_id) - 1] = '\0';
+    }
+
+    /* Extract ping_type field */
+    if ((item = cJSON_GetObjectItem(root, "ping_type")) && cJSON_IsString(item)) {
+        strncpy(msg->ping_type, item->valuestring, sizeof(msg->ping_type) - 1);
+        msg->ping_type[sizeof(msg->ping_type) - 1] = '\0';
+    }
+
+    /* Extract ping_target field */
+    if ((item = cJSON_GetObjectItem(root, "ping_target")) && cJSON_IsString(item)) {
+        strncpy(msg->ping_target, item->valuestring, sizeof(msg->ping_target) - 1);
+        msg->ping_target[sizeof(msg->ping_target) - 1] = '\0';
+    }
+
+    /* Extract ping_task_id field */
+    if ((item = cJSON_GetObjectItem(root, "ping_task_id")) && cJSON_IsNumber(item)) {
+        msg->ping_task_id = (uint32_t)item->valuedouble;
+    }
+
     return 0;
 }
 
@@ -769,51 +840,12 @@ static void *ws_recv_thread(void *arg) {
                          * JSON string. */
                         ws_handle_v2_event(client, root);
                     } else {
-                        /* v1 message: extract fields and invoke handler */
+                        /* v1 message: extract fields via the shared parser and
+                         * invoke the handler. The parser copies each field with
+                         * strncpy(.., sizeof(field) - 1) + NUL termination so
+                         * overlong inputs are truncated rather than overflowed. */
                         ws_message_t msg = {0};
-                        cJSON *item = NULL;
-
-                        /* Extract message field */
-                        if ((item = cJSON_GetObjectItem(root, "message")) && cJSON_IsString(item)) {
-                            strncpy(msg.message, item->valuestring, sizeof(msg.message) - 1);
-                        }
-
-                        /* Extract terminal_id field (compatible with request_id) */
-                        item = cJSON_GetObjectItem(root, "terminal_id");
-                        if (!item) item = cJSON_GetObjectItem(root, "request_id");
-                        if (item && cJSON_IsString(item)) {
-                            strncpy(msg.terminal_id, item->valuestring, sizeof(msg.terminal_id) - 1);
-                        }
-
-                        /* Extract exec_command field (compatible with command) */
-                        item = cJSON_GetObjectItem(root, "exec_command");
-                        if (!item) item = cJSON_GetObjectItem(root, "command");
-                        if (item && cJSON_IsString(item)) {
-                            strncpy(msg.exec_command, item->valuestring, sizeof(msg.exec_command) - 1);
-                        }
-
-                        /* Extract exec_task_id field (compatible with task_id) */
-                        item = cJSON_GetObjectItem(root, "exec_task_id");
-                        if (!item) item = cJSON_GetObjectItem(root, "task_id");
-                        if (item && cJSON_IsString(item)) {
-                            strncpy(msg.exec_task_id, item->valuestring, sizeof(msg.exec_task_id) - 1);
-                        }
-
-                        /* Extract ping_type field */
-                        if ((item = cJSON_GetObjectItem(root, "ping_type")) && cJSON_IsString(item)) {
-                            strncpy(msg.ping_type, item->valuestring, sizeof(msg.ping_type) - 1);
-                        }
-
-                        /* Extract ping_target field */
-                        if ((item = cJSON_GetObjectItem(root, "ping_target")) && cJSON_IsString(item)) {
-                            strncpy(msg.ping_target, item->valuestring, sizeof(msg.ping_target) - 1);
-                        }
-
-                        /* Extract ping_task_id field */
-                        if ((item = cJSON_GetObjectItem(root, "ping_task_id")) && cJSON_IsNumber(item)) {
-                            msg.ping_task_id = (uint32_t)item->valuedouble;
-                        }
-
+                        ws_message_parse_from_json(root, &msg);
                         cJSON_Delete(root);
 
                         /* Reject messages with CR/LF in panel-controlled fields

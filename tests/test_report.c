@@ -401,6 +401,57 @@ void test_report_generate_basic_info_custom_ip(void) {
     cJSON_Delete(root);
 }
 
+/* Test report_generate: returns -1 when the buffer is too small.
+ * A 1-byte buffer can only hold a NUL terminator; any non-trivial JSON
+ * payload must be rejected to avoid truncation. */
+void test_report_generate_buffer_too_small(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    char tiny_buf[1];
+    TEST_ASSERT_EQUAL_INT(-1, report_generate(&config, tiny_buf, sizeof(tiny_buf)));
+
+    /* A 16-byte buffer is still far smaller than the full report JSON. */
+    char small_buf[16];
+    TEST_ASSERT_EQUAL_INT(-1, report_generate(&config, small_buf, sizeof(small_buf)));
+}
+
+/* Test report_generate_basic_info: returns -1 when the buffer is too small. */
+void test_report_generate_basic_info_buffer_too_small(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    char tiny_buf[1];
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_basic_info(&config, tiny_buf, sizeof(tiny_buf)));
+
+    char small_buf[16];
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_basic_info(&config, small_buf, sizeof(small_buf)));
+}
+
+/* Test report_generate_basic_info: gpu_name must always be a string field,
+ * never NULL. When gpu_get_name fails (no GPU, lspci missing, etc.) the
+ * implementation falls back to an empty string, so the JSON field is always
+ * present and of string type — verifying graceful degradation rather than
+ * a crash or NULL pointer dereference in downstream consumers. */
+void test_report_generate_basic_info_gpu_field_always_string(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    char buf[REPORT_BUF_SIZE];
+    int len = report_generate_basic_info(&config, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(len > 0);
+
+    cJSON *root = cJSON_Parse(buf);
+    TEST_ASSERT_NOT_NULL(root);
+
+    cJSON *gpu_name = cJSON_GetObjectItem(root, "gpu_name");
+    TEST_ASSERT_NOT_NULL(gpu_name);
+    TEST_ASSERT_TRUE(cJSON_IsString(gpu_name));
+    /* Whether the GPU is present or not, the field must be a valid string. */
+
+    cJSON_Delete(root);
+}
+
 /* ====== report_generate_v2 tests ====== */
 
 /* Test report_generate_v2: verify return value and JSON-RPC 2.0 structure. */
@@ -627,7 +678,9 @@ void test_report_generate_basic_info_v2_null_args(void) {
 int main(void) {
     UNITY_BEGIN();
 
-    /* report_generate tests */
+#ifdef __linux__
+    /* All report_generate tests invoke monitoring_get_* which read /proc;
+     * skip on non-Linux platforms where /proc does not exist. */
     RUN_TEST(test_report_generate_valid_json);
     RUN_TEST(test_report_generate_required_fields);
     RUN_TEST(test_report_generate_field_values);
@@ -636,23 +689,25 @@ int main(void) {
     RUN_TEST(test_report_generate_connections_fields);
     RUN_TEST(test_report_generate_load_fields);
 
-    /* report_generate_basic_info tests */
     RUN_TEST(test_report_generate_basic_info_valid_json);
     RUN_TEST(test_report_generate_basic_info_required_fields);
     RUN_TEST(test_report_generate_basic_info_field_values);
     RUN_TEST(test_report_generate_basic_info_null_args);
     RUN_TEST(test_report_generate_basic_info_custom_ip);
+    RUN_TEST(test_report_generate_basic_info_buffer_too_small);
+    RUN_TEST(test_report_generate_basic_info_gpu_field_always_string);
 
-    /* report_generate_v2 tests */
+    RUN_TEST(test_report_generate_buffer_too_small);
+
     RUN_TEST(test_report_generate_v2_jsonrpc_structure);
     RUN_TEST(test_report_generate_v2_params_contains_report);
     RUN_TEST(test_report_generate_v2_report_matches_v1);
     RUN_TEST(test_report_generate_v2_null_args);
     RUN_TEST(test_report_generate_v2_buffer_too_small);
 
-    /* report_generate_basic_info_v2 tests */
     RUN_TEST(test_report_generate_basic_info_v2_jsonrpc_structure);
     RUN_TEST(test_report_generate_basic_info_v2_null_args);
+#endif
 
     return UNITY_END();
 }

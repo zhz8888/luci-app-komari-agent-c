@@ -126,3 +126,18 @@ komari_add_test(test_v2
 komari_add_test(test_report
     SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test_report.c"
 )
+
+# test_compress — exercises compress.c + zlib (gzip round-trip, bomb guard)
+komari_add_test(test_compress
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test_compress.c"
+)
+
+# test_update — exercises update.c version comparison (pure function, no deps)
+komari_add_test(test_update
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test_update.c"
+)
+
+# test_v1 — exercises v1.c + cJSON (payload construction, ownership)
+komari_add_test(test_v1
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test_v1.c"
+)

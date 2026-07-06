@@ -157,10 +157,9 @@ void test_monitoring_get_swap_info(void) {
     int ret = monitoring_get_swap_info(&info);
     TEST_ASSERT_EQUAL_INT(0, ret);
 
-    /* Total swap size >= 0 (some systems may have no swap) */
-    TEST_ASSERT_TRUE(info.total >= 0);
-
-    /* Used should not exceed total */
+    /* total is uint64_t so ">= 0" is always true; the meaningful invariant
+     * is that used and free never exceed total (some systems have no swap,
+     * in which case all three are 0). */
     TEST_ASSERT_TRUE(info.used <= info.total);
 
     /* Free should not exceed total */
@@ -184,10 +183,8 @@ void test_monitoring_get_disk_info(void) {
     int ret = monitoring_get_disk_info(&info);
     TEST_ASSERT_EQUAL_INT(0, ret);
 
-    /* Total disk size should be >= 0 */
-    TEST_ASSERT_TRUE(info.total >= 0);
-
-    /* Free space should not exceed total */
+    /* total is uint64_t so ">= 0" is always true; the meaningful invariants
+     * are that free and used never exceed total. */
     TEST_ASSERT_TRUE(info.free <= info.total);
 
     /* Used space should not exceed total */
@@ -208,13 +205,11 @@ void test_monitoring_get_net_info(void) {
     int ret = monitoring_get_net_info(&info);
     TEST_ASSERT_EQUAL_INT(0, ret);
 
-    /* RX/TX byte counts should be >= 0 */
-    TEST_ASSERT_TRUE(info.rx_bytes >= 0);
-    TEST_ASSERT_TRUE(info.tx_bytes >= 0);
-
-    /* Packet counts should be >= 0 */
-    TEST_ASSERT_TRUE(info.rx_packets >= 0);
-    TEST_ASSERT_TRUE(info.tx_packets >= 0);
+    /* All counters in net_info_t are uint64_t, so ">= 0" is always true.
+     * The meaningful check is that the call succeeded (ret == 0, asserted
+     * above) and that the struct was populated; we rely on subsequent
+     * net_speed_update calls to derive rates from these counters. */
+    TEST_PASS();
 }
 
 /* Test monitoring_get_net_info with NULL pointer */
@@ -290,8 +285,9 @@ void test_monitoring_get_system_info(void) {
     /* Hostname should be a non-empty string */
     TEST_ASSERT_TRUE(strlen(info.hostname) > 0);
 
-    /* uptime should be >= 0 */
-    TEST_ASSERT_TRUE(info.uptime >= 0);
+    /* uptime is uint64_t so ">= 0" is always true; assert > 0 instead.
+     * A running system always has uptime > 0. */
+    TEST_ASSERT_TRUE(info.uptime > 0);
 }
 
 /* Test monitoring_get_system_info with NULL pointer */
@@ -305,8 +301,10 @@ void test_monitoring_get_system_info_null(void) {
 /* Test monitoring_get_uptime: verify system uptime retrieval */
 void test_monitoring_get_uptime(void) {
     uint64_t uptime = monitoring_get_uptime();
-    /* System uptime should be > 0 (may be 0 right after boot, but typically the system is already running when tested) */
-    TEST_ASSERT_TRUE(uptime >= 0);
+    /* uptime is uint64_t so ">= 0" is always true; assert > 0 instead.
+     * A freshly booted system could theoretically return 0, but any CI
+     * runner has been up for at least a few seconds by the time tests run. */
+    TEST_ASSERT_TRUE(uptime > 0);
 }
 
 /* ====== Process count tests ====== */
@@ -314,8 +312,9 @@ void test_monitoring_get_uptime(void) {
 /* Test monitoring_get_process_count: verify process count statistics */
 void test_monitoring_get_process_count(void) {
     int count = monitoring_get_process_count();
-    /* Process count should be >= 0, typically > 0 (at least the init process) */
-    TEST_ASSERT_TRUE(count >= 0);
+    /* At least the init process (PID 1) exists on any running system,
+     * so count must be > 0. */
+    TEST_ASSERT_TRUE(count > 0);
 }
 
 /* ====== IP address tests ====== */
@@ -344,7 +343,7 @@ void test_monitoring_get_ip_address_null_buffers(void) {
 int main(void) {
     UNITY_BEGIN();
 
-    /* Data structure size tests */
+    /* Data structure size tests (platform-independent) */
     RUN_TEST(test_monitoring_cpu_info_struct_size);
     RUN_TEST(test_monitoring_mem_info_struct_size);
     RUN_TEST(test_monitoring_disk_info_struct_size);
@@ -352,52 +351,45 @@ int main(void) {
     RUN_TEST(test_monitoring_load_info_struct_size);
     RUN_TEST(test_monitoring_conn_info_struct_size);
 
-    /* monitoring_set_config tests */
+    /* monitoring_set_config tests (platform-independent) */
     RUN_TEST(test_monitoring_set_config);
 
-    /* CPU info tests */
+#ifdef __linux__
+    /* /proc-dependent tests — only run on Linux. On other platforms
+     * (macOS, Windows) /proc does not exist, so these tests would
+     * fail or produce meaningless results. */
     RUN_TEST(test_monitoring_get_cpu_info);
     RUN_TEST(test_monitoring_get_cpu_info_null);
 
-    /* Memory info tests */
     RUN_TEST(test_monitoring_get_mem_info);
     RUN_TEST(test_monitoring_get_mem_info_null);
     RUN_TEST(test_monitoring_get_mem_info_with_cache_config);
 
-    /* Swap tests */
     RUN_TEST(test_monitoring_get_swap_info);
     RUN_TEST(test_monitoring_get_swap_info_null);
 
-    /* Disk info tests */
     RUN_TEST(test_monitoring_get_disk_info);
     RUN_TEST(test_monitoring_get_disk_info_null);
 
-    /* Network info tests */
     RUN_TEST(test_monitoring_get_net_info);
     RUN_TEST(test_monitoring_get_net_info_null);
     RUN_TEST(test_monitoring_net_speed_update);
 
-    /* Connection count tests */
     RUN_TEST(test_monitoring_get_conn_info);
     RUN_TEST(test_monitoring_get_conn_info_null);
 
-    /* Load info tests */
     RUN_TEST(test_monitoring_get_load_info);
     RUN_TEST(test_monitoring_get_load_info_null);
 
-    /* System info tests */
     RUN_TEST(test_monitoring_get_system_info);
     RUN_TEST(test_monitoring_get_system_info_null);
 
-    /* Uptime tests */
     RUN_TEST(test_monitoring_get_uptime);
-
-    /* Process count tests */
     RUN_TEST(test_monitoring_get_process_count);
 
-    /* IP address tests */
     RUN_TEST(test_monitoring_get_ip_address);
     RUN_TEST(test_monitoring_get_ip_address_null_buffers);
+#endif
 
     return UNITY_END();
 }

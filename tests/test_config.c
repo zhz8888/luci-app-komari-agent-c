@@ -206,6 +206,43 @@ void test_config_load_from_env_keep_defaults(void) {
     TEST_ASSERT_EQUAL_INT(5, config.max_retries);
 }
 
+/* Test config_load_from_env: verify that overlong string values are truncated
+ * to fit the fixed-size buffer and always NUL-terminated. This guards against
+ * buffer overflow regressions if strncpy is ever replaced with strcpy. */
+void test_config_load_from_env_truncates_overlong_strings(void) {
+    agent_config_t config;
+    config_init(&config);
+
+    /* Build a token value much longer than MAX_TOKEN_LEN (256). */
+    char overlong_token[1024];
+    memset(overlong_token, 'T', sizeof(overlong_token) - 1);
+    overlong_token[sizeof(overlong_token) - 1] = '\0';
+    setenv("AGENT_TOKEN", overlong_token, 1);
+
+    /* Build an endpoint longer than MAX_ENDPOINT_LEN (512). */
+    char overlong_endpoint[1024];
+    overlong_endpoint[0] = 'w';
+    overlong_endpoint[1] = 's';
+    overlong_endpoint[2] = 's';
+    overlong_endpoint[3] = ':';
+    overlong_endpoint[4] = '/';
+    overlong_endpoint[5] = '/';
+    memset(overlong_endpoint + 6, 'e', sizeof(overlong_endpoint) - 7);
+    overlong_endpoint[sizeof(overlong_endpoint) - 1] = '\0';
+    setenv("AGENT_ENDPOINT", overlong_endpoint, 1);
+
+    int ret = config_load_from_env(&config);
+    TEST_ASSERT_EQUAL_INT(0, ret);
+
+    /* token must be truncated to MAX_TOKEN_LEN-1 chars and NUL-terminated. */
+    TEST_ASSERT_EQUAL_INT(MAX_TOKEN_LEN - 1, (int)strlen(config.token));
+    TEST_ASSERT_EQUAL_INT('\0', config.token[MAX_TOKEN_LEN - 1]);
+
+    /* endpoint must be truncated to MAX_ENDPOINT_LEN-1 chars and NUL-terminated. */
+    TEST_ASSERT_EQUAL_INT(MAX_ENDPOINT_LEN - 1, (int)strlen(config.endpoint));
+    TEST_ASSERT_EQUAL_INT('\0', config.endpoint[MAX_ENDPOINT_LEN - 1]);
+}
+
 /* Test config_load_from_file: create a temporary JSON config file and verify fields are loaded correctly */
 void test_config_load_from_file_basic(void) {
     const char *json_content =
@@ -498,6 +535,7 @@ int main(void) {
     RUN_TEST(test_config_load_from_env_bool_variants);
     RUN_TEST(test_config_load_from_env_null);
     RUN_TEST(test_config_load_from_env_keep_defaults);
+    RUN_TEST(test_config_load_from_env_truncates_overlong_strings);
     RUN_TEST(test_config_load_from_file_basic);
     RUN_TEST(test_config_load_from_file_not_found);
     RUN_TEST(test_config_load_from_file_invalid_json);

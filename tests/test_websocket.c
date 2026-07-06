@@ -4,24 +4,23 @@
  * Test coverage:
  *   - ws_client_create / ws_client_destroy lifecycle management
  *   - ws_client_set_handler / ws_client_set_raw_handler / ws_client_set_user_data setters
- *   - ws_message_t JSON message parsing (verify field extraction logic)
- *   - WebSocket handshake validation (Sec-WebSocket-Accept computation, based on RFC 6455)
- *   - Mask computation validation
+ *   - ws_message_t JSON message parsing via the real ws_message_parse_from_json helper
+ *   - WebSocket handshake validation (real ws_compute_accept_key, RFC 6455 vector)
+ *   - Mask application via the real ws_apply_mask helper
  *   - RFC 6455 §5.4 fragmented message accumulation logic (ws_fragment_accumulate)
  *   - v2 JSON-RPC event handling (ws_handle_v2_event): deduplication, method dispatch, ACK accumulation
  *
- * Note: Frame parsing (ws_recv_frame), handshake (ws_handshake) and other internal functions
- * are static and cannot be unit tested directly. Real network connections are out of scope.
- * JSON message parsing logic is implemented in ws_recv_thread; here we reproduce the parsing
- * logic to verify correctness.
- * Fragment accumulation logic (ws_fragment_accumulate) is exposed via the header file and
- * can be tested directly.
- * v2 event handling logic (ws_handle_v2_event) is also exposed via the header file and can
- * be tested directly.
+ * Note: Real network connections are out of scope. Internal helpers that used to be
+ * static (base64_encode, compute_accept_key, mask loop, JSON field extraction) are now
+ * exposed via websocket_internal.h and tested directly, so a regression in the
+ * production code path will fail these tests rather than a logic copy.
+ * Fragment accumulation (ws_fragment_accumulate) and v2 event handling
+ * (ws_handle_v2_event) are exposed via websocket.h and tested directly.
  */
 
 #include "unity.h"
 #include "websocket.h"
+#include "websocket_internal.h"
 #include "cJSON.h"
 #include "v2.h"
 #include "jsonrpc.h"
@@ -29,51 +28,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <openssl/sha.h>
-
-/* Base64 encoding table */
-static const char base64_table[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/* Reproduce the base64_encode implementation from websocket.c for testing */
-static void test_base64_encode(const unsigned char *data, size_t len, char *out) {
-    size_t i, j;
-    for (i = 0, j = 0; i < len; i += 3, j += 4) {
-        unsigned int n = ((unsigned int)data[i]) << 16;
-        if (i + 1 < len) n |= ((unsigned int)data[i + 1]) << 8;
-        if (i + 2 < len) n |= data[i + 2];
-
-        out[j] = base64_table[(n >> 18) & 0x3F];
-        out[j + 1] = base64_table[(n >> 12) & 0x3F];
-        out[j + 2] = (i + 1 < len) ? base64_table[(n >> 6) & 0x3F] : '=';
-        out[j + 3] = (i + 2 < len) ? base64_table[n & 0x3F] : '=';
-    }
-    out[j] = '\0';
-}
-
-/*
- * Reproduce the compute_accept_key implementation from websocket.c
- * Concatenate Sec-WebSocket-Key with the magic string, compute SHA1, then Base64 encode
- */
-static void test_compute_accept_key(const char *key, char *accept_key) {
-    unsigned char hash[SHA_DIGEST_LENGTH];
-    char combined[256];
-    const char *magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-    snprintf(combined, sizeof(combined), "%s%s", key, magic);
-    SHA1((unsigned char *)combined, strlen(combined), hash);
-    test_base64_encode(hash, SHA_DIGEST_LENGTH, accept_key);
-}
-
-/*
- * Apply WebSocket mask (reproduce the mask logic from ws_recv_frame)
- * Mask rule: data[i] ^= mask[i % 4]
- */
-static void test_apply_mask(unsigned char *data, size_t len, const unsigned char *mask) {
-    for (size_t i = 0; i < len; i++) {
-        data[i] ^= mask[i % 4];
-    }
-}
 
 void setUp(void) {
 }
@@ -288,12 +242,16 @@ void test_ws_client_send_ping_not_connected(void) {
  * Uses the example from RFC 6455 Section 4.1:
  *   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
  *   Expected Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+ *
+ * This test exercises the real ws_compute_accept_key helper exposed via
+ * websocket_internal.h, so a regression in the production code path
+ * (wrong magic GUID, wrong SHA1, wrong Base64) will fail here.
  */
 void test_ws_handshake_accept_key_rfc6455(void) {
     const char *key = "dGhlIHNhbXBsZSBub25jZQ==";
     char accept_key[64];
 
-    test_compute_accept_key(key, accept_key);
+    TEST_ASSERT_EQUAL_INT(0, ws_compute_accept_key(key, accept_key, sizeof(accept_key)));
 
     /* Expected value per RFC 6455 */
     TEST_ASSERT_EQUAL_STRING("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accept_key);
@@ -304,15 +262,27 @@ void test_ws_handshake_accept_key_custom(void) {
     const char *key = "YWJjZGVmZ2hpamtsbW5vcA==";
     char accept_key[64];
 
-    test_compute_accept_key(key, accept_key);
+    TEST_ASSERT_EQUAL_INT(0, ws_compute_accept_key(key, accept_key, sizeof(accept_key)));
 
     /* Verify output is non-empty and has reasonable length (Base64-encoded SHA1 = 28 chars) */
     TEST_ASSERT_TRUE(strlen(accept_key) == 28);
 }
 
+/* Test ws_compute_accept_key rejects an undersized output buffer.
+ * The Base64-encoded SHA1 is 28 chars; requiring 29 bytes (incl. NUL) is the
+ * minimum. A 28-byte buffer must be rejected to avoid an unterminated string. */
+void test_ws_handshake_accept_key_buffer_too_small(void) {
+    const char *key = "dGhlIHNhbXBsZSBub25jZQ==";
+    char accept_key[28];
+
+    TEST_ASSERT_EQUAL_INT(-1, ws_compute_accept_key(key, accept_key, sizeof(accept_key)));
+}
+
 /* ====== WebSocket frame mask tests ====== */
 
-/* Test WebSocket client mask application: verify mask reversibility */
+/* Test WebSocket client mask application: verify mask reversibility.
+ * Exercises the real ws_apply_mask helper so a regression in the production
+ * mask loop (e.g., wrong modulo or wrong mask indexing) will fail here. */
 void test_ws_frame_mask_reversible(void) {
     unsigned char data[] = "Hello, WebSocket!";
     size_t data_len = strlen((char *)data);
@@ -322,13 +292,13 @@ void test_ws_frame_mask_reversible(void) {
     unsigned char mask[4] = {0x12, 0x34, 0x56, 0x78};
 
     /* Apply mask */
-    test_apply_mask(data, data_len, mask);
+    ws_apply_mask(data, data_len, mask);
 
     /* Masked data should differ from original data */
     TEST_ASSERT_NOT_EQUAL(0, memcmp(data, original, data_len));
 
     /* Applying the same mask again should restore original data */
-    test_apply_mask(data, data_len, mask);
+    ws_apply_mask(data, data_len, mask);
     TEST_ASSERT_EQUAL(0, memcmp(data, original, data_len));
 }
 
@@ -338,7 +308,7 @@ void test_ws_frame_mask_empty(void) {
     unsigned char mask[4] = {0xFF, 0xFF, 0xFF, 0xFF};
 
     /* Masking empty data should not crash */
-    test_apply_mask(data, 0, mask);
+    ws_apply_mask(data, 0, mask);
     TEST_PASS();
 }
 
@@ -352,7 +322,7 @@ void test_ws_frame_mask_non_aligned(void) {
     unsigned char mask[4] = {0xAA, 0xBB, 0xCC, 0xDD};
 
     /* Apply mask */
-    test_apply_mask(data, data_len, mask);
+    ws_apply_mask(data, data_len, mask);
 
     /* Verify each byte is correctly masked */
     for (size_t i = 0; i < data_len; i++) {
@@ -361,24 +331,19 @@ void test_ws_frame_mask_non_aligned(void) {
 }
 
 /* ====== ws_message_t JSON message parsing tests ====== */
+/* These tests exercise the real ws_message_parse_from_json helper exposed via
+ * websocket_internal.h, so a regression in the production field-extraction
+ * logic (wrong key name, missing fallback, wrong buffer size) will fail here
+ * rather than a logic copy in the test file. */
 
-/*
- * Test WebSocket message JSON parsing: construct a message with the message field
- * This test reproduces the JSON parsing logic in ws_recv_thread
- */
+/* Test WebSocket message JSON parsing: construct a message with the message field */
 void test_ws_message_parse_message_field(void) {
     const char *json_str = "{\"message\": \"hello world\"}";
     cJSON *root = cJSON_Parse(json_str);
     TEST_ASSERT_NOT_NULL(root);
 
-    ws_message_t msg;
-    memset(&msg, 0, sizeof(msg));
-
-    cJSON *item = cJSON_GetObjectItem(root, "message");
-    if (item && cJSON_IsString(item)) {
-        strncpy(msg.message, item->valuestring, sizeof(msg.message) - 1);
-    }
-
+    ws_message_t msg = {0};
+    TEST_ASSERT_EQUAL_INT(0, ws_message_parse_from_json(root, &msg));
     TEST_ASSERT_EQUAL_STRING("hello world", msg.message);
 
     cJSON_Delete(root);
@@ -391,15 +356,8 @@ void test_ws_message_parse_terminal_id(void) {
     cJSON *root1 = cJSON_Parse(json_str1);
     TEST_ASSERT_NOT_NULL(root1);
 
-    ws_message_t msg;
-    memset(&msg, 0, sizeof(msg));
-
-    cJSON *item = cJSON_GetObjectItem(root1, "terminal_id");
-    if (!item) item = cJSON_GetObjectItem(root1, "request_id");
-    if (item && cJSON_IsString(item)) {
-        strncpy(msg.terminal_id, item->valuestring, sizeof(msg.terminal_id) - 1);
-    }
-
+    ws_message_t msg = {0};
+    TEST_ASSERT_EQUAL_INT(0, ws_message_parse_from_json(root1, &msg));
     TEST_ASSERT_EQUAL_STRING("term-123", msg.terminal_id);
     cJSON_Delete(root1);
 
@@ -409,12 +367,7 @@ void test_ws_message_parse_terminal_id(void) {
     TEST_ASSERT_NOT_NULL(root2);
 
     memset(&msg, 0, sizeof(msg));
-    item = cJSON_GetObjectItem(root2, "terminal_id");
-    if (!item) item = cJSON_GetObjectItem(root2, "request_id");
-    if (item && cJSON_IsString(item)) {
-        strncpy(msg.terminal_id, item->valuestring, sizeof(msg.terminal_id) - 1);
-    }
-
+    TEST_ASSERT_EQUAL_INT(0, ws_message_parse_from_json(root2, &msg));
     TEST_ASSERT_EQUAL_STRING("req-456", msg.terminal_id);
     cJSON_Delete(root2);
 }
@@ -426,15 +379,8 @@ void test_ws_message_parse_exec_command(void) {
     cJSON *root1 = cJSON_Parse(json_str1);
     TEST_ASSERT_NOT_NULL(root1);
 
-    ws_message_t msg;
-    memset(&msg, 0, sizeof(msg));
-
-    cJSON *item = cJSON_GetObjectItem(root1, "exec_command");
-    if (!item) item = cJSON_GetObjectItem(root1, "command");
-    if (item && cJSON_IsString(item)) {
-        strncpy(msg.exec_command, item->valuestring, sizeof(msg.exec_command) - 1);
-    }
-
+    ws_message_t msg = {0};
+    TEST_ASSERT_EQUAL_INT(0, ws_message_parse_from_json(root1, &msg));
     TEST_ASSERT_EQUAL_STRING("ls -la", msg.exec_command);
     cJSON_Delete(root1);
 
@@ -444,12 +390,7 @@ void test_ws_message_parse_exec_command(void) {
     TEST_ASSERT_NOT_NULL(root2);
 
     memset(&msg, 0, sizeof(msg));
-    item = cJSON_GetObjectItem(root2, "exec_command");
-    if (!item) item = cJSON_GetObjectItem(root2, "command");
-    if (item && cJSON_IsString(item)) {
-        strncpy(msg.exec_command, item->valuestring, sizeof(msg.exec_command) - 1);
-    }
-
+    TEST_ASSERT_EQUAL_INT(0, ws_message_parse_from_json(root2, &msg));
     TEST_ASSERT_EQUAL_STRING("uname -a", msg.exec_command);
     cJSON_Delete(root2);
 }
@@ -460,15 +401,8 @@ void test_ws_message_parse_exec_task_id(void) {
     cJSON *root = cJSON_Parse(json_str);
     TEST_ASSERT_NOT_NULL(root);
 
-    ws_message_t msg;
-    memset(&msg, 0, sizeof(msg));
-
-    cJSON *item = cJSON_GetObjectItem(root, "exec_task_id");
-    if (!item) item = cJSON_GetObjectItem(root, "task_id");
-    if (item && cJSON_IsString(item)) {
-        strncpy(msg.exec_task_id, item->valuestring, sizeof(msg.exec_task_id) - 1);
-    }
-
+    ws_message_t msg = {0};
+    TEST_ASSERT_EQUAL_INT(0, ws_message_parse_from_json(root, &msg));
     TEST_ASSERT_EQUAL_STRING("task-789", msg.exec_task_id);
     cJSON_Delete(root);
 }
@@ -480,26 +414,8 @@ void test_ws_message_parse_ping_fields(void) {
     cJSON *root = cJSON_Parse(json_str);
     TEST_ASSERT_NOT_NULL(root);
 
-    ws_message_t msg;
-    memset(&msg, 0, sizeof(msg));
-
-    cJSON *item;
-
-    /* Parse ping_type */
-    if ((item = cJSON_GetObjectItem(root, "ping_type")) && cJSON_IsString(item)) {
-        strncpy(msg.ping_type, item->valuestring, sizeof(msg.ping_type) - 1);
-    }
-
-    /* Parse ping_target */
-    if ((item = cJSON_GetObjectItem(root, "ping_target")) && cJSON_IsString(item)) {
-        strncpy(msg.ping_target, item->valuestring, sizeof(msg.ping_target) - 1);
-    }
-
-    /* Parse ping_task_id */
-    if ((item = cJSON_GetObjectItem(root, "ping_task_id")) && cJSON_IsNumber(item)) {
-        msg.ping_task_id = (uint32_t)item->valuedouble;
-    }
-
+    ws_message_t msg = {0};
+    TEST_ASSERT_EQUAL_INT(0, ws_message_parse_from_json(root, &msg));
     TEST_ASSERT_EQUAL_STRING("icmp", msg.ping_type);
     TEST_ASSERT_EQUAL_STRING("8.8.8.8", msg.ping_target);
     TEST_ASSERT_EQUAL_UINT32(42, msg.ping_task_id);
@@ -522,45 +438,8 @@ void test_ws_message_parse_full_message(void) {
     cJSON *root = cJSON_Parse(json_str);
     TEST_ASSERT_NOT_NULL(root);
 
-    ws_message_t msg;
-    memset(&msg, 0, sizeof(msg));
-
-    cJSON *item;
-
-    if ((item = cJSON_GetObjectItem(root, "message")) && cJSON_IsString(item)) {
-        strncpy(msg.message, item->valuestring, sizeof(msg.message) - 1);
-    }
-
-    item = cJSON_GetObjectItem(root, "terminal_id");
-    if (!item) item = cJSON_GetObjectItem(root, "request_id");
-    if (item && cJSON_IsString(item)) {
-        strncpy(msg.terminal_id, item->valuestring, sizeof(msg.terminal_id) - 1);
-    }
-
-    item = cJSON_GetObjectItem(root, "exec_command");
-    if (!item) item = cJSON_GetObjectItem(root, "command");
-    if (item && cJSON_IsString(item)) {
-        strncpy(msg.exec_command, item->valuestring, sizeof(msg.exec_command) - 1);
-    }
-
-    item = cJSON_GetObjectItem(root, "exec_task_id");
-    if (!item) item = cJSON_GetObjectItem(root, "task_id");
-    if (item && cJSON_IsString(item)) {
-        strncpy(msg.exec_task_id, item->valuestring, sizeof(msg.exec_task_id) - 1);
-    }
-
-    if ((item = cJSON_GetObjectItem(root, "ping_type")) && cJSON_IsString(item)) {
-        strncpy(msg.ping_type, item->valuestring, sizeof(msg.ping_type) - 1);
-    }
-
-    if ((item = cJSON_GetObjectItem(root, "ping_target")) && cJSON_IsString(item)) {
-        strncpy(msg.ping_target, item->valuestring, sizeof(msg.ping_target) - 1);
-    }
-
-    if ((item = cJSON_GetObjectItem(root, "ping_task_id")) && cJSON_IsNumber(item)) {
-        msg.ping_task_id = (uint32_t)item->valuedouble;
-    }
-
+    ws_message_t msg = {0};
+    TEST_ASSERT_EQUAL_INT(0, ws_message_parse_from_json(root, &msg));
     TEST_ASSERT_EQUAL_STRING("exec", msg.message);
     TEST_ASSERT_EQUAL_STRING("term-001", msg.terminal_id);
     TEST_ASSERT_EQUAL_STRING("uptime", msg.exec_command);
@@ -572,11 +451,25 @@ void test_ws_message_parse_full_message(void) {
     cJSON_Delete(root);
 }
 
-/* Test WebSocket message JSON parsing: invalid JSON */
+/* Test WebSocket message JSON parsing: invalid JSON returns NULL from cJSON_Parse.
+ * ws_message_parse_from_json must reject a NULL root. */
 void test_ws_message_parse_invalid_json(void) {
     const char *json_str = "{ invalid json }";
     cJSON *root = cJSON_Parse(json_str);
     TEST_ASSERT_NULL(root);
+
+    /* The parser must reject NULL root without crashing. */
+    ws_message_t msg = {0};
+    TEST_ASSERT_EQUAL_INT(-1, ws_message_parse_from_json(NULL, &msg));
+}
+
+/* Test ws_message_parse_from_json rejects NULL msg. */
+void test_ws_message_parse_null_msg(void) {
+    const char *json_str = "{\"message\":\"x\"}";
+    cJSON *root = cJSON_Parse(json_str);
+    TEST_ASSERT_NOT_NULL(root);
+    TEST_ASSERT_EQUAL_INT(-1, ws_message_parse_from_json(root, NULL));
+    cJSON_Delete(root);
 }
 
 /* Test ws_message_t struct size */
@@ -585,6 +478,85 @@ void test_ws_message_struct_size(void) {
     /* message[32] + terminal_id[64] + exec_command[1024] + exec_task_id[64] +
        ping_task_id(4) + ping_type[16] + ping_target[256] */
     TEST_ASSERT_TRUE(sizeof(ws_message_t) >= 32 + 64 + 1024 + 64 + 4 + 16 + 256);
+}
+
+/* Boundary tests: overlong string fields must be truncated and NUL-terminated
+ * rather than overflowing the fixed-size buffers in ws_message_t. These tests
+ * cover the case where a malicious server sends an exec_command longer than
+ * 1024 bytes (which would overflow into exec_task_id and beyond if strncpy
+ * were replaced with strcpy or the NUL terminator were missing). */
+
+/* Test: exec_command exactly 1024 chars (buffer size) is truncated to 1023.
+ * The buffer holds 1024 bytes including the NUL terminator, so the maximum
+ * storable string is 1023 chars. */
+void test_ws_message_parse_exec_command_overlong_truncated(void) {
+    /* Build a JSON string with an exec_command of 1024 'A' characters. */
+    char overlong[1024 + 1];
+    memset(overlong, 'A', sizeof(overlong) - 1);
+    overlong[sizeof(overlong) - 1] = '\0';
+
+    /* JSON: {"exec_command":"AAAA..."} (2048 + 20 = ~2068 bytes) */
+    char json_str[32 + sizeof(overlong)];
+    snprintf(json_str, sizeof(json_str), "{\"exec_command\":\"%s\"}", overlong);
+
+    cJSON *root = cJSON_Parse(json_str);
+    TEST_ASSERT_NOT_NULL(root);
+
+    ws_message_t msg = {0};
+    TEST_ASSERT_EQUAL_INT(0, ws_message_parse_from_json(root, &msg));
+
+    /* The parser must truncate to sizeof(exec_command) - 1 = 1023 chars and
+     * NUL-terminate. */
+    TEST_ASSERT_EQUAL_INT((int)sizeof(msg.exec_command) - 1, (int)strlen(msg.exec_command));
+    TEST_ASSERT_EQUAL_INT('\0', msg.exec_command[sizeof(msg.exec_command) - 1]);
+    /* The byte just past the truncation point must be untouched (still 0 from
+     * the initial memset, since exec_task_id follows immediately in the
+     * struct). This catches an off-by-one that writes past the buffer. */
+    TEST_ASSERT_EQUAL_INT(0, msg.exec_task_id[0]);
+
+    cJSON_Delete(root);
+}
+
+/* Test: terminal_id overlong input is truncated to sizeof(terminal_id) - 1. */
+void test_ws_message_parse_terminal_id_overlong_truncated(void) {
+    char overlong[128 + 1];
+    memset(overlong, 'T', sizeof(overlong) - 1);
+    overlong[sizeof(overlong) - 1] = '\0';
+
+    char json_str[32 + sizeof(overlong)];
+    snprintf(json_str, sizeof(json_str), "{\"terminal_id\":\"%s\"}", overlong);
+
+    cJSON *root = cJSON_Parse(json_str);
+    TEST_ASSERT_NOT_NULL(root);
+
+    ws_message_t msg = {0};
+    TEST_ASSERT_EQUAL_INT(0, ws_message_parse_from_json(root, &msg));
+
+    TEST_ASSERT_EQUAL_INT((int)sizeof(msg.terminal_id) - 1, (int)strlen(msg.terminal_id));
+    TEST_ASSERT_EQUAL_INT('\0', msg.terminal_id[sizeof(msg.terminal_id) - 1]);
+
+    cJSON_Delete(root);
+}
+
+/* Test: ping_target overlong input is truncated to sizeof(ping_target) - 1. */
+void test_ws_message_parse_ping_target_overlong_truncated(void) {
+    char overlong[512 + 1];
+    memset(overlong, 'P', sizeof(overlong) - 1);
+    overlong[sizeof(overlong) - 1] = '\0';
+
+    char json_str[32 + sizeof(overlong)];
+    snprintf(json_str, sizeof(json_str), "{\"ping_target\":\"%s\"}", overlong);
+
+    cJSON *root = cJSON_Parse(json_str);
+    TEST_ASSERT_NOT_NULL(root);
+
+    ws_message_t msg = {0};
+    TEST_ASSERT_EQUAL_INT(0, ws_message_parse_from_json(root, &msg));
+
+    TEST_ASSERT_EQUAL_INT((int)sizeof(msg.ping_target) - 1, (int)strlen(msg.ping_target));
+    TEST_ASSERT_EQUAL_INT('\0', msg.ping_target[sizeof(msg.ping_target) - 1]);
+
+    cJSON_Delete(root);
 }
 
 /* ====== RFC 6455 §5.4 fragmented message accumulation logic tests ====== */
@@ -1279,6 +1251,7 @@ int main(void) {
     /* Handshake tests */
     RUN_TEST(test_ws_handshake_accept_key_rfc6455);
     RUN_TEST(test_ws_handshake_accept_key_custom);
+    RUN_TEST(test_ws_handshake_accept_key_buffer_too_small);
 
     /* Mask tests */
     RUN_TEST(test_ws_frame_mask_reversible);
@@ -1293,7 +1266,11 @@ int main(void) {
     RUN_TEST(test_ws_message_parse_ping_fields);
     RUN_TEST(test_ws_message_parse_full_message);
     RUN_TEST(test_ws_message_parse_invalid_json);
+    RUN_TEST(test_ws_message_parse_null_msg);
     RUN_TEST(test_ws_message_struct_size);
+    RUN_TEST(test_ws_message_parse_exec_command_overlong_truncated);
+    RUN_TEST(test_ws_message_parse_terminal_id_overlong_truncated);
+    RUN_TEST(test_ws_message_parse_ping_target_overlong_truncated);
 
     /* RFC 6455 §5.4 fragmented message accumulation tests */
     RUN_TEST(test_ws_fragment_unfragmented_text);

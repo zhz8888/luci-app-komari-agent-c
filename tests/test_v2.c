@@ -13,6 +13,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
 
 void setUp(void) {
 }
@@ -197,6 +199,72 @@ void test_v2_fallback_threshold(void) {
     v2_state_cleanup(&state);
 }
 
+/* ====== Concurrency test ====== */
+
+/* Stress test: multiple producer threads call v2_add_ack_event and
+ * v2_add_seen_event while a consumer thread calls v2_snapshot_ack_ids and
+ * v2_clear_acks. Run under ASan/TSan to detect data races or use-after-free
+ * in the mutex-protected state. */
+
+#define CONCURRENCY_PRODUCERS 4
+#define CONCURRENCY_ITERATIONS 2000
+
+static volatile int g_concurrency_running = 1;
+static v2_state_t g_concurrency_state;
+
+static void *concurrency_producer(void *arg) {
+    int tid = (int)(long)arg;
+    char event_id[32];
+    for (int i = 0; i < CONCURRENCY_ITERATIONS; i++) {
+        if (!g_concurrency_running) break;
+        snprintf(event_id, sizeof(event_id), "evt-%d-%d", tid, i);
+        v2_add_ack_event(&g_concurrency_state, tid * 100000 + i);
+        v2_add_seen_event(&g_concurrency_state, event_id);
+    }
+    return NULL;
+}
+
+static void *concurrency_consumer(void *arg) {
+    (void)arg;
+    int buf[256];
+    int count;
+    for (int i = 0; i < CONCURRENCY_ITERATIONS; i++) {
+        if (!g_concurrency_running) break;
+        v2_snapshot_ack_ids(&g_concurrency_state, buf, 256, &count);
+        if (i % 500 == 0) {
+            v2_clear_acks(&g_concurrency_state);
+        }
+    }
+    return NULL;
+}
+
+void test_v2_concurrent_access_no_crash(void) {
+    TEST_ASSERT_EQUAL_INT(0, v2_state_init(&g_concurrency_state));
+    g_concurrency_running = 1;
+
+    pthread_t producers[CONCURRENCY_PRODUCERS];
+    pthread_t consumer;
+
+    for (int i = 0; i < CONCURRENCY_PRODUCERS; i++) {
+        pthread_create(&producers[i], NULL, concurrency_producer, (void *)(long)i);
+    }
+    pthread_create(&consumer, NULL, concurrency_consumer, NULL);
+
+    for (int i = 0; i < CONCURRENCY_PRODUCERS; i++) {
+        pthread_join(producers[i], NULL);
+    }
+    g_concurrency_running = 0;
+    pthread_join(consumer, NULL);
+
+    /* After all threads finish, the state must still be consistent:
+     * ack_count >= 0 and <= V2_ACK_IDS_MAX, seen_count >= 0. */
+    TEST_ASSERT_TRUE(g_concurrency_state.ack_count >= 0);
+    TEST_ASSERT_TRUE(g_concurrency_state.ack_count <= V2_ACK_IDS_MAX);
+    TEST_ASSERT_TRUE(g_concurrency_state.seen_count >= 0);
+
+    v2_state_cleanup(&g_concurrency_state);
+}
+
 int main(void) {
     UNITY_BEGIN();
 
@@ -218,6 +286,9 @@ int main(void) {
 
     /* Fallback threshold */
     RUN_TEST(test_v2_fallback_threshold);
+
+    /* Concurrency */
+    RUN_TEST(test_v2_concurrent_access_no_crash);
 
     return UNITY_END();
 }
