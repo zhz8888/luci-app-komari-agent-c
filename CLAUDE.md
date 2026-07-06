@@ -22,12 +22,14 @@
 采用 Conventional Commits 格式：
 
 ```
-<type>(<scope>): <subject>  # type/scope 英文，subject 中文
+<type>(<scope>): <subject>  # type/scope 英文，subject 中文或英文
 
-<body>  # 中文
+<body>  # 中文或英文
 
 <footer>
 ```
+
+> **提交信息语言**：`type` 与 `scope` 必须使用英文；`subject` 与 `body` 可使用中文或英文，建议与同一提交内已使用的语言保持一致，且同一仓库的历史提交风格保持连贯。
 
 **提交类型**：`feat`、`fix`、`docs`、`style`、`refactor`、`perf`、`test`、`build`、`ci`、`chore`、`revert`
 
@@ -213,11 +215,19 @@ luci-app-komari-agent-c/
 |------|--------|------|
 | `KOMARI_BUILD_PROFILE` | `binary` | 构建 profile：`binary`（独立二进制）或 `openwrt`（OpenWrt 包） |
 | `KOMARI_BUILD_TESTS` | `ON`/`OFF` | 构建单元测试（OpenWrt profile 默认 OFF） |
+| `KOMARI_BUILD_SHARED` | `OFF` | 将 `komari_core` 构建为共享库而非静态库 |
 | `KOMARI_ENABLE_CPACK` | `ON`/`OFF` | 启用 CPack 打包（OpenWrt profile 默认 OFF） |
 | `KOMARI_ENABLE_LTO` | `OFF` | 链接时优化 |
 | `KOMARI_ENABLE_SANITIZERS` | `OFF` | ASan + UBSan |
+| `KOMARI_ENABLE_COVERAGE` | `OFF` | 代码覆盖率插桩（仅 gcc/clang） |
 | `KOMARI_ENABLE_PIE` | `ON` | 位置无关可执行文件 |
 | `KOMARI_WERROR` | `OFF` | 警告视为错误 |
+| `KOMARI_VERBOSE_CMAKE` | `OFF` | 打印详细 CMake 配置诊断信息 |
+| `KOMARI_ENABLE_CCACHE` | `ON` | 启用 ccache 加速重复构建 |
+| `KOMARI_HARDEN_STACK` | `ON` | 启用 `-fstack-protector-strong` |
+| `KOMARI_HARDEN_FORTIFY` | `ON` | 启用 `-D_FORTIFY_SOURCE=2` |
+| `KOMARI_HARDEN_FORMAT` | `ON` | 启用 `-Wformat -Werror=format-security` |
+| `KOMARI_HARDEN_VISIBILITY` | `ON` | 启用 `-fvisibility=hidden` 隐藏非导出符号 |
 
 ### 安全编译标志
 
@@ -235,7 +245,7 @@ Linux/OpenWrt 默认启用 5 项硬化选项：
 推送/PR 到 `main`/`develop` 分支时触发，包含 4 个 job：
 
 1. **test-binary-build** — 8 架构 Docker 二进制构建矩阵（amd64/arm64/arm/armv7/mipsel/mips64/riscv64/386）
-2. **test-openwrt-build** — 9 个 OpenWrt 架构 × 2 个版本（24.10.6、25.12.2）矩阵
+2. **test-openwrt-build** — 10 个 OpenWrt 架构 × 2 个版本（24.10.6、25.12.2）矩阵
 3. **test-luci-build** — LuCI 包构建测试（24.10.6、25.12.2）
 4. **lint** — 代码质量检查（codespell、shell 语法、YAML 校验、verify_ci_config.py、Docker 单元测试）
 
@@ -243,7 +253,7 @@ Linux/OpenWrt 默认启用 5 项硬化选项：
 
 推送 `v*` tag 时触发，包含 4 个 job：
 
-1. **build-openwrt** — 构建 OpenWrt IPK/APK 包（9 架构 × 2 版本）
+1. **build-openwrt** — 构建 OpenWrt IPK/APK 包（10 架构 × 2 版本）
 2. **build-binaries** — 构建独立二进制（8 架构 Docker）
 3. **build-luci** — 构建 LuCI 包（2 版本）
 4. **release** — 汇总产物并创建 GitHub Release

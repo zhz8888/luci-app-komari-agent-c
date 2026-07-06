@@ -24,7 +24,11 @@ validate_section() {
 		'include_mountpoints:string' \
 		'custom_ipv4:string' \
 		'custom_ipv6:string' \
-		'enable_gpu:bool:0'
+		'enable_gpu:bool:0' \
+		'auto_discovery_key:string' \
+		'protocol_version:int:2' \
+		'disable_compression:bool:0' \
+		'disable_auto_update:bool:0'
 }
 
 start_instance() {
@@ -32,6 +36,7 @@ start_instance() {
 	local disable_web_ssh max_retries reconnect_interval info_report_interval
 	local month_rotate include_nics exclude_nics include_mountpoints
 	local custom_ipv4 custom_ipv6 enable_gpu
+	local auto_discovery_key protocol_version disable_compression disable_auto_update
 
 	[ "$2" = "0" ] || {
 		echo "Validation failed"
@@ -60,6 +65,24 @@ start_instance() {
 	[ -n "$custom_dns" ] && procd_append_param command --dns "$custom_dns"
 	[ "$ignore_unsafe_cert" = "1" ] && procd_append_param command --insecure
 	[ "$disable_web_ssh" = "1" ] && procd_append_param command --disable-ssh
+
+	# Options without CLI flags are passed via environment variables consumed
+	# by config_load_from_env() in src/config/config.c. procd_set_param env
+	# injects them into the process environment.
+	procd_set_param env AGENT_MAX_RETRIES="$max_retries"
+	procd_set_param env AGENT_RECONNECT_INTERVAL="$reconnect_interval"
+	procd_set_param env AGENT_INFO_REPORT_INTERVAL="$info_report_interval"
+	procd_set_param env AGENT_MONTH_ROTATE="$month_rotate"
+	procd_set_param env AGENT_PROTOCOL_VERSION="$protocol_version"
+	procd_set_param env AGENT_DISABLE_AUTO_UPDATE="$disable_auto_update"
+	procd_set_param env AGENT_DISABLE_COMPRESSION="$disable_compression"
+	procd_set_param env AGENT_ENABLE_GPU="$enable_gpu"
+	[ -n "$include_nics" ] && procd_set_param env AGENT_INCLUDE_NICS="$include_nics"
+	[ -n "$exclude_nics" ] && procd_set_param env AGENT_EXCLUDE_NICS="$exclude_nics"
+	[ -n "$include_mountpoints" ] && procd_set_param env AGENT_INCLUDE_MOUNTPOINTS="$include_mountpoints"
+	[ -n "$custom_ipv4" ] && procd_set_param env AGENT_CUSTOM_IPV4="$custom_ipv4"
+	[ -n "$custom_ipv6" ] && procd_set_param env AGENT_CUSTOM_IPV6="$custom_ipv6"
+	[ -n "$auto_discovery_key" ] && procd_set_param env AGENT_AUTO_DISCOVERY_KEY="$auto_discovery_key"
 
 	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
 	procd_set_param stdout 1

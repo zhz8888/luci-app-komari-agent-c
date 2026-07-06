@@ -175,6 +175,11 @@ void monitoring_net_speed_update(void);
 /**
  * Set global config pointer, used by memory calculation and other modules to read config items.
  *
+ * Threading: must be called once during initialization before any monitoring_*
+ * function is invoked from a worker thread. The caller retains ownership of
+ * the config object; the agent only stores the pointer and never copies or
+ * frees it, so the config must outlive all monitoring calls.
+ *
  * @param config Pointer to the agent configuration
  */
 void monitoring_set_config(const agent_config_t *config);

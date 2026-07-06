@@ -24,33 +24,185 @@
 
 ## 📦 快速安装
 
+> 将下方 `<version>` 替换为最新 release 版本号（见 [Releases 页面](https://github.com/zhz8888/luci-app-komari-agent-c/releases)），`<arch>` 替换为目标架构。
+
 ### OpenWrt 系统（推荐）
 
 ```bash
 # OpenWrt >= 24.10（使用 APK）
-apk add komari-agent-c-1.0.0-1-<arch>.apk
+apk add komari-agent-c-<version>-<arch>.apk
 
 # OpenWrt < 24.10（使用 IPK）
-opkg install komari-agent-c_1.0.0-1_<arch>.ipk
+opkg install komari-agent-c_<version>_<arch>.ipk
 ```
 
 安装 LuCI 前端界面（可选）：
 
 ```bash
 # OpenWrt >= 24.10
-apk add luci-app-komari-agent-c-1.0.0-1-<arch>.apk
+apk add luci-app-komari-agent-c-<version>-<arch>.apk
 
 # OpenWrt < 24.10
-opkg install luci-app-komari-agent-c_1.0.0-1_<arch>.ipk
+opkg install luci-app-komari-agent-c_<version>_<arch>.ipk
 ```
 
 ### 其他 Linux 系统
 
 ```bash
 # 下载并解压二进制文件
-wget https://github.com/zhz8888/luci-app-komari-agent-c/releases/download/v1.0.0/komari-agent-c-1.0.0-linux-<arch>.tar.gz
-tar -xzf komari-agent-c-1.0.0-linux-<arch>.tar.gz
+wget https://github.com/zhz8888/luci-app-komari-agent-c/releases/download/v<version>/komari-agent-c-<version>-linux-<arch>.tar.gz
+tar -xzf komari-agent-c-<version>-linux-<arch>.tar.gz
 sudo cp komari-agent-c /usr/local/bin/
+```
+
+## 🚀 运行
+
+### 最小启动示例
+
+```bash
+komari-agent-c --token <TOKEN> --endpoint <URL>
+```
+
+- `<TOKEN>`：在 Komari 面板添加节点时获取的认证 Token
+- `<URL>`：面板的 WebSocket 地址，例如 `wss://panel.example.com/ws/client`
+
+### 常用启动参数
+
+| 参数 | 说明 |
+|------|------|
+| `-t, --token <token>` | 认证 Token（必填） |
+| `-e, --endpoint <url>` | 面板服务器 URL（必填） |
+| `-i, --interval <seconds>` | 上报间隔秒数，默认 1.0 |
+| `-d, --dns <server>` | 自定义 DNS 服务器 |
+| `-c, --config <file>` | JSON 配置文件路径 |
+| `-k, --insecure` | 忽略 TLS 证书错误（不推荐在生产环境使用） |
+| `-s, --disable-ssh` | 禁用 Web SSH 远程终端 |
+| `-v, --verbose` | 详细日志输出 |
+| `-h, --help` | 显示帮助信息 |
+
+### systemd 集成示例（非 OpenWrt 系统）
+
+```ini
+# /etc/systemd/system/komari-agent-c.service
+[Unit]
+Description=Komari Monitoring Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/komari-agent-c --token <TOKEN> --endpoint <URL>
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启用并启动：
+
+```bash
+sudo systemctl enable --now komari-agent-c
+```
+
+### OpenWrt 启动
+
+OpenWrt 安装 ipk/apk 后通过 `/etc/init.d/komari-agent-c` 管理：
+
+```bash
+/etc/init.d/komari-agent-c enable   # 开机自启
+/etc/init.d/komari-agent-c start    # 立即启动
+/etc/init.d/komari-agent-c restart  # 重启
+/etc/init.d/komari-agent-c stop     # 停止
+```
+
+## ⚙️ 配置说明
+
+Agent 支持四种配置途径，优先级从低到高依次为：
+
+1. **默认值**（`config_init`）
+2. **JSON 配置文件**（`--config <file>` 指定路径，或 `AGENT_CONFIG_FILE` 环境变量）
+3. **OpenWrt UCI**（`/etc/config/komari-agent-c`，仅 OpenWrt 环境）
+4. **环境变量**（`AGENT_*` 系列）
+5. **命令行参数**（优先级最高，覆盖以上所有来源）
+
+### 配置项一览
+
+| 字段 | 类型 | 默认值 | 环境变量 | CLI 参数 | 说明 |
+|------|------|--------|----------|----------|------|
+| `token` | string | 空 | `AGENT_TOKEN` | `--token` | 认证 Token（必填） |
+| `endpoint` | string | 空 | `AGENT_ENDPOINT` | `--endpoint` | 面板服务器 URL（必填） |
+| `interval` | float | `1.0` | `AGENT_INTERVAL` | `--interval` | 上报间隔（秒） |
+| `custom_dns` | string | 空 | `AGENT_CUSTOM_DNS` | `--dns` | 自定义 DNS 服务器 |
+| `ignore_unsafe_cert` | bool | `false` | `AGENT_IGNORE_UNSAFE_CERT` | `--insecure` | 忽略 TLS 证书错误 |
+| `disable_web_ssh` | bool | `false` | `AGENT_DISABLE_WEB_SSH` | `--disable-ssh` | 禁用 Web SSH |
+| `max_retries` | int | `5` | `AGENT_MAX_RETRIES` | - | 最大重连次数 |
+| `reconnect_interval` | int | `5` | `AGENT_RECONNECT_INTERVAL` | - | 重连间隔（秒） |
+| `info_report_interval` | int | `30` | `AGENT_INFO_REPORT_INTERVAL` | - | 系统信息上报间隔（秒） |
+| `month_rotate` | int | `0` | `AGENT_MONTH_ROTATE` | - | 流量统计月份切换日（0=自动） |
+| `protocol_version` | int | `2` | `AGENT_PROTOCOL_VERSION` | - | 协议版本（1 或 2） |
+| `disable_auto_update` | bool | `false` | `AGENT_DISABLE_AUTO_UPDATE` | - | 禁用自动更新检查 |
+| `disable_compression` | bool | `false` | `AGENT_DISABLE_COMPRESSION` | - | 禁用 v2 协议 gzip 压缩 |
+| `enable_gpu` | bool | `false` | `AGENT_ENABLE_GPU` | - | 启用 GPU 监控 |
+| `include_nics` | string | 空 | `AGENT_INCLUDE_NICS` | - | 包含的网卡（逗号分隔） |
+| `exclude_nics` | string | 空 | `AGENT_EXCLUDE_NICS` | - | 排除的网卡（逗号分隔） |
+| `include_mountpoints` | string | 空 | `AGENT_INCLUDE_MOUNTPOINTS` | - | 包含的挂载点（逗号分隔） |
+| `custom_ipv4` | string | 空 | `AGENT_CUSTOM_IPV4` | - | 自定义 IPv4 地址 |
+| `custom_ipv6` | string | 空 | `AGENT_CUSTOM_IPV6` | - | 自定义 IPv6 地址 |
+| `auto_discovery_key` | string | 空 | `AGENT_AUTO_DISCOVERY_KEY` | - | 自动发现注册密钥 |
+
+> **注**：布尔类型环境变量接受 `true`/`false`、`1`/`0`、`on`/`off` 等常见格式。
+
+### JSON 配置文件示例
+
+字段名与上表一致，保存为 `/etc/komari/agent.json`：
+
+```json
+{
+  "token": "your-token-here",
+  "endpoint": "wss://panel.example.com/ws/client",
+  "interval": 2.0,
+  "max_retries": 10,
+  "reconnect_interval": 10,
+  "protocol_version": 2,
+  "enable_gpu": true,
+  "include_nics": "eth0,wlan0",
+  "exclude_nics": "docker0"
+}
+```
+
+启动时通过 `--config` 指定：
+
+```bash
+komari-agent-c --config /etc/komari/agent.json
+```
+
+文件权限应为 `600`（仅所有者可读写），否则 agent 会拒绝加载：
+
+```bash
+chmod 600 /etc/komari/agent.json
+```
+
+### OpenWrt UCI 配置
+
+UCI 配置文件位于 `/etc/config/komari-agent-c`，字段名与上表一致：
+
+```sh
+config komari-agent-c 'komari-agent-c'
+    option token 'your-token-here'
+    option endpoint 'wss://panel.example.com/ws/client'
+    option interval '1.0'
+    option protocol_version '2'
+    option enable_gpu '0'
+```
+
+通过 `uci` 命令修改：
+
+```sh
+uci set komari-agent-c.komari-agent-c.token='your-token'
+uci set komari-agent-c.komari-agent-c.endpoint='wss://panel.example.com/ws/client'
+uci commit komari-agent-c
+/etc/init.d/komari-agent-c restart
 ```
 
 ## 🛠️ 本地构建
@@ -75,6 +227,8 @@ cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build
 cmake --preset default      # 默认 Release + 测试
 cmake --preset debug        # Debug + 详细诊断
 cmake --preset release      # Release + LTO，无测试
+cmake --preset relwithdebinfo # 优化 + 调试符号
+cmake --preset minsizerel   # 最小体积（嵌入式目标）
 cmake --preset sanitize     # ASan + UBSan
 cmake --preset coverage     # 代码覆盖率
 cmake --preset openwrt      # OpenWrt 交叉编译（需 SDK 环境）
@@ -107,7 +261,7 @@ ctest --test-dir build --output-on-failure
 
 ## 📋 系统要求
 
-- OpenWrt 21.02 或更高版本（CI 测试覆盖 24.10.x 和 25.12.x）
+- OpenWrt 24.10 或更高版本（CI 测试覆盖 24.10.6 与 25.12.2）
 - 最低内存：64MB
 - 必需依赖：`libpthread`、`libopenssl`、`librt`、`zlib`
 
@@ -118,6 +272,10 @@ ctest --test-dir build --output-on-failure
 3. **证书校验**：生产环境不要忽略证书错误
 4. **禁用 Web SSH**：如不需要远程终端，建议禁用
 5. **定期更新**：保持 OpenSSL 依赖为最新版本
+
+## 🤝 贡献
+
+欢迎提交 Issue 和 Pull Request。提交前请阅读 [贡献指南](CONTRIBUTING.md)（[English](CONTRIBUTING.en.md)），了解 Git 提交规范、代码规范与测试要求。
 
 ## 📄 许可证
 

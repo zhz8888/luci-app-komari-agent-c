@@ -152,6 +152,11 @@ int ws_client_send_ping(ws_client_t *client);
 /**
  * Set the JSON message handler invoked for incoming text frames parsed as JSON.
  *
+ * Threading: the handler is invoked on the client's receive thread. Handlers
+ * must not block, must not call ws_client_destroy, and must not acquire locks
+ * that could be held by the caller's thread (see main.c terminal teardown
+ * order for an example of the lock-ordering constraints).
+ *
  * @param client  Pointer to the client.
  * @param handler Callback function. May be NULL to clear.
  */
@@ -161,6 +166,11 @@ void ws_client_set_handler(ws_client_t *client, ws_message_handler_t handler);
  * Set the raw data handler invoked for incoming text frames without JSON parsing
  * (used by terminal sessions and similar scenarios).
  *
+ * Threading: the handler is invoked on the client's receive thread. Handlers
+ * must not block, must not call ws_client_destroy, and must not acquire locks
+ * that could be held by the caller's thread (see main.c terminal teardown
+ * order for an example of the lock-ordering constraints).
+ *
  * @param client  Pointer to the client.
  * @param handler Callback function. May be NULL to clear.
  */
@@ -168,6 +178,10 @@ void ws_client_set_raw_handler(ws_client_t *client, ws_raw_handler_t handler);
 
 /**
  * Set the user data pointer stored on the client.
+ *
+ * Ownership: caller retains ownership of `data`; the client only stores the
+ * pointer and never frees it. The caller must ensure `data` remains valid for
+ * the lifetime of the client (or until replaced with another pointer).
  *
  * @param client Pointer to the client.
  * @param data   Opaque user data pointer.
