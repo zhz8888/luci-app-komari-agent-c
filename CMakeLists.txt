@@ -132,7 +132,7 @@ if(KOMARI_ENABLE_CPACK)
     set(CPACK_DEBIAN_PACKAGE_MAINTAINER   "zhz8888 <zhz8888@users.noreply.github.com>")
     set(CPACK_DEBIAN_PACKAGE_SECTION      "net")
     set(CPACK_DEBIAN_PACKAGE_PRIORITY     "optional")
-    set(CPACK_DEBIAN_PACKAGE_DEPENDS      "libssl3, zlib1g (>= 1:1.2.0)")
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS      "libssl3 | libssl1.1, zlib1g (>= 1:1.2.11)")
 
     # RPM-specific
     set(CPACK_RPM_PACKAGE_ARCHITECTURE    "${CPACK_PACKAGE_ARCH}")

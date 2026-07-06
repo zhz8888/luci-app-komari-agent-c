@@ -900,12 +900,10 @@ static void *heartbeat_thread(void *arg) {
  * @return 0 on success, non-zero on failure
  */
 int main(int argc, char *argv[]) {
-    /* OpenSSL 1.0.2 requires manual library initialization; 1.1.0+ auto-initializes */
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_all_algorithms();
-#endif
+    /* OpenSSL 1.1.0+ initializes itself automatically; no explicit
+     * SSL_library_init / SSL_load_error_strings / OpenSSL_add_all_algorithms
+     * calls are needed. The project requires OpenSSL >= 1.1.0 (see
+     * cmake/Dependencies.cmake), so the 1.0.2 init path was removed. */
 
     config_init(&g_config);
     
@@ -1268,11 +1266,9 @@ int main(int argc, char *argv[]) {
 
     printf("Service stopped\n");
 
-    /* OpenSSL 1.0.2 requires manual cleanup; 1.1.0+ auto-cleans */
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-    EVP_cleanup();
-    ERR_remove_state(0);
-#endif
+    /* OpenSSL 1.1.0+ cleans up automatically; no EVP_cleanup /
+     * ERR_remove_state calls are needed. The project requires OpenSSL >= 1.1.0
+     * (see cmake/Dependencies.cmake), so the 1.0.2 cleanup path was removed. */
 
     return 0;
 }

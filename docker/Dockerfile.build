@@ -3,7 +3,13 @@
 # libraries for these architectures. For armel/mipsel/mips64el use the
 # companion Dockerfile.legacy (debian:bookworm-slim) instead, because
 # Ubuntu 24.04 lacks cross support for those targets.
-FROM ubuntu:24.04
+#
+# BASE_IMAGE is parameterized so CI can pin a digest-locked image for
+# reproducible builds (see docker/README.md → "Pinning base image digests"):
+#   docker build --build-arg BASE_IMAGE=ubuntu:24.04@sha256:<hash> ...
+# The default (ubuntu:24.04) uses the mutable tag for local development.
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE}
 
 ARG DEBIAN_ARCH=amd64
 ARG MULTIARCH_TRIPLET=x86_64-linux-gnu

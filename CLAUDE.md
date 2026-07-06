@@ -11,8 +11,8 @@
 - **CI/CD**：GitHub Actions（`ci.yml` + `release.yml`）
 - **目标平台**：Linux、OpenWrt、8 种 CPU 架构
 - **前端界面**：LuCI（Lua + CBI 框架，支持中英文 i18n）
-- **测试框架**：Unity v2.5.2
-- **第三方库**：cJSON v1.7.19、OpenSSL、zlib
+- **测试框架**：Unity v2.6.1
+- **第三方库**：cJSON v1.7.19、OpenSSL (>=1.1.0)、zlib (>=1.2.11)
 - **交叉编译**：Docker 化构建（Dockerfile.build + Dockerfile.legacy）
 
 ## 开发规范
@@ -268,9 +268,15 @@ LuCI 前端位于 `luci/` 目录，提供 Web 配置界面：
 - **ACL 权限**：通过 `luci-app-komari-agent-c` ACL 定义控制访问
 - **包元数据**：使用 `luci.mk` 标准流程，`LUCI_PKGARCH:=all`
 
-### LuCI 版本同步
+### 版本同步
 
-`luci/Makefile` 的 `PKG_VERSION` 必须与主项目版本保持同步。
+以下三处版本号必须与主项目版本保持一致，由 `scripts/update-version.sh` 统一更新：
+
+1. `include/komari-agent-c/version.h` — `KOMARI_AGENT_C_VERSION_*` 宏
+2. `openwrt/Makefile` — `PKG_VERSION` 与 `PKG_SOURCE_VERSION`（新 tag 推送后两者应一致）
+3. `luci/Makefile` — `PKG_VERSION`
+
+发布新版本时，通过 `scripts/update-version.sh <version>` 一次性同步所有位置。
 
 ## 多架构支持
 

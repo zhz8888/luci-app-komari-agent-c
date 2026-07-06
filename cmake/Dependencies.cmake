@@ -10,9 +10,10 @@ include_guard(GLOBAL)
 # ---------------------------------------------------------------------------
 # Required dependencies
 # ---------------------------------------------------------------------------
-# OpenSSL is used for TLS (websocket.c) and crypto primitives. Require at
-# least 1.1.0 so SSL_CTX_new / TLS_method() are available. OpenSSL 3.x is
-# the default on Ubuntu 24.04 / Debian bookworm / OpenWrt master.
+# OpenSSL is used for TLS (websocket.c) and crypto primitives. Require
+# OpenSSL 1.1.0+; 1.0.2 is not supported. SSL_CTX_new / TLS_client_method()
+# are available in 1.1.0+. OpenSSL 3.x is the default on Ubuntu 24.04 /
+# Debian bookworm / OpenWrt master.
 find_package(OpenSSL 1.1.0 REQUIRED)
 message(STATUS "OpenSSL: ${OPENSSL_VERSION} (include: ${OPENSSL_INCLUDE_DIR})")
 

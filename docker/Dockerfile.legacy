@@ -3,7 +3,13 @@
 # architectures, so we fall back to Debian bookworm-slim which still ships
 # full cross-toolchain and target library support. The companion
 # Dockerfile.build (ubuntu:24.04) handles amd64/arm64/armhf/riscv64/i386.
-FROM debian:bookworm-slim
+#
+# BASE_IMAGE is parameterized so CI can pin a digest-locked image for
+# reproducible builds (see docker/README.md → "Pinning base image digests"):
+#   docker build --build-arg BASE_IMAGE=debian:bookworm-slim@sha256:<hash> ...
+# The default (debian:bookworm-slim) uses the mutable tag for local development.
+ARG BASE_IMAGE=debian:bookworm-slim
+FROM ${BASE_IMAGE}
 
 ARG DEBIAN_ARCH=amd64
 ARG MULTIARCH_TRIPLET=x86_64-linux-gnu

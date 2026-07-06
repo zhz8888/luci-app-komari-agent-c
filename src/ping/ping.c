@@ -631,12 +631,9 @@ int ping_task_http(const char *target, int timeout_ms, const char *custom_dns, i
     SSL_CTX *ssl_ctx = NULL;
 
     if (use_tls) {
-        /* OpenSSL compatibility: 1.0.2 uses SSLv23_client_method, 1.1.0+ uses TLS_client_method */
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-        ssl_ctx = SSL_CTX_new(SSLv23_client_method());
-#else
+        /* The project requires OpenSSL >= 1.1.0, so TLS_client_method() is
+         * always available. */
         ssl_ctx = SSL_CTX_new(TLS_client_method());
-#endif
         if (!ssl_ctx) {
             close(fd);
             return -1;

@@ -245,12 +245,9 @@ static int http_post_get_body(const char *url,
 
     /* TLS connection */
     if (strcmp(scheme, "https") == 0) {
-        /* OpenSSL version compatibility: 1.0.2 uses SSLv23_client_method, 1.1.0+ uses TLS_client_method */
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-        ssl_ctx = SSL_CTX_new(SSLv23_client_method());
-#else
+        /* The project requires OpenSSL >= 1.1.0, so TLS_client_method() is
+         * always available. */
         ssl_ctx = SSL_CTX_new(TLS_client_method());
-#endif
         if (!ssl_ctx) {
             close(fd);
             KOMARI_LOG_ERROR("Auto-discovery: Failed to create SSL_CTX");

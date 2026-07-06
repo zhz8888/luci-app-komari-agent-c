@@ -119,6 +119,53 @@ export APT_MIRROR=cn
 APT_MIRROR=cn ./scripts/docker-build.sh amd64
 ```
 
+## 锁定基础镜像 digest（供应链安全）
+
+Dockerfile 默认使用可变 tag（`ubuntu:24.04`、`debian:bookworm-slim`），发行方可能随时重新发布镜像。为确保 8 种架构交叉编译在时间维度上可重现，并防止供应链篡改，CI 和正式发布应使用 digest 锁定。
+
+### 查询当前 digest
+
+使用 `scripts/lock-docker-images.sh` 脚本自动查询 Docker Hub API 并输出锁定命令：
+
+```bash
+./scripts/lock-docker-images.sh
+```
+
+输出示例：
+
+```
+# Dockerfile.build (ubuntu:24.04)
+docker build --build-arg BASE_IMAGE=ubuntu:24.04@sha256:abcdef1234567890... -f docker/Dockerfile.build ...
+
+# Dockerfile.legacy (debian:bookworm-slim)
+docker build --build-arg BASE_IMAGE=debian:bookworm-slim@sha256:0987654321abcdef... -f docker/Dockerfile.legacy ...
+```
+
+### 在 CI 中使用
+
+在 `scripts/docker-build.sh` 调用时传入 `BASE_IMAGE` 构建参数：
+
+```bash
+# 先查询 digest
+UBUNTU_DIGEST=$(docker buildx imagetools inspect ubuntu:24.04 --format '{{.Manifest.Digest}}')
+# 构建时锁定
+./scripts/docker-build.sh amd64 --build-arg BASE_IMAGE=ubuntu:24.04@${UBUNTU_DIGEST}
+```
+
+### 升级 digest 流程
+
+1. 运行 `scripts/lock-docker-images.sh` 获取最新 digest
+2. 在 CI 中更新 digest 值（建议通过 PR 提交，便于审计）
+3. 可选：使用 Dependabot（`.github/dependabot.yml` 中 `docker` 生态）自动创建 PR 升级基础镜像
+
+### 追溯构建所用镜像
+
+CI 构建后，通过以下命令记录本次构建所用镜像 digest 到 artifact：
+
+```bash
+docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' komari-build:latest
+```
+
 ## 常见问题
 
 ### 出现 "Read-only file system" 错误

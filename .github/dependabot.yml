@@ -1,0 +1,44 @@
+# Dependabot configuration for komari-agent-c
+# Monitors GitHub Actions and Docker base images for updates, automatically
+# creating PRs when new versions are released. This complements the SHA-pinning
+# strategy for critical actions (checkout, gh-release, gh-action-sdk) by making
+# version upgrades visible through reviewable PRs rather than silent floating-tag
+# drift.
+#
+# See: https://docs.github.com/code-security/dependabot/working-with-dependabot
+version: 2
+
+updates:
+  # GitHub Actions — monitor all workflows in .github/workflows/
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "ci(deps)"
+      include: "scope"
+    groups:
+      # Group minor/patch updates together to reduce PR noise
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Docker base images — monitor Dockerfiles for base image updates
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "build(deps)"
+      include: "scope"

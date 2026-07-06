@@ -1,7 +1,7 @@
 # Copyright (C) 2026 zhz8888/luci-app-komari-agent-c Contributors
 # Licensed under MIT License
 #
-# Unit test definitions for komari-agent-c. Tests use the Unity v2.5.2
+# Unit test definitions for komari-agent-c. Tests use the Unity v2.6.1
 # framework shipped in this directory and link against the komari_core
 # static library to avoid recompiling individual source files.
 

@@ -119,6 +119,55 @@ Or inline:
 APT_MIRROR=cn ./scripts/docker-build.sh amd64
 ```
 
+## Pinning base image digests (supply chain security)
+
+The Dockerfiles use mutable tags (`ubuntu:24.04`, `debian:bookworm-slim`) by
+default, which can be republished at any time. To ensure reproducible builds
+across the 8 target architectures and prevent supply chain tampering, CI and
+release builds should pin digests.
+
+### Querying current digests
+
+Use the `scripts/lock-docker-images.sh` helper to query Docker Hub and print
+the locked build commands:
+
+```bash
+./scripts/lock-docker-images.sh
+```
+
+Example output:
+
+```
+# Dockerfile.build (ubuntu:24.04)
+docker build --build-arg BASE_IMAGE=ubuntu:24.04@sha256:abcdef1234567890... -f docker/Dockerfile.build ...
+
+# Dockerfile.legacy (debian:bookworm-slim)
+docker build --build-arg BASE_IMAGE=debian:bookworm-slim@sha256:0987654321abcdef... -f docker/Dockerfile.legacy ...
+```
+
+### Using in CI
+
+Pass the `BASE_IMAGE` build arg when invoking `scripts/docker-build.sh`:
+
+```bash
+UBUNTU_DIGEST=$(docker buildx imagetools inspect ubuntu:24.04 --format '{{.Manifest.Digest}}')
+./scripts/docker-build.sh amd64 --build-arg BASE_IMAGE=ubuntu:24.04@${UBUNTU_DIGEST}
+```
+
+### Upgrading digests
+
+1. Run `scripts/lock-docker-images.sh` to get the latest digests
+2. Update the digest values in CI via a PR (for audit trail)
+3. Optionally use Dependabot (`.github/dependabot.yml` with `docker` ecosystem) to auto-create PRs
+
+### Tracing the image used by a build
+
+After a CI build, record the image digest to an artifact:
+
+```bash
+docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' komari-build:latest
+```
+
 ## Troubleshooting
 
 ### "Read-only file system" errors

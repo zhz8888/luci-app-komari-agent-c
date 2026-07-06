@@ -261,6 +261,7 @@ class CIConfigValidator:
         self._check_cross_compilation()
         self._check_cmake_config()
         self._check_openwrt_config()
+        self._check_version_consistency()
 
     def _check_job_dependencies(self):
         """Verify workflow job dependency chains."""
@@ -519,6 +520,92 @@ class CIConfigValidator:
                     f"{workflow}: PKG_SOURCE removal sed",
                     "PKG_SOURCE_PROTO:/d" in content,
                 )
+
+        self.logger.info("")
+
+    def _check_version_consistency(self):
+        """Verify version numbers are consistent across version.h, openwrt/Makefile, and luci/Makefile."""
+        self.logger.info("--- Version Consistency Check ---")
+
+        versions = {}
+
+        # 1. include/komari-agent-c/version.h
+        version_h, err = self._read_file("include/komari-agent-c/version.h")
+        if not err:
+            match = re.search(
+                r'#define\s+KOMARI_AGENT_C_VERSION_STRING\s+"([^"]+)"',
+                version_h,
+            )
+            if match:
+                versions["version.h"] = match.group(1)
+                self.check(
+                    "version.h: KOMARI_AGENT_C_VERSION_STRING is defined",
+                    True,
+                )
+            else:
+                self.check(
+                    "version.h: KOMARI_AGENT_C_VERSION_STRING is defined",
+                    False,
+                )
+        else:
+            self.check("version.h: file exists", False)
+
+        # 2. openwrt/Makefile
+        openwrt_mk, err = self._read_file("openwrt/Makefile")
+        if not err:
+            match = re.search(r"^PKG_VERSION:=(\S+)", openwrt_mk, re.MULTILINE)
+            if match:
+                versions["openwrt/Makefile"] = match.group(1)
+                self.check(
+                    "openwrt/Makefile: PKG_VERSION is defined",
+                    True,
+                )
+            else:
+                self.check(
+                    "openwrt/Makefile: PKG_VERSION is defined",
+                    False,
+                )
+
+            # Also check PKG_SOURCE_VERSION matches v<version>
+            match_src = re.search(
+                r"^PKG_SOURCE_VERSION:=(\S+)", openwrt_mk, re.MULTILINE
+            )
+            if match_src and "openwrt/Makefile" in versions:
+                expected = f"v{versions['openwrt/Makefile']}"
+                self.check(
+                    f"openwrt/Makefile: PKG_SOURCE_VERSION matches v<version> "
+                    f"(expected {expected}, got {match_src.group(1)})",
+                    match_src.group(1) == expected,
+                )
+        else:
+            self.check("openwrt/Makefile: file exists", False)
+
+        # 3. luci/Makefile
+        luci_mk, err = self._read_file("luci/Makefile")
+        if not err:
+            match = re.search(r"^PKG_VERSION:=(\S+)", luci_mk, re.MULTILINE)
+            if match:
+                versions["luci/Makefile"] = match.group(1)
+                self.check(
+                    "luci/Makefile: PKG_VERSION is defined",
+                    True,
+                )
+            else:
+                self.check(
+                    "luci/Makefile: PKG_VERSION is defined",
+                    False,
+                )
+        else:
+            self.check("luci/Makefile: file exists", False)
+
+        # 4. Cross-check consistency
+        if len(versions) >= 2:
+            unique_versions = set(versions.values())
+            self.check(
+                f"Version consistency across {', '.join(sorted(versions.keys()))} "
+                f"(all should be equal: {versions})",
+                len(unique_versions) == 1,
+            )
 
         self.logger.info("")
 

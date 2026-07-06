@@ -1347,12 +1347,10 @@ int ws_client_connect(ws_client_t *client) {
     }
     
     if (client->use_tls) {
-        /* OpenSSL version compatibility: 1.0.2 uses SSLv23_client_method, 1.1.0+ uses TLS_client_method */
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-        client->ssl_ctx = SSL_CTX_new(SSLv23_client_method());
-#else
+        /* The project requires OpenSSL >= 1.1.0 (see cmake/Dependencies.cmake),
+         * so TLS_client_method() is always available. SSLv23_client_method()
+         * was removed in OpenSSL 3.0 and is not compiled here. */
         client->ssl_ctx = SSL_CTX_new(TLS_client_method());
-#endif
         if (!client->ssl_ctx) {
             close(client->fd);
             client->fd = -1;
