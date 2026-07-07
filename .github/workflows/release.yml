@@ -279,7 +279,7 @@ jobs:
           scripts/generate-release-notes.sh "$VERSION" "${{ github.repository }}"
 
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: Komari Agent v${{ steps.get_version.outputs.VERSION }}
           body_path: release_notes.md
