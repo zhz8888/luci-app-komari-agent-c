@@ -23,11 +23,10 @@
     #error "Unsupported platform: only Linux/OpenWrt is supported"
 #endif
 
-/* Common error codes */
-#define KOMARI_OK          0
-#define KOMARI_ERROR      -1
-#define KOMARI_ERR_NO_MEM -2
-#define KOMARI_ERR_IO     -3
-#define KOMARI_ERR_NET    -4
+/* Unified error codes. See komari_errno.h for the full enum and the
+ * komari_strerror helper. KOMARI_ERROR is kept as a readable alias for
+ * legacy 0/-1 code paths that have not yet migrated to komari_errno_t. */
+#include "komari_errno.h"
+#define KOMARI_ERROR KOMARI_ERR_GENERIC
 
 #endif /* KOMARI_AGENT_C_COMMON_H */

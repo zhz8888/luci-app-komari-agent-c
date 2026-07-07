@@ -11,11 +11,13 @@
  *   - v2 JSON-RPC event handling (ws_handle_v2_event): deduplication, method dispatch, ACK accumulation
  *
  * Note: Real network connections are out of scope. Internal helpers that used to be
- * static (base64_encode, compute_accept_key, mask loop, JSON field extraction) are now
- * exposed via websocket_internal.h and tested directly, so a regression in the
- * production code path will fail these tests rather than a logic copy.
- * Fragment accumulation (ws_fragment_accumulate) and v2 event handling
- * (ws_handle_v2_event) are exposed via websocket.h and tested directly.
+ * static (base64_encode, compute_accept_key, mask loop, JSON field extraction,
+ * fragment accumulation, v2 event handling) are exposed via websocket_internal.h
+ * and tested directly, so a regression in the production code path will fail
+ * these tests rather than a logic copy. The full struct ws_client definition
+ * also lives in websocket_internal.h so tests can assert on internal state
+ * (connected flag, fragment buffer, v2 ack list) that application code treats
+ * as opaque.
  */
 
 #include "unity.h"

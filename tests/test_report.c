@@ -26,12 +26,11 @@
 #define REPORT_BUF_SIZE 8192
 
 void setUp(void) {
-    /* Set global config pointer for use by the monitoring module */
-    monitoring_set_config(NULL);
+    /* Monitoring module no longer holds global state; nothing to reset. */
 }
 
 void tearDown(void) {
-    monitoring_set_config(NULL);
+    /* Monitoring module no longer holds global state; nothing to reset. */
 }
 
 /* ====== report_generate tests ====== */
@@ -42,7 +41,7 @@ void test_report_generate_valid_json(void) {
     config_init(&config);
 
     char buf[REPORT_BUF_SIZE];
-    int len = report_generate(&config, buf, sizeof(buf));
+    int len = report_generate(&config, NULL,buf, sizeof(buf));
 
     TEST_ASSERT_TRUE(len > 0);
 
@@ -60,7 +59,7 @@ void test_report_generate_required_fields(void) {
     config_init(&config);
 
     char buf[REPORT_BUF_SIZE];
-    int len = report_generate(&config, buf, sizeof(buf));
+    int len = report_generate(&config, NULL,buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0);
 
     cJSON *root = cJSON_Parse(buf);
@@ -144,7 +143,7 @@ void test_report_generate_field_values(void) {
     config_init(&config);
 
     char buf[REPORT_BUF_SIZE];
-    report_generate(&config, buf, sizeof(buf));
+    report_generate(&config, NULL,buf, sizeof(buf));
 
     cJSON *root = cJSON_Parse(buf);
     TEST_ASSERT_NOT_NULL(root);
@@ -188,9 +187,9 @@ void test_report_generate_null_args(void) {
     config_init(&config);
     char buf[REPORT_BUF_SIZE];
 
-    TEST_ASSERT_EQUAL_INT(-1, report_generate(NULL, buf, sizeof(buf)));
-    TEST_ASSERT_EQUAL_INT(-1, report_generate(&config, NULL, sizeof(buf)));
-    TEST_ASSERT_EQUAL_INT(-1, report_generate(&config, buf, 0));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate(NULL, NULL,buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate(&config, NULL,NULL, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate(&config, NULL,buf, 0));
 }
 
 /* Test report_generate: verify network subfields */
@@ -199,7 +198,7 @@ void test_report_generate_network_fields(void) {
     config_init(&config);
 
     char buf[REPORT_BUF_SIZE];
-    report_generate(&config, buf, sizeof(buf));
+    report_generate(&config, NULL,buf, sizeof(buf));
 
     cJSON *root = cJSON_Parse(buf);
     TEST_ASSERT_NOT_NULL(root);
@@ -224,7 +223,7 @@ void test_report_generate_connections_fields(void) {
     config_init(&config);
 
     char buf[REPORT_BUF_SIZE];
-    report_generate(&config, buf, sizeof(buf));
+    report_generate(&config, NULL,buf, sizeof(buf));
 
     cJSON *root = cJSON_Parse(buf);
     TEST_ASSERT_NOT_NULL(root);
@@ -250,7 +249,7 @@ void test_report_generate_load_fields(void) {
     config_init(&config);
 
     char buf[REPORT_BUF_SIZE];
-    report_generate(&config, buf, sizeof(buf));
+    report_generate(&config, NULL,buf, sizeof(buf));
 
     cJSON *root = cJSON_Parse(buf);
     TEST_ASSERT_NOT_NULL(root);
@@ -409,11 +408,11 @@ void test_report_generate_buffer_too_small(void) {
     config_init(&config);
 
     char tiny_buf[1];
-    TEST_ASSERT_EQUAL_INT(-1, report_generate(&config, tiny_buf, sizeof(tiny_buf)));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate(&config, NULL,tiny_buf, sizeof(tiny_buf)));
 
     /* A 16-byte buffer is still far smaller than the full report JSON. */
     char small_buf[16];
-    TEST_ASSERT_EQUAL_INT(-1, report_generate(&config, small_buf, sizeof(small_buf)));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate(&config, NULL,small_buf, sizeof(small_buf)));
 }
 
 /* Test report_generate_basic_info: returns -1 when the buffer is too small. */
@@ -460,7 +459,7 @@ void test_report_generate_v2_jsonrpc_structure(void) {
     config_init(&config);
 
     char buf[REPORT_BUF_SIZE];
-    int len = report_generate_v2(&config, buf, sizeof(buf));
+    int len = report_generate_v2(&config, NULL,buf, sizeof(buf));
 
     TEST_ASSERT_TRUE(len > 0);
 
@@ -493,7 +492,7 @@ void test_report_generate_v2_params_contains_report(void) {
     config_init(&config);
 
     char buf[REPORT_BUF_SIZE];
-    int len = report_generate_v2(&config, buf, sizeof(buf));
+    int len = report_generate_v2(&config, NULL,buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0);
 
     cJSON *root = cJSON_Parse(buf);
@@ -547,7 +546,7 @@ void test_report_generate_v2_report_matches_v1(void) {
 
     /* Generate the v1 report. */
     char v1_buf[REPORT_BUF_SIZE];
-    int v1_len = report_generate(&config, v1_buf, sizeof(v1_buf));
+    int v1_len = report_generate(&config, NULL,v1_buf, sizeof(v1_buf));
     TEST_ASSERT_TRUE(v1_len > 0);
 
     cJSON *v1_root = cJSON_Parse(v1_buf);
@@ -555,7 +554,7 @@ void test_report_generate_v2_report_matches_v1(void) {
 
     /* Generate the v2 report (which internally calls report_generate). */
     char v2_buf[REPORT_BUF_SIZE];
-    int v2_len = report_generate_v2(&config, v2_buf, sizeof(v2_buf));
+    int v2_len = report_generate_v2(&config, NULL,v2_buf, sizeof(v2_buf));
     TEST_ASSERT_TRUE(v2_len > 0);
 
     cJSON *v2_root = cJSON_Parse(v2_buf);
@@ -597,9 +596,9 @@ void test_report_generate_v2_null_args(void) {
     config_init(&config);
     char buf[REPORT_BUF_SIZE];
 
-    TEST_ASSERT_EQUAL_INT(-1, report_generate_v2(NULL, buf, sizeof(buf)));
-    TEST_ASSERT_EQUAL_INT(-1, report_generate_v2(&config, NULL, sizeof(buf)));
-    TEST_ASSERT_EQUAL_INT(-1, report_generate_v2(&config, buf, 0));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_v2(NULL, NULL,buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_v2(&config, NULL,NULL, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_v2(&config, NULL,buf, 0));
 }
 
 /* Test report_generate_v2: returns -1 when the buffer is too small. */
@@ -609,7 +608,7 @@ void test_report_generate_v2_buffer_too_small(void) {
 
     /* A 1-byte buffer can only hold a NUL terminator, no JSON. */
     char tiny_buf[1];
-    TEST_ASSERT_EQUAL_INT(-1, report_generate_v2(&config, tiny_buf, sizeof(tiny_buf)));
+    TEST_ASSERT_EQUAL_INT(-1, report_generate_v2(&config, NULL,tiny_buf, sizeof(tiny_buf)));
 }
 
 /* ====== report_generate_basic_info_v2 tests ====== */

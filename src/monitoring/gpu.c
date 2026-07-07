@@ -15,6 +15,7 @@
 #include "gpu.h"
 #include "utils.h"
 #include "logger.h"
+#include "paths.h"
 
 /* Virtual graphics card driver list (kernel driver names, used for sysfs detection) */
 static const char *g_virtual_drivers[] = {
@@ -268,7 +269,7 @@ static int detect_soc_gpu(const char *card_path, char *name, size_t name_len) {
 
 /* Get GPU name via sysfs (/sys/class/drm/card*) */
 static int gpu_get_name_via_sysfs(char *name, size_t name_len) {
-    DIR *dir = opendir("/sys/class/drm");
+    DIR *dir = opendir(KOMARI_PATH_SYS_DRM);
     if (!dir) return -1;
 
     int virtual_count = 0;
@@ -280,7 +281,7 @@ static int gpu_get_name_via_sysfs(char *name, size_t name_len) {
         if (!is_card_entry(entry->d_name)) continue;
 
         char card_path[512];
-        snprintf(card_path, sizeof(card_path), "/sys/class/drm/%s", entry->d_name);
+        snprintf(card_path, sizeof(card_path), "%s/%s", KOMARI_PATH_SYS_DRM, entry->d_name);
 
         /* Read driver name (symbolic link) */
         char driver_link[640];
@@ -372,7 +373,7 @@ int gpu_get_info(gpu_info_t *info) {
     }
 
     /* Try to get driver name from sysfs */
-    DIR *dir = opendir("/sys/class/drm");
+    DIR *dir = opendir(KOMARI_PATH_SYS_DRM);
     if (dir) {
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL) {
@@ -381,7 +382,7 @@ int gpu_get_info(gpu_info_t *info) {
             char driver_link[640];
             char driver_name[64] = {0};
             snprintf(driver_link, sizeof(driver_link),
-                     "/sys/class/drm/%s/device/driver", entry->d_name);
+                     "%s/%s/device/driver", KOMARI_PATH_SYS_DRM, entry->d_name);
 
             if (read_driver_name(driver_link, driver_name, sizeof(driver_name)) == 0) {
                 if (!is_virtual_driver(driver_name)) {

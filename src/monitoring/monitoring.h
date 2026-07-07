@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 #include "config.h"
 
@@ -74,18 +75,22 @@ int monitoring_get_cpu_info(cpu_info_t *info);
 /**
  * Get memory information (total, used, free, available, buffers, cached).
  *
+ * @param memory_include_cache Whether to include cache/buffers in "used" total
  * @param info Output memory info structure
  * @return 0 on success, -1 on failure
  */
-int monitoring_get_mem_info(mem_info_t *info);
+int monitoring_get_mem_info(bool memory_include_cache, mem_info_t *info);
 
 /**
  * Get swap space information.
  *
+ * @param memory_include_cache Whether to include cache/buffers in "used" total
+ *                             (currently only affects memory, not swap, but
+ *                             kept for signature symmetry with mem_info)
  * @param info Output memory info structure (reused for swap)
  * @return 0 on success, -1 on failure
  */
-int monitoring_get_swap_info(mem_info_t *info);
+int monitoring_get_swap_info(bool memory_include_cache, mem_info_t *info);
 
 /**
  * Get memory and swap information in a single /proc/meminfo read.
@@ -95,11 +100,12 @@ int monitoring_get_swap_info(mem_info_t *info);
  * combined interface parses the file once and populates both structures,
  * halving the per-cycle fopen/parse cost.
  *
+ * @param memory_include_cache Whether to include cache/buffers in "used" total
  * @param mem  Output memory info structure (may be NULL to skip memory)
  * @param swap Output swap info structure (may be NULL to skip swap)
  * @return 0 on success, -1 on failure
  */
-int monitoring_get_mem_swap_info(mem_info_t *mem, mem_info_t *swap);
+int monitoring_get_mem_swap_info(bool memory_include_cache, mem_info_t *mem, mem_info_t *swap);
 
 /**
  * Get disk usage information aggregated across mounted filesystems.
@@ -110,12 +116,61 @@ int monitoring_get_mem_swap_info(mem_info_t *mem, mem_info_t *swap);
 int monitoring_get_disk_info(disk_info_t *info);
 
 /**
- * Get network traffic statistics and current speed.
+ * Per-caller network rate calculation state.
  *
- * @param info Output network info structure
+ * monitoring_get_net_info computes rx_speed/tx_speed by comparing the current
+ * byte counters against the previous call's snapshot. Previously this state
+ * was stored in file-level globals, making the module non-reentrant and hard
+ * to test in isolation. Callers now own and pass an instance of this struct
+ * so each calling context (e.g. the report thread) has its own independent
+ * rate tracker.
+ *
+ * Initialize with monitoring_net_state_init() before the first call. The
+ * struct contains a mutex so it is safe to share between threads that access
+ * the same network data source.
+ */
+typedef struct {
+    uint64_t last_rx;       /* Total RX bytes at the previous sample */
+    uint64_t last_tx;       /* Total TX bytes at the previous sample */
+    uint64_t last_time;     /* Timestamp (ms) of the previous sample */
+    bool has_prev_sample;   /* Whether a previous sample exists */
+    bool mutex_inited;      /* Whether the mutex has been initialized */
+    pthread_mutex_t mutex;  /* Protects the fields above */
+} monitoring_net_state_t;
+
+/**
+ * Initialize a monitoring_net_state_t instance.
+ *
+ * Must be called once before passing the struct to monitoring_get_net_info.
+ * Returns 0 on success, -1 on mutex init failure.
+ *
+ * @param state State to initialize (must not be NULL)
  * @return 0 on success, -1 on failure
  */
-int monitoring_get_net_info(net_info_t *info);
+int monitoring_net_state_init(monitoring_net_state_t *state);
+
+/**
+ * Destroy resources owned by a monitoring_net_state_t instance.
+ *
+ * Call when the state is no longer needed to destroy the internal mutex.
+ * Safe to call on a zero-initialized struct that was never passed to
+ * monitoring_net_state_init.
+ *
+ * @param state State to clean up (may be NULL)
+ */
+void monitoring_net_state_cleanup(monitoring_net_state_t *state);
+
+/**
+ * Get network traffic statistics and current speed.
+ *
+ * @param state Caller-owned rate calculation state. Pass NULL to skip speed
+ *              calculation (rx_speed and tx_speed will be 0). When non-NULL,
+ *              the state is updated under its internal mutex so the next call
+ *              can compute the rate delta.
+ * @param info  Output network info structure
+ * @return 0 on success, -1 on failure
+ */
+int monitoring_get_net_info(monitoring_net_state_t *state, net_info_t *info);
 
 /**
  * Get system load averages (1, 5 and 15 minutes).
@@ -169,19 +224,9 @@ int monitoring_get_ip_address(char *ipv4, size_t ipv4_len,
 
 /**
  * Force a network speed sample update by querying current net info.
- */
-void monitoring_net_speed_update(void);
-
-/**
- * Set global config pointer, used by memory calculation and other modules to read config items.
  *
- * Threading: must be called once during initialization before any monitoring_*
- * function is invoked from a worker thread. The caller retains ownership of
- * the config object; the agent only stores the pointer and never copies or
- * frees it, so the config must outlive all monitoring calls.
- *
- * @param config Pointer to the agent configuration
+ * @param state Caller-owned rate calculation state (may be NULL)
  */
-void monitoring_set_config(const agent_config_t *config);
+void monitoring_net_speed_update(monitoring_net_state_t *state);
 
 #endif

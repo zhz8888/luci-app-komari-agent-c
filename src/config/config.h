@@ -12,6 +12,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "komari_errno.h"
+#include "protocol.h"
+
 #define MAX_TOKEN_LEN 256
 #define MAX_ENDPOINT_LEN 512
 #define MAX_DNS_LEN 128
@@ -43,13 +46,12 @@ typedef struct {
     int reconnect_interval;
     int info_report_interval;
     int month_rotate;
-    int protocol_version;   /* Protocol version (1 or 2), default 2 */
+    int protocol_version;   /* Active protocol version (protocol_version_t); default PROTOCOL_VERSION_V2 */
 
     bool disable_auto_update;
     bool disable_web_ssh;
     bool ignore_unsafe_cert;
     bool memory_include_cache;
-    bool memory_report_raw_used;
     bool enable_gpu;
     bool get_ip_addr_from_nic;
     bool show_warning;
@@ -79,8 +81,11 @@ int config_load_from_env(agent_config_t *config);
  *
  * @param config Configuration structure to populate
  * @param path   Path to the JSON configuration file
- * @return 0 on success, -1 on failure (invalid argument, file not
- *         found, or JSON parse error)
+ * @return KOMARI_OK on success; KOMARI_ERR_INVALID_ARG if config/path is NULL
+ *         or the file is group/world accessible; KOMARI_ERR_NOT_FOUND if the
+ *         file cannot be opened; KOMARI_ERR_PARSE if the JSON is invalid;
+ *         KOMARI_ERR_NOMEM on allocation failure; KOMARI_ERR_GENERIC on
+ *         other I/O failures.
  */
 int config_load_from_file(agent_config_t *config, const char *path);
 

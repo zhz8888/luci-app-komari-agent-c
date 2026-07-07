@@ -174,4 +174,18 @@ char *utils_json_escape(const char *str);
  */
 int utils_json_unescape(const char *json, char *out, size_t out_len);
 
+/**
+ * Copy a string into a fixed-size buffer with guaranteed NUL termination.
+ *
+ * Replaces the repeated `strncpy(dst, src, sizeof(dst) - 1);
+ * dst[sizeof(dst) - 1] = '\0';` idiom used throughout config loading, CLI
+ * argument parsing and terminal session setup. Unlike raw strncpy, the
+ * destination is always NUL-terminated even when `src` fills the buffer.
+ *
+ * @param dst Destination buffer
+ * @param dst_size Size of dst in bytes (including the NUL terminator slot)
+ * @param src Source string; if NULL the destination is set to an empty string
+ */
+void utils_set_string(char *dst, size_t dst_size, const char *src);
+
 #endif

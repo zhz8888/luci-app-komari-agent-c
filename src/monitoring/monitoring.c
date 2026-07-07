@@ -32,8 +32,7 @@
 #include "utils.h"
 #include "config.h"
 #include "logger.h"
-
-static const agent_config_t *g_config = NULL;
+#include "paths.h"
 
 /* Cross-call CPU sampling state. Previously monitoring_get_cpu_info blocked
  * for 100ms on every call to measure a CPU usage delta inside the function.
@@ -62,8 +61,28 @@ static time_t g_disk_cache_ts = 0;
 static time_t g_conn_cache_ts = 0;
 static time_t g_process_count_ts = 0;
 
-void monitoring_set_config(const agent_config_t *config) {
-    g_config = config;
+void monitoring_net_speed_update(monitoring_net_state_t *state) {
+    net_info_t info;
+    monitoring_get_net_info(state, &info);
+}
+
+int monitoring_net_state_init(monitoring_net_state_t *state) {
+    if (!state) return -1;
+    memset(state, 0, sizeof(*state));
+    if (pthread_mutex_init(&state->mutex, NULL) != 0) {
+        return -1;
+    }
+    state->mutex_inited = true;
+    state->has_prev_sample = false;
+    return 0;
+}
+
+void monitoring_net_state_cleanup(monitoring_net_state_t *state) {
+    if (!state) return;
+    if (state->mutex_inited) {
+        pthread_mutex_destroy(&state->mutex);
+        state->mutex_inited = false;
+    }
 }
 
 int monitoring_get_cpu_info(cpu_info_t *info) {
@@ -90,7 +109,7 @@ int monitoring_get_cpu_info(cpu_info_t *info) {
         strcpy(g_cpu_invariants.cpu_arch, "unknown");
 #endif
 
-        FILE *fp = fopen("/proc/cpuinfo", "r");
+        FILE *fp = fopen(KOMARI_PATH_PROC_CPUINFO, "r");
         if (fp) {
             char line[256];
             while (fgets(line, sizeof(line), fp)) {
@@ -128,7 +147,7 @@ int monitoring_get_cpu_info(cpu_info_t *info) {
     /* Sample /proc/stat once and compute CPU usage against the previous
      * call's snapshot, instead of blocking for 100ms inside this function.
      * The first call has no baseline and reports 0.0% usage. */
-    FILE *stat_fp = fopen("/proc/stat", "r");
+    FILE *stat_fp = fopen(KOMARI_PATH_PROC_STAT, "r");
     if (stat_fp) {
         unsigned long long user, nice, system, idle, iowait, irq, softirq;
         if (fscanf(stat_fp, "cpu %llu %llu %llu %llu %llu %llu %llu",
@@ -157,7 +176,7 @@ int monitoring_get_cpu_info(cpu_info_t *info) {
     return 0;
 }
 
-int monitoring_get_mem_swap_info(mem_info_t *mem, mem_info_t *swap) {
+int monitoring_get_mem_swap_info(bool memory_include_cache, mem_info_t *mem, mem_info_t *swap) {
     /* Parse /proc/meminfo once for both memory and swap fields. Previously
      * monitoring_get_mem_info and monitoring_get_swap_info each opened and
      * parsed the file independently, doubling the per-cycle
@@ -168,7 +187,7 @@ int monitoring_get_mem_swap_info(mem_info_t *mem, mem_info_t *swap) {
     if (mem) memset(mem, 0, sizeof(mem_info_t));
     if (swap) memset(swap, 0, sizeof(mem_info_t));
 
-    FILE *fp = fopen("/proc/meminfo", "r");
+    FILE *fp = fopen(KOMARI_PATH_PROC_MEMINFO, "r");
     if (!fp) return -1;
 
     char line[256];
@@ -211,7 +230,7 @@ int monitoring_get_mem_swap_info(mem_info_t *mem, mem_info_t *swap) {
         mem->buffers = buffers;
         mem->cached = cached + sreclaimable;
 
-        if (g_config && g_config->memory_include_cache) {
+        if (memory_include_cache) {
             mem->used = mem_total - mem_free;
         } else if (mem_available > 0) {
             mem->used = mem_total - mem_available;
@@ -229,15 +248,15 @@ int monitoring_get_mem_swap_info(mem_info_t *mem, mem_info_t *swap) {
     return 0;
 }
 
-int monitoring_get_mem_info(mem_info_t *info) {
+int monitoring_get_mem_info(bool memory_include_cache, mem_info_t *info) {
     /* Thin wrapper for backward compatibility; delegates to the combined
      * parser so /proc/meminfo is read once per cycle when callers invoke
      * monitoring_get_mem_info and monitoring_get_swap_info back-to-back. */
-    return monitoring_get_mem_swap_info(info, NULL);
+    return monitoring_get_mem_swap_info(memory_include_cache, info, NULL);
 }
 
-int monitoring_get_swap_info(mem_info_t *info) {
-    return monitoring_get_mem_swap_info(NULL, info);
+int monitoring_get_swap_info(bool memory_include_cache, mem_info_t *info) {
+    return monitoring_get_mem_swap_info(memory_include_cache, NULL, info);
 }
 
 int monitoring_get_disk_info(disk_info_t *info) {
@@ -253,7 +272,7 @@ int monitoring_get_disk_info(disk_info_t *info) {
 
     memset(info, 0, sizeof(disk_info_t));
 
-    FILE *fp = fopen("/proc/mounts", "r");
+    FILE *fp = fopen(KOMARI_PATH_PROC_MOUNTS, "r");
     if (!fp) return -1;
     
     char line[512];
@@ -324,21 +343,12 @@ int monitoring_get_disk_info(disk_info_t *info) {
     return 0;
 }
 
-static uint64_t g_last_rx = 0, g_last_tx = 0;
-static uint64_t g_last_time = 0;
-/* Protects g_last_rx/g_last_tx/g_last_time against concurrent access.
- * monitoring_get_net_info may be called from multiple threads (e.g. the
- * report thread and a status API handler); without a lock the read-modify-
- * write cycle on these globals could interleave and produce incorrect
- * rx_speed/tx_speed values. Mirrors the pattern used in logger.c. */
-static pthread_mutex_t g_net_info_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-int monitoring_get_net_info(net_info_t *info) {
+int monitoring_get_net_info(monitoring_net_state_t *state, net_info_t *info) {
     if (!info) return -1;
 
     memset(info, 0, sizeof(net_info_t));
 
-    FILE *fp = fopen("/proc/net/dev", "r");
+    FILE *fp = fopen(KOMARI_PATH_PROC_NET_DEV, "r");
     if (!fp) return -1;
 
     char line[512];
@@ -384,26 +394,31 @@ int monitoring_get_net_info(net_info_t *info) {
     info->rx_packets = total_rx_packets;
     info->tx_packets = total_tx_packets;
 
-    pthread_mutex_lock(&g_net_info_mutex);
-    uint64_t now = utils_get_current_timestamp();
-    if (g_last_time > 0) {
-        uint64_t time_diff = now - g_last_time;
-        if (time_diff > 0) {
-            /* Guard against counter wraparound or reset to avoid underflow */
-            uint64_t rx_diff = (total_rx >= g_last_rx) ? (total_rx - g_last_rx) : 0;
-            uint64_t tx_diff = (total_tx >= g_last_tx) ? (total_tx - g_last_tx) : 0;
-            /* Use floating-point division and round to nearest to avoid
-               integer truncation that systematically under-reports the
-               transfer rate (MIN-29/30). */
-            info->rx_speed = (uint64_t)((double)rx_diff / (double)time_diff + 0.5);
-            info->tx_speed = (uint64_t)((double)tx_diff / (double)time_diff + 0.5);
+    /* Compute per-second speed from the delta against the previous sample.
+     * When state is NULL the caller opts out of rate tracking (speed stays 0). */
+    if (state) {
+        pthread_mutex_lock(&state->mutex);
+        uint64_t now = utils_get_current_timestamp();
+        if (state->has_prev_sample) {
+            uint64_t time_diff = now - state->last_time;
+            if (time_diff > 0) {
+                /* Guard against counter wraparound or reset to avoid underflow */
+                uint64_t rx_diff = (total_rx >= state->last_rx) ? (total_rx - state->last_rx) : 0;
+                uint64_t tx_diff = (total_tx >= state->last_tx) ? (total_tx - state->last_tx) : 0;
+                /* Use floating-point division and round to nearest to avoid
+                   integer truncation that systematically under-reports the
+                   transfer rate (MIN-29/30). */
+                info->rx_speed = (uint64_t)((double)rx_diff / (double)time_diff + 0.5);
+                info->tx_speed = (uint64_t)((double)tx_diff / (double)time_diff + 0.5);
+            }
         }
-    }
 
-    g_last_rx = total_rx;
-    g_last_tx = total_tx;
-    g_last_time = now;
-    pthread_mutex_unlock(&g_net_info_mutex);
+        state->last_rx = total_rx;
+        state->last_tx = total_tx;
+        state->last_time = now;
+        state->has_prev_sample = true;
+        pthread_mutex_unlock(&state->mutex);
+    }
 
     return 0;
 }
@@ -413,7 +428,7 @@ int monitoring_get_load_info(load_info_t *info) {
     
     memset(info, 0, sizeof(load_info_t));
     
-    FILE *fp = fopen("/proc/loadavg", "r");
+    FILE *fp = fopen(KOMARI_PATH_PROC_LOADAVG, "r");
     if (!fp) return -1;
     
     double load1, load5, load15;
@@ -440,7 +455,7 @@ int monitoring_get_conn_info(conn_info_t *info) {
 
     memset(info, 0, sizeof(conn_info_t));
 
-    FILE *fp = fopen("/proc/net/tcp", "r");
+    FILE *fp = fopen(KOMARI_PATH_PROC_NET_TCP, "r");
     if (fp) {
         char line[256];
         fgets(line, sizeof(line), fp);
@@ -450,7 +465,7 @@ int monitoring_get_conn_info(conn_info_t *info) {
         fclose(fp);
     }
 
-    fp = fopen("/proc/net/tcp6", "r");
+    fp = fopen(KOMARI_PATH_PROC_NET_TCP6, "r");
     if (fp) {
         char line[256];
         fgets(line, sizeof(line), fp);
@@ -460,7 +475,7 @@ int monitoring_get_conn_info(conn_info_t *info) {
         fclose(fp);
     }
 
-    fp = fopen("/proc/net/udp", "r");
+    fp = fopen(KOMARI_PATH_PROC_NET_UDP, "r");
     if (fp) {
         char line[256];
         fgets(line, sizeof(line), fp);
@@ -470,7 +485,7 @@ int monitoring_get_conn_info(conn_info_t *info) {
         fclose(fp);
     }
 
-    fp = fopen("/proc/net/udp6", "r");
+    fp = fopen(KOMARI_PATH_PROC_NET_UDP6, "r");
     if (fp) {
         char line[256];
         fgets(line, sizeof(line), fp);
@@ -554,7 +569,7 @@ int monitoring_get_process_count(void) {
     }
 
     int count = 0;
-    DIR *dir = opendir("/proc");
+    DIR *dir = opendir(KOMARI_PATH_PROC);
     if (!dir) return g_process_count_cache;  /* fall back to last known value */
 
     struct dirent *entry;
@@ -623,9 +638,4 @@ int monitoring_get_ip_address(char *ipv4, size_t ipv4_len,
     
     freeifaddrs(ifaddr);
     return 0;
-}
-
-void monitoring_net_speed_update(void) {
-    net_info_t info;
-    monitoring_get_net_info(&info);
 }

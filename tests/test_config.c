@@ -84,7 +84,6 @@ void test_config_init_defaults(void) {
     TEST_ASSERT_FALSE(config.disable_web_ssh);
     TEST_ASSERT_FALSE(config.ignore_unsafe_cert);
     TEST_ASSERT_FALSE(config.memory_include_cache);
-    TEST_ASSERT_FALSE(config.memory_report_raw_used);
     TEST_ASSERT_FALSE(config.enable_gpu);
     TEST_ASSERT_FALSE(config.get_ip_addr_from_nic);
     TEST_ASSERT_FALSE(config.show_warning);
@@ -296,7 +295,7 @@ void test_config_load_from_file_not_found(void) {
     config_init(&config);
 
     int ret = config_load_from_file(&config, "/nonexistent/path/config.json");
-    TEST_ASSERT_EQUAL_INT(-1, ret);
+    TEST_ASSERT_EQUAL_INT(KOMARI_ERR_NOT_FOUND, ret);
 }
 
 /* Test config_load_from_file: invalid JSON format */
@@ -312,7 +311,7 @@ void test_config_load_from_file_invalid_json(void) {
     config_init(&config);
 
     int ret = config_load_from_file(&config, TEST_CONFIG_FILE_PATH);
-    TEST_ASSERT_EQUAL_INT(-1, ret);
+    TEST_ASSERT_EQUAL_INT(KOMARI_ERR_PARSE, ret);
 
     remove(TEST_CONFIG_FILE_PATH);
 }
@@ -344,8 +343,8 @@ void test_config_load_from_file_null_args(void) {
     agent_config_t config;
     config_init(&config);
 
-    TEST_ASSERT_EQUAL_INT(-1, config_load_from_file(NULL, TEST_CONFIG_FILE_PATH));
-    TEST_ASSERT_EQUAL_INT(-1, config_load_from_file(&config, NULL));
+    TEST_ASSERT_EQUAL_INT(KOMARI_ERR_INVALID_ARG, config_load_from_file(NULL, TEST_CONFIG_FILE_PATH));
+    TEST_ASSERT_EQUAL_INT(KOMARI_ERR_INVALID_ARG, config_load_from_file(&config, NULL));
 }
 
 /* Test configuration priority: environment variables override config file values

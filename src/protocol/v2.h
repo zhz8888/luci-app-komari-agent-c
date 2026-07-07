@@ -27,6 +27,15 @@
  * to prevent a malicious peer from exhausting memory by flooding events. */
 #define V2_ACK_IDS_MAX 1024
 
+/* Recommended snapshot buffer capacity for callers of v2_snapshot_ack_ids.
+ * Callers may use any buffer size up to V2_ACK_IDS_MAX, but this value
+ * balances stack usage (4 KB on 32-bit, 8 KB on 64-bit) against the
+ * likelihood of truncation under normal event rates. When the internal
+ * state holds more than this many pending ACKs, v2_snapshot_ack_ids
+ * silently copies only the first V2_ACK_SNAPSHOT_RECOMMENDED entries and
+ * logs a warning so operators can detect event bursts. */
+#define V2_ACK_SNAPSHOT_RECOMMENDED 256
+
 /* v2 protocol runtime state */
 typedef struct {
     int fail_count;             /* Number of consecutive v2 failures */
@@ -161,6 +170,9 @@ int v2_add_ack_event(v2_state_t *state, int event_id);
  * @param count Outputs the number of items in the array.
  * @return 0 on success, -1 on failure.
  */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((deprecated("use v2_snapshot_ack_ids instead")))
+#endif
 int v2_get_ack_ids(v2_state_t *state, int **ids, int *count);
 
 /**

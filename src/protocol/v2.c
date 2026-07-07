@@ -9,10 +9,12 @@
 
 #include "v2.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "jsonrpc.h"
+#include "logger.h"
 
 /* ----------------------------------------------------------------------- */
 /* Payload construction functions                                          */
@@ -370,6 +372,12 @@ int v2_snapshot_ack_ids(v2_state_t *state, int *buf, int max, int *count)
 
     int to_copy = state->ack_count;
     if (to_copy > max) {
+        /* Truncation: the caller's buffer cannot hold all pending ACKs.
+         * Log a warning so operators can detect event bursts (e.g., server
+         * retransmit storms). The remaining ACKs will be reported in
+         * subsequent cycles after the caller clears the reported ones. */
+        KOMARI_LOG_WARN("[v2] ACK snapshot truncated: %d pending, buffer holds %d",
+                        state->ack_count, max);
         to_copy = max;
     }
     if (to_copy > 0) {

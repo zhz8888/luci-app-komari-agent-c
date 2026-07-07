@@ -17,6 +17,7 @@
 #include "utils.h"
 #include "logger.h"
 #include "cJSON.h"
+#include "paths.h"
 
 /* Hard cap on per-interface sample count. At the default detect_interval=2s
  * this covers ~4.6 days of raw samples; older samples are dropped via
@@ -26,7 +27,7 @@
 
 /* Collect per-interface traffic deltas from /proc/net/dev for tracked interfaces. */
 static void netstatic_collect(netstatic_t *ns) {
-    FILE *fp = fopen("/proc/net/dev", "r");
+    FILE *fp = fopen(KOMARI_PATH_PROC_NET_DEV, "r");
     if (!fp) return;
     
     char line[512];

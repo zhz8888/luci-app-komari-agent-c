@@ -39,27 +39,32 @@ typedef struct {
 /**
  * Generate the periodic status report JSON payload.
  *
- * @param config Agent configuration
- * @param buf Output buffer for the JSON payload
- * @param buf_len Size of buf
+ * @param config    Agent configuration
+ * @param net_state Caller-owned network rate calculation state. Pass NULL to
+ *                  skip speed calculation (rx_speed/tx_speed will be 0).
+ * @param buf       Output buffer for the JSON payload
+ * @param buf_len   Size of buf
  * @return Number of bytes written on success, -1 on failure
  */
-int report_generate(const agent_config_t *config, char *buf, size_t buf_len);
+int report_generate(const agent_config_t *config, monitoring_net_state_t *net_state,
+                    char *buf, size_t buf_len);
 
 /**
  * Generate the periodic status report payload wrapped as a v2 JSON-RPC 2.0
  * notification (method = "agent.report", params.report = original report).
  *
- * Internally calls report_generate to produce the v1 JSON, parses it into a
- * cJSON object, and passes it to v2_build_report_payload for wrapping. The
- * caller-provided buffer receives the resulting compact JSON string.
+ * Internally calls report_generate to produce the v1 JSON, then embeds it
+ * verbatim under params.report via direct string concatenation. This avoids
+ * the cJSON_Parse → cJSON_Print round-trip on the 1 Hz report path.
  *
- * @param config Agent configuration
- * @param buf Output buffer for the JSON-RPC payload
- * @param buf_len Size of buf
+ * @param config    Agent configuration
+ * @param net_state Caller-owned network rate calculation state (see report_generate)
+ * @param buf       Output buffer for the JSON-RPC payload
+ * @param buf_len   Size of buf
  * @return Number of bytes written on success, -1 on failure
  */
-int report_generate_v2(const agent_config_t *config, char *buf, size_t buf_len);
+int report_generate_v2(const agent_config_t *config, monitoring_net_state_t *net_state,
+                       char *buf, size_t buf_len);
 
 /**
  * Generate the periodic status report payload wrapped as a v2 JSON-RPC 2.0
@@ -72,6 +77,7 @@ int report_generate_v2(const agent_config_t *config, char *buf, size_t buf_len);
  * current time so each report cycle uses a distinct id.
  *
  * @param config    Agent configuration
+ * @param net_state Caller-owned network rate calculation state (see report_generate)
  * @param buf       Output buffer for the JSON-RPC payload
  * @param buf_len   Size of buf
  * @param ack_ids   Array of pending ACK event IDs to include in the report.
@@ -79,8 +85,9 @@ int report_generate_v2(const agent_config_t *config, char *buf, size_t buf_len);
  * @param ack_count Number of items in ack_ids
  * @return Number of bytes written on success, -1 on failure
  */
-int report_generate_v2_with_acks(const agent_config_t *config, char *buf,
-                                 size_t buf_len, const int *ack_ids,
+int report_generate_v2_with_acks(const agent_config_t *config,
+                                 monitoring_net_state_t *net_state,
+                                 char *buf, size_t buf_len, const int *ack_ids,
                                  int ack_count);
 
 /**

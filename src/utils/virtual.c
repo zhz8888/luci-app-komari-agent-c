@@ -17,6 +17,7 @@
 #include "virtual.h"
 #include "utils.h"
 #include "logger.h"
+#include "paths.h"
 
 /* Read a file and return 1 if it contains the given keyword substring. */
 static int check_file_contains(const char *path, const char *keyword) {
@@ -47,28 +48,28 @@ static const char *virt_vm_output(void) {
 }
 
 static const char *virt_detect_once(void) {
-    if (file_exists("/.dockerenv")) {
+    if (file_exists(KOMARI_PATH_DOCKER_ENV)) {
         KOMARI_LOG_DEBUG("Virtualization detected: docker (/.dockerenv exists)");
         return VIRT_TYPE_DOCKER;
     }
 
-    if (check_file_contains("/proc/1/cgroup", "docker") ||
-        check_file_contains("/proc/1/cgroup", "kubepods")) {
+    if (check_file_contains(KOMARI_PATH_PROC_SELF_CGROUP, "docker") ||
+        check_file_contains(KOMARI_PATH_PROC_SELF_CGROUP, "kubepods")) {
         KOMARI_LOG_DEBUG("Virtualization detected: docker (/proc/1/cgroup)");
         return VIRT_TYPE_DOCKER;
     }
 
-    if (file_exists("/run/.containerenv")) {
+    if (file_exists(KOMARI_PATH_CONTAINER_ENV)) {
         KOMARI_LOG_DEBUG("Virtualization detected: docker (/run/.containerenv)");
         return VIRT_TYPE_DOCKER;
     }
 
-    if (check_file_contains("/proc/1/cgroup", "lxc")) {
+    if (check_file_contains(KOMARI_PATH_PROC_SELF_CGROUP, "lxc")) {
         KOMARI_LOG_DEBUG("Virtualization detected: lxc");
         return VIRT_TYPE_LXC;
     }
 
-    if (file_exists("/proc/vz/veinfo")) {
+    if (file_exists(KOMARI_PATH_PROC_VZ_VEINFO)) {
         KOMARI_LOG_DEBUG("Virtualization detected: openvz");
         return VIRT_TYPE_OPENVZ;
     }
@@ -103,22 +104,22 @@ static const char *virt_detect_once(void) {
         return VIRT_TYPE_XEN;
     }
 
-    if (check_file_contains("/proc/cpuinfo", "QEMU") ||
-        check_file_contains("/proc/cpuinfo", "KVM")) {
+    if (check_file_contains(KOMARI_PATH_PROC_CPUINFO, "QEMU") ||
+        check_file_contains(KOMARI_PATH_PROC_CPUINFO, "KVM")) {
         KOMARI_LOG_DEBUG("Virtualization detected: kvm/qemu (/proc/cpuinfo)");
-        return check_file_contains("/proc/cpuinfo", "QEMU") ? VIRT_TYPE_QEMU : VIRT_TYPE_KVM;
+        return check_file_contains(KOMARI_PATH_PROC_CPUINFO, "QEMU") ? VIRT_TYPE_QEMU : VIRT_TYPE_KVM;
     }
 
-    if (file_exists("/sys/class/dmi/id/product_name")) {
-        if (check_file_contains("/sys/class/dmi/id/product_name", "VMware")) {
+    if (file_exists(KOMARI_PATH_SYS_DMI_PRODUCT_NAME)) {
+        if (check_file_contains(KOMARI_PATH_SYS_DMI_PRODUCT_NAME, "VMware")) {
             KOMARI_LOG_DEBUG("Virtualization detected: vmware (DMI)");
             return VIRT_TYPE_VMWARE;
         }
-        if (check_file_contains("/sys/class/dmi/id/product_name", "VirtualBox")) {
+        if (check_file_contains(KOMARI_PATH_SYS_DMI_PRODUCT_NAME, "VirtualBox")) {
             KOMARI_LOG_DEBUG("Virtualization detected: virtualbox (DMI)");
             return VIRT_TYPE_VIRTUALBOX;
         }
-        if (check_file_contains("/sys/class/dmi/id/product_name", "KVM")) {
+        if (check_file_contains(KOMARI_PATH_SYS_DMI_PRODUCT_NAME, "KVM")) {
             KOMARI_LOG_DEBUG("Virtualization detected: kvm (DMI)");
             return VIRT_TYPE_KVM;
         }

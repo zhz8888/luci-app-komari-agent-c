@@ -1,5 +1,6 @@
 #include "unity.h"
 #include "../src/utils/utils.h"
+#include "komari_errno.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -91,6 +92,24 @@ void test_utils_format_timestamp(void) {
     TEST_ASSERT_TRUE(strlen(buf) > 0);
 }
 
+/* komari_strerror must return non-NULL, human-readable strings for every
+ * documented error code and a fallback for unknown values. The returned
+ * pointers must be static (safe to compare by address). */
+void test_utils_komari_strerror(void) {
+    TEST_ASSERT_EQUAL_STRING("success", komari_strerror(KOMARI_OK));
+    TEST_ASSERT_EQUAL_STRING("invalid argument", komari_strerror(KOMARI_ERR_INVALID_ARG));
+    TEST_ASSERT_EQUAL_STRING("not found", komari_strerror(KOMARI_ERR_NOT_FOUND));
+    TEST_ASSERT_EQUAL_STRING("buffer too small", komari_strerror(KOMARI_ERR_BUFFER_TOO_SMALL));
+    TEST_ASSERT_EQUAL_STRING("parse error", komari_strerror(KOMARI_ERR_PARSE));
+    TEST_ASSERT_EQUAL_STRING("network error", komari_strerror(KOMARI_ERR_NETWORK));
+    TEST_ASSERT_EQUAL_STRING("out of memory", komari_strerror(KOMARI_ERR_NOMEM));
+    TEST_ASSERT_EQUAL_STRING("operation not supported", komari_strerror(KOMARI_ERR_UNSUPPORTED));
+    TEST_ASSERT_EQUAL_STRING("unspecified error", komari_strerror(KOMARI_ERR_GENERIC));
+    /* Unknown code returns a non-NULL fallback rather than crashing. */
+    TEST_ASSERT_NOT_NULL(komari_strerror((komari_errno_t)-999));
+    TEST_ASSERT_EQUAL_STRING("unknown error code", komari_strerror((komari_errno_t)-999));
+}
+
 int main(void) {
     UNITY_BEGIN();
 
@@ -102,6 +121,7 @@ int main(void) {
     RUN_TEST(test_utils_file_exists);
     RUN_TEST(test_utils_get_current_timestamp);
     RUN_TEST(test_utils_format_timestamp);
+    RUN_TEST(test_utils_komari_strerror);
 
     return UNITY_END();
 }

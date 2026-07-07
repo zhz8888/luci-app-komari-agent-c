@@ -33,6 +33,7 @@
 #include "cJSON.h"
 #include "logger.h"
 #include "v2.h"
+#include "protocol.h"
 #include "v1.h"
 #include "jsonrpc.h"
 
@@ -1184,7 +1185,7 @@ ws_client_t *ws_client_create(const ws_client_config_t *config) {
     client->use_tls = false;
     client->ssl = NULL;
     client->ssl_ctx = NULL;
-    client->protocol_version = 2;   /* Use v2 protocol by default */
+    client->protocol_version = PROTOCOL_VERSION_V2;
 
     if (config) {
         memcpy(&client->config, config, sizeof(ws_client_config_t));
@@ -1278,7 +1279,7 @@ int ws_client_connect(ws_client_t *client) {
      * ws_handshake, so only the path component is selected here. This
      * mirrors the Go reference implementation (server/websocket.go,
      * buildWebSocketEndpoint) which picks the path by protocol version. */
-    if (ws_client_should_use_v2(client)) {
+    if (ws_client_should_use_current_protocol(client)) {
         int path_ret = snprintf(path, WS_PATH_MAX, "%s", V2_RPC_ENDPOINT);
         if (path_ret < 0 || (size_t)path_ret >= WS_PATH_MAX) {
             KOMARI_LOG_WARN("v2 RPC endpoint path truncated");
@@ -1560,6 +1561,24 @@ void ws_client_set_user_data(ws_client_t *client, void *data) {
     if (client) client->user_data = data;
 }
 
+void *ws_client_get_user_data(ws_client_t *client) {
+    if (!client) return NULL;
+    return client->user_data;
+}
+
+bool ws_client_is_connected(ws_client_t *client) {
+    if (!client) return false;
+    pthread_mutex_lock(&client->state_mutex);
+    bool connected = client->connected;
+    pthread_mutex_unlock(&client->state_mutex);
+    return connected;
+}
+
+v2_state_t *ws_client_get_v2_state(ws_client_t *client) {
+    if (!client) return NULL;
+    return &client->v2_state;
+}
+
 void ws_client_stop(ws_client_t *client) {
     if (!client) return;
     pthread_mutex_lock(&client->state_mutex);
@@ -1569,12 +1588,12 @@ void ws_client_stop(ws_client_t *client) {
 
 /* ================ Protocol fallback mechanism implementation ================ */
 
-int ws_client_get_protocol_version(ws_client_t *client) {
-    if (!client) return 1;
-    return client->protocol_version;
+protocol_version_t ws_client_get_protocol_version(ws_client_t *client) {
+    if (!client) return PROTOCOL_VERSION_V1;
+    return (protocol_version_t)client->protocol_version;
 }
 
-bool ws_client_should_use_v2(ws_client_t *client) {
+bool ws_client_should_use_current_protocol(ws_client_t *client) {
     if (!client) return false;
     /* Fall back to v1 when consecutive v2 failures reach threshold (3 times) */
     if (v2_should_fallback_to_v1(&client->v2_state)) {
@@ -1589,9 +1608,9 @@ void ws_client_note_protocol_result(ws_client_t *client, bool success) {
     if (success) {
         /* Success: reset failure count and automatically upgrade back to v2 */
         v2_note_attempt_result(&client->v2_state, 1);
-        if (client->protocol_version != 2) {
+        if (client->protocol_version != PROTOCOL_VERSION_V2) {
             KOMARI_LOG_INFO("[Protocol] Upgrading to v2 after successful connection");
-            client->protocol_version = 2;
+            client->protocol_version = PROTOCOL_VERSION_V2;
         }
     } else {
         /* Failure: increment failure count */
@@ -1601,10 +1620,10 @@ void ws_client_note_protocol_result(ws_client_t *client, bool success) {
 
         /* Fall back to v1 when failure count reaches threshold */
         if (v2_should_fallback_to_v1(&client->v2_state)) {
-            if (client->protocol_version != 1) {
+            if (client->protocol_version != PROTOCOL_VERSION_V1) {
                 KOMARI_LOG_WARN("[Protocol] v2 failed %d times, falling back to v1",
                                 V2_FALLBACK_THRESHOLD);
-                client->protocol_version = 1;
+                client->protocol_version = PROTOCOL_VERSION_V1;
             }
         }
     }

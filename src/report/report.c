@@ -28,7 +28,6 @@
 #include "virtual.h"
 #include "gpu.h"
 #include "cJSON.h"
-#include "v2.h"
 #include "jsonrpc.h"
 
 /* Connect/send/recv timeout for HTTP requests (MIN-34: extracted magic number). */
@@ -162,20 +161,21 @@ static int send_full(SSL *ssl, int fd, const char *data, size_t len) {
     return 0;
 }
 
-int report_generate(const agent_config_t *config, char *buf, size_t buf_len) {
+int report_generate(const agent_config_t *config, monitoring_net_state_t *net_state,
+                    char *buf, size_t buf_len) {
     if (!config || !buf || buf_len == 0) return -1;
-    
+
     cpu_info_t cpu;
     mem_info_t mem, swap;
     disk_info_t disk;
     net_info_t net;
     load_info_t load;
     conn_info_t conn;
-    
+
     monitoring_get_cpu_info(&cpu);
-    monitoring_get_mem_swap_info(&mem, &swap);
+    monitoring_get_mem_swap_info(config->memory_include_cache, &mem, &swap);
     monitoring_get_disk_info(&disk);
-    monitoring_get_net_info(&net);
+    monitoring_get_net_info(net_state, &net);
     monitoring_get_load_info(&load);
     monitoring_get_conn_info(&conn);
     
@@ -219,72 +219,53 @@ int report_generate(const agent_config_t *config, char *buf, size_t buf_len) {
     return len;
 }
 
-/* Internal helper: wrap a pre-serialized v1 JSON payload as a v2 JSON-RPC 2.0
- * notification using the provided builder function, then copy the result into
- * the caller-provided buffer.
- *
- * @param v1_json   NUL-terminated v1 JSON string (will be parsed).
- * @param buf       Output buffer for the v2 JSON-RPC payload.
- * @param buf_len   Size of buf.
- * @param builder   Function that wraps a cJSON object as a JSON-RPC payload;
- *                  takes ownership of the cJSON object on input.
- * @return Number of bytes written on success, -1 on failure.
- */
-static int report_wrap_v2(const char *v1_json, char *buf, size_t buf_len,
-                           int (*builder)(cJSON *, char **)) {
-    if (!v1_json || !buf || buf_len == 0 || !builder) return -1;
-
-    /* Parse the v1 JSON into a cJSON object so the v2 builder can attach it
-     * under params.report / params.info. cJSON_Parse is thread-safe.
-     *
-     * Ownership of `data` is transferred to the builder on success. The
-     * builder also takes care of freeing `data` on every failure path
-     * (MIN-43), so this function must NOT free `data` after a builder
-     * failure - doing so would be a double-free when the builder already
-     * freed it via cJSON_Delete(params). */
-    cJSON *data = cJSON_Parse(v1_json);
-    if (!data) return -1;
-
-    char *v2_str = NULL;
-    if (builder(data, &v2_str) != 0) {
-        /* data has been freed by the builder (MIN-43). */
-        return -1;
-    }
-
-    size_t v2_len = strlen(v2_str);
-    if (v2_len >= buf_len) {
-        /* Buffer too small for the wrapped payload. */
-        free(v2_str);
-        return -1;
-    }
-    memcpy(buf, v2_str, v2_len + 1);
-    free(v2_str);
-
-    return (int)v2_len;
-}
-
-int report_generate_v2(const agent_config_t *config, char *buf, size_t buf_len) {
+int report_generate_v2(const agent_config_t *config, monitoring_net_state_t *net_state,
+                       char *buf, size_t buf_len) {
     if (!config || !buf || buf_len == 0) return -1;
 
     /* Generate the v1-style report JSON first. Use a local buffer so the
      * caller's buffer is left untouched on failure. */
     char v1_buf[4096];
-    int v1_len = report_generate(config, v1_buf, sizeof(v1_buf));
+    int v1_len = report_generate(config, net_state, v1_buf, sizeof(v1_buf));
     if (v1_len <= 0) return -1;
     v1_buf[sizeof(v1_buf) - 1] = '\0';
 
-    return report_wrap_v2(v1_buf, buf, buf_len, v2_build_report_payload);
+    /* Build the v2 JSON-RPC envelope by direct string concatenation instead
+     * of cJSON_Parse(v1) → jsonrpc_build_report_payload → cJSON_Print. The v1
+     * JSON produced by report_generate contains only numeric fields and an
+     * empty message string, so it can be embedded verbatim under
+     * params.report without re-escaping. This eliminates 4-6 heap malloc/free
+     * operations per cycle on the 1 Hz report path. */
+    int n = snprintf(buf, buf_len,
+                     "{\"jsonrpc\":\"2.0\",\"method\":\"%s\",\"params\":{\"report\":",
+                     AGENT_REPORT);
+    if (n < 0 || (size_t)n >= buf_len) return -1;
+    int offset = n;
+
+    /* Embed the v1 JSON verbatim — it is already a complete, valid JSON object. */
+    if ((size_t)v1_len >= buf_len - (size_t)offset) return -1;
+    memcpy(buf + offset, v1_buf, (size_t)v1_len);
+    offset += v1_len;
+
+    /* Close the params object and the envelope. */
+    if ((size_t)2 >= buf_len - (size_t)offset) return -1;
+    buf[offset++] = '}';
+    buf[offset++] = '}';
+    buf[offset] = '\0';
+
+    return offset;
 }
 
-int report_generate_v2_with_acks(const agent_config_t *config, char *buf,
-                                 size_t buf_len, const int *ack_ids,
+int report_generate_v2_with_acks(const agent_config_t *config,
+                                 monitoring_net_state_t *net_state,
+                                 char *buf, size_t buf_len, const int *ack_ids,
                                  int ack_count) {
     if (!config || !buf || buf_len == 0) return -1;
     if (ack_count < 0) ack_count = 0;
 
     /* Generate the v1-style report JSON first. */
     char v1_buf[4096];
-    int v1_len = report_generate(config, v1_buf, sizeof(v1_buf));
+    int v1_len = report_generate(config, net_state, v1_buf, sizeof(v1_buf));
     if (v1_len <= 0) return -1;
     v1_buf[sizeof(v1_buf) - 1] = '\0';
 
@@ -339,7 +320,7 @@ int report_generate_basic_info(const agent_config_t *config, char *buf, size_t b
     char ipv4[64] = "", ipv6[128] = "";
     
     monitoring_get_cpu_info(&cpu);
-    monitoring_get_mem_swap_info(&mem, &swap);
+    monitoring_get_mem_swap_info(config->memory_include_cache, &mem, &swap);
     monitoring_get_disk_info(&disk);
     monitoring_get_system_info(&sys);
     monitoring_get_ip_address(ipv4, sizeof(ipv4), ipv6, sizeof(ipv6));
@@ -412,7 +393,29 @@ int report_generate_basic_info_v2(const agent_config_t *config, char *buf, size_
     if (v1_len <= 0) return -1;
     v1_buf[sizeof(v1_buf) - 1] = '\0';
 
-    return report_wrap_v2(v1_buf, buf, buf_len, v2_build_basic_info_payload);
+    /* Build the v2 JSON-RPC envelope by direct string concatenation, mirroring
+     * report_generate_v2. The v1 JSON produced by report_generate_basic_info
+     * has all string fields pre-escaped via escape_json_string, so it can be
+     * embedded verbatim under params.info without re-parsing. This avoids the
+     * cJSON_Parse → cJSON_Print round-trip on every basic-info upload. */
+    int n = snprintf(buf, buf_len,
+                     "{\"jsonrpc\":\"2.0\",\"method\":\"%s\",\"params\":{\"info\":",
+                     AGENT_BASIC_INFO);
+    if (n < 0 || (size_t)n >= buf_len) return -1;
+    int offset = n;
+
+    /* Embed the v1 JSON verbatim — it is already a complete, valid JSON object. */
+    if ((size_t)v1_len >= buf_len - (size_t)offset) return -1;
+    memcpy(buf + offset, v1_buf, (size_t)v1_len);
+    offset += v1_len;
+
+    /* Close the params object and the envelope. */
+    if ((size_t)2 >= buf_len - (size_t)offset) return -1;
+    buf[offset++] = '}';
+    buf[offset++] = '}';
+    buf[offset] = '\0';
+
+    return offset;
 }
 
 /* Perform an HTTP POST request with optional extra headers, supporting HTTPS.

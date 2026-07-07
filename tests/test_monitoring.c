@@ -25,12 +25,11 @@
 #include <stdint.h>
 
 void setUp(void) {
-    /* Reset global config pointer */
-    monitoring_set_config(NULL);
+    /* Monitoring module no longer holds global state; nothing to reset. */
 }
 
 void tearDown(void) {
-    monitoring_set_config(NULL);
+    /* Monitoring module no longer holds global state; nothing to reset. */
 }
 
 /* ====== Data structure size tests ====== */
@@ -66,17 +65,26 @@ void test_monitoring_conn_info_struct_size(void) {
     TEST_ASSERT_EQUAL_INT(2 * (int)sizeof(int), (int)sizeof(conn_info_t));
 }
 
-/* ====== monitoring_set_config tests ====== */
+/* ====== monitoring_net_state tests ====== */
 
-/* Test monitoring_set_config sets config pointer */
-void test_monitoring_set_config(void) {
-    agent_config_t config;
-    config_init(&config);
-    config.memory_include_cache = true;
+/* Test monitoring_net_state_init/cleanup lifecycle */
+void test_monitoring_net_state_lifecycle(void) {
+    monitoring_net_state_t state;
+    TEST_ASSERT_EQUAL_INT(0, monitoring_net_state_init(&state));
+    TEST_ASSERT_FALSE(state.has_prev_sample);
+    TEST_ASSERT_TRUE(state.mutex_inited);
+    monitoring_net_state_cleanup(&state);
+    TEST_ASSERT_FALSE(state.mutex_inited);
+}
 
-    /* Set config pointer, should not crash */
-    monitoring_set_config(&config);
-    monitoring_set_config(NULL);
+/* Test monitoring_net_state_init with NULL */
+void test_monitoring_net_state_init_null(void) {
+    TEST_ASSERT_EQUAL_INT(-1, monitoring_net_state_init(NULL));
+}
+
+/* Test monitoring_net_state_cleanup with NULL (should not crash) */
+void test_monitoring_net_state_cleanup_null(void) {
+    monitoring_net_state_cleanup(NULL);
     TEST_PASS();
 }
 
@@ -113,7 +121,7 @@ void test_monitoring_get_cpu_info_null(void) {
 /* Test monitoring_get_mem_info: verify Total/Free/Buffers/Cached parsing */
 void test_monitoring_get_mem_info(void) {
     mem_info_t info;
-    int ret = monitoring_get_mem_info(&info);
+    int ret = monitoring_get_mem_info(false, &info);
     TEST_ASSERT_EQUAL_INT(0, ret);
 
     /* Total memory should be greater than 0 */
@@ -131,19 +139,14 @@ void test_monitoring_get_mem_info(void) {
 
 /* Test monitoring_get_mem_info with NULL pointer */
 void test_monitoring_get_mem_info_null(void) {
-    int ret = monitoring_get_mem_info(NULL);
+    int ret = monitoring_get_mem_info(false, NULL);
     TEST_ASSERT_EQUAL_INT(-1, ret);
 }
 
-/* Test monitoring_get_mem_info with memory_include_cache config */
+/* Test monitoring_get_mem_info with memory_include_cache=true */
 void test_monitoring_get_mem_info_with_cache_config(void) {
-    agent_config_t config;
-    config_init(&config);
-    config.memory_include_cache = true;
-    monitoring_set_config(&config);
-
     mem_info_t info;
-    int ret = monitoring_get_mem_info(&info);
+    int ret = monitoring_get_mem_info(true, &info);
     TEST_ASSERT_EQUAL_INT(0, ret);
     TEST_ASSERT_TRUE(info.total > 0);
 
@@ -154,7 +157,7 @@ void test_monitoring_get_mem_info_with_cache_config(void) {
 /* Test monitoring_get_swap_info: verify swap parsing */
 void test_monitoring_get_swap_info(void) {
     mem_info_t info;
-    int ret = monitoring_get_swap_info(&info);
+    int ret = monitoring_get_swap_info(false, &info);
     TEST_ASSERT_EQUAL_INT(0, ret);
 
     /* total is uint64_t so ">= 0" is always true; the meaningful invariant
@@ -171,7 +174,7 @@ void test_monitoring_get_swap_info(void) {
 
 /* Test monitoring_get_swap_info with NULL pointer */
 void test_monitoring_get_swap_info_null(void) {
-    int ret = monitoring_get_swap_info(NULL);
+    int ret = monitoring_get_swap_info(false, NULL);
     TEST_ASSERT_EQUAL_INT(-1, ret);
 }
 
@@ -201,29 +204,44 @@ void test_monitoring_get_disk_info_null(void) {
 
 /* Test monitoring_get_net_info: verify RX/TX byte parsing */
 void test_monitoring_get_net_info(void) {
+    monitoring_net_state_t state;
+    TEST_ASSERT_EQUAL_INT(0, monitoring_net_state_init(&state));
+
     net_info_t info;
-    int ret = monitoring_get_net_info(&info);
+    int ret = monitoring_get_net_info(&state, &info);
     TEST_ASSERT_EQUAL_INT(0, ret);
 
     /* All counters in net_info_t are uint64_t, so ">= 0" is always true.
      * The meaningful check is that the call succeeded (ret == 0, asserted
      * above) and that the struct was populated; we rely on subsequent
-     * net_speed_update calls to derive rates from these counters. */
+     * calls to derive rates from these counters. */
     TEST_PASS();
+
+    monitoring_net_state_cleanup(&state);
 }
 
 /* Test monitoring_get_net_info with NULL pointer */
 void test_monitoring_get_net_info_null(void) {
-    int ret = monitoring_get_net_info(NULL);
+    monitoring_net_state_t state;
+    TEST_ASSERT_EQUAL_INT(0, monitoring_net_state_init(&state));
+
+    int ret = monitoring_get_net_info(&state, NULL);
     TEST_ASSERT_EQUAL_INT(-1, ret);
+
+    monitoring_net_state_cleanup(&state);
 }
 
 /* Test monitoring_net_speed_update: verify speed update does not crash */
 void test_monitoring_net_speed_update(void) {
+    monitoring_net_state_t state;
+    TEST_ASSERT_EQUAL_INT(0, monitoring_net_state_init(&state));
+
     /* Call twice to compute speed delta */
-    monitoring_net_speed_update();
-    monitoring_net_speed_update();
+    monitoring_net_speed_update(&state);
+    monitoring_net_speed_update(&state);
     TEST_PASS();
+
+    monitoring_net_state_cleanup(&state);
 }
 
 /* ====== Connection count statistics tests ====== */
@@ -351,8 +369,10 @@ int main(void) {
     RUN_TEST(test_monitoring_load_info_struct_size);
     RUN_TEST(test_monitoring_conn_info_struct_size);
 
-    /* monitoring_set_config tests (platform-independent) */
-    RUN_TEST(test_monitoring_set_config);
+    /* monitoring_net_state tests (platform-independent) */
+    RUN_TEST(test_monitoring_net_state_lifecycle);
+    RUN_TEST(test_monitoring_net_state_init_null);
+    RUN_TEST(test_monitoring_net_state_cleanup_null);
 
 #ifdef __linux__
     /* /proc-dependent tests — only run on Linux. On other platforms

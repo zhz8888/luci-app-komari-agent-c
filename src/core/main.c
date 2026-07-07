@@ -42,6 +42,11 @@ static volatile sig_atomic_t g_running = 1;
 static agent_config_t g_config;
 static ws_client_t *g_ws_client = NULL;
 static netstatic_t *g_netstatic = NULL;
+/* Per-process network rate calculation state, owned by the report thread.
+ * Previously this state lived inside monitoring.c as file-level globals,
+ * making the module non-reentrant. Now the caller owns the state and passes
+ * it explicitly to monitoring_get_net_info via report_generate. */
+static monitoring_net_state_t g_net_state;
 
 /* Detect CR/LF in a string to prevent HTTP header injection via panel-
  * controlled fields (terminal_id, ping_target). Mirrors the helper in
@@ -232,7 +237,7 @@ static void on_terminal_output(terminal_t *term, const char *data, size_t len) {
 
 /* Terminal WebSocket raw data callback: handle terminal input and resize messages (WS→terminal input thread) */
 static void on_terminal_ws_data(ws_client_t *client, const char *data, size_t len) {
-    terminal_session_t *session = (terminal_session_t *)client->user_data;
+    terminal_session_t *session = (terminal_session_t *)ws_client_get_user_data(client);
     if (!session || !session->active) return;
 
     /* Snapshot the term pointer under the mutex. The monitor thread NULLs
@@ -294,10 +299,7 @@ static void *terminal_monitor_thread(void *arg) {
 
         /* Check if WebSocket has disconnected */
         if (session->ws) {
-            pthread_mutex_lock(&session->ws->state_mutex);
-            bool connected = session->ws->connected;
-            pthread_mutex_unlock(&session->ws->state_mutex);
-            if (!connected) {
+            if (!ws_client_is_connected(session->ws)) {
                 KOMARI_LOG_INFO("[Terminal] WebSocket disconnected, closing session");
                 break;
             }
@@ -405,8 +407,7 @@ static int establish_terminal_connection(const char *token, const char *request_
     /* IDN domain name conversion */
     char ascii_endpoint[512];
     if (idn_convert_url_to_ascii(session->ws_endpoint, ascii_endpoint, sizeof(ascii_endpoint)) == 0) {
-        strncpy(session->ws_endpoint, ascii_endpoint, sizeof(session->ws_endpoint) - 1);
-        session->ws_endpoint[sizeof(session->ws_endpoint) - 1] = '\0';
+        utils_set_string(session->ws_endpoint, sizeof(session->ws_endpoint), ascii_endpoint);
     }
 
     /* Build extra query parameters. URL-encode request_id before splicing
@@ -699,7 +700,7 @@ static void handle_ws_message(ws_client_t *client, const ws_message_t *msg) {
  * sends status reports and basic info to the panel.
  *
  * The payload format is selected per connection based on the negotiated
- * protocol version: when ws_client_should_use_v2 returns true the report
+ * protocol version: when ws_client_should_use_current_protocol returns true the report
  * is wrapped as a JSON-RPC 2.0 notification (method = "agent.report" /
  * "agent.basicInfo"); otherwise the original v1 JSON is sent. This mirrors
  * the Go reference implementation (server/websocket.go, EstablishWebSocket
@@ -716,10 +717,8 @@ static void *report_thread(void *arg) {
     time_t last_basic_info = 0;
     
     while (g_running) {
-        pthread_mutex_lock(&g_ws_client->state_mutex);
-        bool connected = g_ws_client->connected;
-        pthread_mutex_unlock(&g_ws_client->state_mutex);
-        
+        bool connected = ws_client_is_connected(g_ws_client);
+
         if (!connected) {
             KOMARI_LOG_INFO("[WebSocket] Connecting to %s...", g_config.endpoint);
             
@@ -731,7 +730,7 @@ static void *report_thread(void *arg) {
                     /* Send basic info on (re)connect using the negotiated
                      * protocol version so the server receives the right
                      * payload format immediately after the handshake. */
-                    bool use_v2 = ws_client_should_use_v2(g_ws_client);
+                    bool use_v2 = ws_client_should_use_current_protocol(g_ws_client);
                     int len = use_v2
                         ? report_generate_basic_info_v2(&g_config, report_buf, sizeof(report_buf))
                         : report_generate_basic_info(&g_config, report_buf, sizeof(report_buf));
@@ -762,7 +761,7 @@ static void *report_thread(void *arg) {
         /* Pick the payload format from the current protocol version. The
          * version may change between ticks due to v2->v1 fallback, so it
          * must be re-evaluated on every report cycle. */
-        bool use_v2 = ws_client_should_use_v2(g_ws_client);
+        bool use_v2 = ws_client_should_use_current_protocol(g_ws_client);
 
         /* For v2 reports, snapshot the pending ACK event IDs and include them
          * in the report payload so the server can stop retransmitting events
@@ -775,25 +774,25 @@ static void *report_thread(void *arg) {
          * dropping 768 unreported ACKs and causing the server to retransmit
          * those events every cycle. 4 KB of stack is acceptable for a 1 Hz
          * report path. */
+        _Static_assert(V2_ACK_IDS_MAX >= V2_ACK_SNAPSHOT_RECOMMENDED,
+                       "snapshot buffer smaller than recommended capacity");
         int ack_buf[V2_ACK_IDS_MAX];
         int ack_count = 0;
         int len;
 
         if (use_v2) {
-            v2_snapshot_ack_ids(&g_ws_client->v2_state, ack_buf,
+            v2_snapshot_ack_ids(ws_client_get_v2_state(g_ws_client), ack_buf,
                                 (int)(sizeof(ack_buf) / sizeof(ack_buf[0])),
                                 &ack_count);
-            len = report_generate_v2_with_acks(&g_config, report_buf,
+            len = report_generate_v2_with_acks(&g_config, &g_net_state, report_buf,
                                                 sizeof(report_buf),
                                                 ack_count > 0 ? ack_buf : NULL,
                                                 ack_count);
         } else {
-            len = report_generate(&g_config, report_buf, sizeof(report_buf));
+            len = report_generate(&g_config, &g_net_state, report_buf, sizeof(report_buf));
         }
 
-        pthread_mutex_lock(&g_ws_client->state_mutex);
-        bool is_connected = g_ws_client->connected;
-        pthread_mutex_unlock(&g_ws_client->state_mutex);
+        bool is_connected = ws_client_is_connected(g_ws_client);
 
         if (len > 0 && is_connected) {
             if (ws_client_send_text(g_ws_client, report_buf, len) != 0) {
@@ -809,24 +808,22 @@ static void *report_thread(void *arg) {
                  * re-ACKing them. This matches the simple clear-all semantic
                  * of v2_clear_acks (the C v2 interface does not expose a
                  * "remove only these IDs" operation). */
-                v2_clear_acks(&g_ws_client->v2_state);
+                v2_clear_acks(ws_client_get_v2_state(g_ws_client));
             }
         }
-        
+
         time_t now = time(NULL);
         if (now - last_basic_info >= g_config.info_report_interval * 60) {
             /* Re-evaluate the protocol version for the basic info payload,
              * in case the connection was retried with a different version
              * since the last report tick. */
-            use_v2 = ws_client_should_use_v2(g_ws_client);
+            use_v2 = ws_client_should_use_current_protocol(g_ws_client);
             len = use_v2
                 ? report_generate_basic_info_v2(&g_config, report_buf, sizeof(report_buf))
                 : report_generate_basic_info(&g_config, report_buf, sizeof(report_buf));
-            
-            pthread_mutex_lock(&g_ws_client->state_mutex);
-            is_connected = g_ws_client->connected;
-            pthread_mutex_unlock(&g_ws_client->state_mutex);
-            
+
+            is_connected = ws_client_is_connected(g_ws_client);
+
             if (len > 0 && is_connected) {
                 ws_client_send_text(g_ws_client, report_buf, len);
             }
@@ -860,12 +857,9 @@ static void *heartbeat_thread(void *arg) {
      * redundant. Check g_running only so the loop winds down promptly on
      * SIGTERM/SIGINT. */
     while (g_running) {
-        /* Protect read of connected flag with state_mutex to avoid torn
-         * reads on architectures without atomic word loads and to
-         * synchronize with writers in websocket.c. */
-        pthread_mutex_lock(&g_ws_client->state_mutex);
-        bool connected = g_ws_client->connected;
-        pthread_mutex_unlock(&g_ws_client->state_mutex);
+        /* ws_client_is_connected takes the state mutex internally so the
+         * read is synchronized with writers in websocket.c. */
+        bool connected = ws_client_is_connected(g_ws_client);
 
         if (connected) {
             if (ws_client_send_ping(g_ws_client) != 0) {
@@ -943,13 +937,11 @@ int main(int argc, char *argv[]) {
     while ((opt = getopt_long(argc, argv, "t:e:i:d:c:ksvh", long_options, NULL)) != -1) {
         switch (opt) {
             case 't':
-                strncpy(cli_token, optarg, sizeof(cli_token) - 1);
-                cli_token[sizeof(cli_token) - 1] = '\0';
+                utils_set_string(cli_token, sizeof(cli_token), optarg);
                 cli_set_token = true;
                 break;
             case 'e':
-                strncpy(cli_endpoint, optarg, sizeof(cli_endpoint) - 1);
-                cli_endpoint[sizeof(cli_endpoint) - 1] = '\0';
+                utils_set_string(cli_endpoint, sizeof(cli_endpoint), optarg);
                 cli_set_endpoint = true;
                 break;
             case 'i':
@@ -957,13 +949,11 @@ int main(int argc, char *argv[]) {
                 cli_set_interval = true;
                 break;
             case 'd':
-                strncpy(cli_custom_dns, optarg, sizeof(cli_custom_dns) - 1);
-                cli_custom_dns[sizeof(cli_custom_dns) - 1] = '\0';
+                utils_set_string(cli_custom_dns, sizeof(cli_custom_dns), optarg);
                 cli_set_custom_dns = true;
                 break;
             case 'c':
-                strncpy(cli_config_file, optarg, sizeof(cli_config_file) - 1);
-                cli_config_file[sizeof(cli_config_file) - 1] = '\0';
+                utils_set_string(cli_config_file, sizeof(cli_config_file), optarg);
                 cli_set_config_file = true;
                 break;
             case 'k':
@@ -987,13 +977,11 @@ int main(int argc, char *argv[]) {
      * the AGENT_CONFIG_FILE environment variable. Both must be resolved before
      * loading JSON so the correct file is read. */
     if (cli_set_config_file) {
-        strncpy(g_config.config_file, cli_config_file, sizeof(g_config.config_file) - 1);
-        g_config.config_file[sizeof(g_config.config_file) - 1] = '\0';
+        utils_set_string(g_config.config_file, sizeof(g_config.config_file), cli_config_file);
     } else {
         char *env_cfg = getenv("AGENT_CONFIG_FILE");
         if (env_cfg && env_cfg[0] != '\0') {
-            strncpy(g_config.config_file, env_cfg, sizeof(g_config.config_file) - 1);
-            g_config.config_file[sizeof(g_config.config_file) - 1] = '\0';
+            utils_set_string(g_config.config_file, sizeof(g_config.config_file), env_cfg);
         }
     }
 
@@ -1013,19 +1001,16 @@ int main(int argc, char *argv[]) {
      * config_load_from_env may have overwritten with AGENT_CONFIG_FILE even
      * though JSON was already loaded from the command-line path. */
     if (cli_set_token) {
-        strncpy(g_config.token, cli_token, sizeof(g_config.token) - 1);
-        g_config.token[sizeof(g_config.token) - 1] = '\0';
+        utils_set_string(g_config.token, sizeof(g_config.token), cli_token);
     }
     if (cli_set_endpoint) {
-        strncpy(g_config.endpoint, cli_endpoint, sizeof(g_config.endpoint) - 1);
-        g_config.endpoint[sizeof(g_config.endpoint) - 1] = '\0';
+        utils_set_string(g_config.endpoint, sizeof(g_config.endpoint), cli_endpoint);
     }
     if (cli_set_interval) {
         g_config.interval = cli_interval;
     }
     if (cli_set_custom_dns) {
-        strncpy(g_config.custom_dns, cli_custom_dns, sizeof(g_config.custom_dns) - 1);
-        g_config.custom_dns[sizeof(g_config.custom_dns) - 1] = '\0';
+        utils_set_string(g_config.custom_dns, sizeof(g_config.custom_dns), cli_custom_dns);
     }
     if (cli_set_insecure) {
         g_config.ignore_unsafe_cert = true;
@@ -1034,8 +1019,7 @@ int main(int argc, char *argv[]) {
         g_config.disable_web_ssh = true;
     }
     if (cli_set_config_file) {
-        strncpy(g_config.config_file, cli_config_file, sizeof(g_config.config_file) - 1);
-        g_config.config_file[sizeof(g_config.config_file) - 1] = '\0';
+        utils_set_string(g_config.config_file, sizeof(g_config.config_file), cli_config_file);
     }
 
     /* Validate the merged configuration before any subsystem consumes it.
@@ -1063,8 +1047,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Pass configuration to monitoring module to activate options like memory_include_cache */
-    monitoring_set_config(&g_config);
+    /* Initialize the per-process network rate calculation state used by the
+     * report thread. The monitoring module no longer holds internal global
+     * state; the caller owns the state and passes it explicitly. */
+    if (monitoring_net_state_init(&g_net_state) != 0) {
+        KOMARI_LOG_ERROR("Failed to initialize network monitoring state");
+        return 1;
+    }
 
     if (g_config.token[0] == '\0' || g_config.endpoint[0] == '\0') {
         fprintf(stderr, "Error: token and endpoint are required\n");
@@ -1099,8 +1088,7 @@ int main(int argc, char *argv[]) {
     char ascii_endpoint[512];
     if (idn_convert_url_to_ascii(ws_endpoint, ascii_endpoint, sizeof(ascii_endpoint)) == 0) {
         KOMARI_LOG_DEBUG("IDN converted: %s -> %s", ws_endpoint, ascii_endpoint);
-        strncpy(ws_endpoint, ascii_endpoint, sizeof(ws_endpoint) - 1);
-        ws_endpoint[sizeof(ws_endpoint) - 1] = '\0';
+        utils_set_string(ws_endpoint, sizeof(ws_endpoint), ascii_endpoint);
     } else {
         KOMARI_LOG_DEBUG("IDN conversion failed, using original URL");
     }
@@ -1215,11 +1203,11 @@ int main(int argc, char *argv[]) {
     }
 
     /* Join worker threads BEFORE destroying any shared resources they
-     * access. Both report_thread and heartbeat_thread read
-     * g_ws_client->state_mutex and g_ws_client->connected on every loop
-     * iteration; destroying g_ws_client first would turn those reads into
-     * use-after-free (MAJ-09). The threads check g_running every second
-     * in their sleep loops, so join returns within ~1 second.
+     * access. Both report_thread and heartbeat_thread call
+     * ws_client_is_connected(g_ws_client) on every loop iteration, which
+     * takes the client's state mutex; destroying g_ws_client first would
+     * turn those calls into use-after-free. The threads check g_running
+     * every second in their sleep loops, so join returns within ~1 second.
      *
      * This mirrors the Go reference implementation's cleanup pattern
      * (.komari-agent-main/server/websocket.go, EstablishWebSocketConnection)
@@ -1261,6 +1249,8 @@ int main(int argc, char *argv[]) {
         ws_client_disconnect(g_ws_client);
         ws_client_destroy(g_ws_client);
     }
+
+    monitoring_net_state_cleanup(&g_net_state);
 
     logger_cleanup();
 

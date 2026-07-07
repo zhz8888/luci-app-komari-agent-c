@@ -26,7 +26,7 @@
 #define CONFIG_DEFAULT_MAX_RETRIES       5
 #define CONFIG_DEFAULT_RECONNECT_INTERVAL 5
 #define CONFIG_DEFAULT_INFO_REPORT_INTERVAL 30
-#define CONFIG_DEFAULT_PROTOCOL_VERSION  2
+#define CONFIG_DEFAULT_PROTOCOL_VERSION  PROTOCOL_VERSION_V2
 
 /* Length of a canonical UUID string (8-4-4-4-12 hex digits with hyphens). */
 #define UUID_LEN 36
@@ -111,13 +111,12 @@ void config_init(agent_config_t *config) {
     config->reconnect_interval = 5;
     config->info_report_interval = 30;
     config->month_rotate = 0;
-    config->protocol_version = 2;   /* Default to v2 protocol */
+    config->protocol_version = PROTOCOL_VERSION_V2;
 
     config->disable_auto_update = false;
     config->disable_web_ssh = false;
     config->ignore_unsafe_cert = false;
     config->memory_include_cache = false;
-    config->memory_report_raw_used = false;
     config->enable_gpu = false;
     config->get_ip_addr_from_nic = false;
     config->show_warning = false;
@@ -133,8 +132,7 @@ void config_init(agent_config_t *config) {
 static char *get_env_or_empty(const char *name, char *buf, size_t buf_len) {
     char *val = getenv(name);
     if (val) {
-        strncpy(buf, val, buf_len - 1);
-        buf[buf_len - 1] = '\0';
+        utils_set_string(buf, buf_len, val);
         return buf;
     }
     /* When environment variable is not set, keep existing value without override (supports configuration priority: environment variables only override set fields) */
@@ -212,7 +210,6 @@ int config_load_from_env(agent_config_t *config) {
     config->disable_web_ssh = get_env_bool("AGENT_DISABLE_WEB_SSH", config->disable_web_ssh);
     config->ignore_unsafe_cert = get_env_bool("AGENT_IGNORE_UNSAFE_CERT", config->ignore_unsafe_cert);
     config->memory_include_cache = get_env_bool("AGENT_MEMORY_INCLUDE_CACHE", config->memory_include_cache);
-    config->memory_report_raw_used = get_env_bool("AGENT_MEMORY_REPORT_RAW_USED", config->memory_report_raw_used);
     config->enable_gpu = get_env_bool("AGENT_ENABLE_GPU", config->enable_gpu);
     config->get_ip_addr_from_nic = get_env_bool("AGENT_GET_IP_ADDR_FROM_NIC", config->get_ip_addr_from_nic);
     config->show_warning = get_env_bool("AGENT_SHOW_WARNING", config->show_warning);
@@ -224,10 +221,10 @@ int config_load_from_env(agent_config_t *config) {
 
 
 int config_load_from_file(agent_config_t *config, const char *path) {
-    if (!config || !path) return -1;
+    if (!config || !path) return KOMARI_ERR_INVALID_ARG;
 
     FILE *f = fopen(path, "r");
-    if (!f) return -1;
+    if (!f) return KOMARI_ERR_NOT_FOUND;
 
     /* Reject world/group-accessible config files to prevent token and
      * auto_discovery_key leakage to local users. Only the owner should be
@@ -237,23 +234,23 @@ int config_load_from_file(agent_config_t *config, const char *path) {
         KOMARI_LOG_WARN("Config file %s is group/world accessible (mode %03o); refusing to load. Use 'chmod 600 %s' to fix.",
                         path, st.st_mode & 0777, path);
         fclose(f);
-        return -1;
+        return KOMARI_ERR_INVALID_ARG;
     }
 
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     if (size < 0) {
         fclose(f);
-        return -1;
+        return KOMARI_ERR_GENERIC;
     }
     fseek(f, 0, SEEK_SET);
 
     char *json = malloc(size + 1);
     if (!json) {
         fclose(f);
-        return -1;
+        return KOMARI_ERR_NOMEM;
     }
-    
+
     size_t bytes_read = fread(json, 1, size, f);
     if (bytes_read != (size_t)size) {
         /* Partial read usually indicates an underlying I/O problem (file
@@ -263,73 +260,62 @@ int config_load_from_file(agent_config_t *config, const char *path) {
         fprintf(stderr, "Warning: Config file read incomplete: %zu/%ld bytes\n", bytes_read, size);
         free(json);
         fclose(f);
-        return -1;
+        return KOMARI_ERR_GENERIC;
     }
     json[bytes_read] = '\0';
     fclose(f);
-    
+
     cJSON *root = cJSON_Parse(json);
     if (!root) {
         fprintf(stderr, "Failed to parse JSON config from %s\n", path);
         free(json);
-        return -1;
+        return KOMARI_ERR_PARSE;
     }
     
     cJSON *item;
     
     if ((item = cJSON_GetObjectItem(root, "token")) && item->valuestring) {
-        strncpy(config->token, item->valuestring, sizeof(config->token) - 1);
-        config->token[sizeof(config->token) - 1] = '\0';
+        utils_set_string(config->token, sizeof(config->token), item->valuestring);
     }
-    
+
     if ((item = cJSON_GetObjectItem(root, "endpoint")) && item->valuestring) {
-        strncpy(config->endpoint, item->valuestring, sizeof(config->endpoint) - 1);
-        config->endpoint[sizeof(config->endpoint) - 1] = '\0';
+        utils_set_string(config->endpoint, sizeof(config->endpoint), item->valuestring);
     }
-    
+
     if ((item = cJSON_GetObjectItem(root, "custom_dns")) && item->valuestring) {
-        strncpy(config->custom_dns, item->valuestring, sizeof(config->custom_dns) - 1);
-        config->custom_dns[sizeof(config->custom_dns) - 1] = '\0';
+        utils_set_string(config->custom_dns, sizeof(config->custom_dns), item->valuestring);
     }
-    
+
     if ((item = cJSON_GetObjectItem(root, "include_nics")) && item->valuestring) {
-        strncpy(config->include_nics, item->valuestring, sizeof(config->include_nics) - 1);
-        config->include_nics[sizeof(config->include_nics) - 1] = '\0';
+        utils_set_string(config->include_nics, sizeof(config->include_nics), item->valuestring);
     }
-    
+
     if ((item = cJSON_GetObjectItem(root, "exclude_nics")) && item->valuestring) {
-        strncpy(config->exclude_nics, item->valuestring, sizeof(config->exclude_nics) - 1);
-        config->exclude_nics[sizeof(config->exclude_nics) - 1] = '\0';
+        utils_set_string(config->exclude_nics, sizeof(config->exclude_nics), item->valuestring);
     }
-    
+
     if ((item = cJSON_GetObjectItem(root, "include_mountpoints")) && item->valuestring) {
-        strncpy(config->include_mountpoints, item->valuestring, sizeof(config->include_mountpoints) - 1);
-        config->include_mountpoints[sizeof(config->include_mountpoints) - 1] = '\0';
+        utils_set_string(config->include_mountpoints, sizeof(config->include_mountpoints), item->valuestring);
     }
-    
+
     if ((item = cJSON_GetObjectItem(root, "cf_access_client_id")) && item->valuestring) {
-        strncpy(config->cf_access_client_id, item->valuestring, sizeof(config->cf_access_client_id) - 1);
-        config->cf_access_client_id[sizeof(config->cf_access_client_id) - 1] = '\0';
+        utils_set_string(config->cf_access_client_id, sizeof(config->cf_access_client_id), item->valuestring);
     }
-    
+
     if ((item = cJSON_GetObjectItem(root, "cf_access_client_secret")) && item->valuestring) {
-        strncpy(config->cf_access_client_secret, item->valuestring, sizeof(config->cf_access_client_secret) - 1);
-        config->cf_access_client_secret[sizeof(config->cf_access_client_secret) - 1] = '\0';
+        utils_set_string(config->cf_access_client_secret, sizeof(config->cf_access_client_secret), item->valuestring);
     }
-    
+
     if ((item = cJSON_GetObjectItem(root, "custom_ipv4")) && item->valuestring) {
-        strncpy(config->custom_ipv4, item->valuestring, sizeof(config->custom_ipv4) - 1);
-        config->custom_ipv4[sizeof(config->custom_ipv4) - 1] = '\0';
+        utils_set_string(config->custom_ipv4, sizeof(config->custom_ipv4), item->valuestring);
     }
-    
+
     if ((item = cJSON_GetObjectItem(root, "custom_ipv6")) && item->valuestring) {
-        strncpy(config->custom_ipv6, item->valuestring, sizeof(config->custom_ipv6) - 1);
-        config->custom_ipv6[sizeof(config->custom_ipv6) - 1] = '\0';
+        utils_set_string(config->custom_ipv6, sizeof(config->custom_ipv6), item->valuestring);
     }
-    
+
     if ((item = cJSON_GetObjectItem(root, "auto_discovery_key")) && item->valuestring) {
-        strncpy(config->auto_discovery_key, item->valuestring, sizeof(config->auto_discovery_key) - 1);
-        config->auto_discovery_key[sizeof(config->auto_discovery_key) - 1] = '\0';
+        utils_set_string(config->auto_discovery_key, sizeof(config->auto_discovery_key), item->valuestring);
     }
 
     if ((item = cJSON_GetObjectItem(root, "interval")) && item->valuedouble > 0) {
@@ -387,15 +373,7 @@ int config_load_from_file(agent_config_t *config, const char *path) {
             config->memory_include_cache = (strcasecmp(item->valuestring, "true") == 0);
         }
     }
-    
-    if ((item = cJSON_GetObjectItem(root, "memory_report_raw_used"))) {
-        if (cJSON_IsBool(item)) {
-            config->memory_report_raw_used = cJSON_IsTrue(item);
-        } else if (cJSON_IsString(item)) {
-            config->memory_report_raw_used = (strcasecmp(item->valuestring, "true") == 0);
-        }
-    }
-    
+
     if ((item = cJSON_GetObjectItem(root, "enable_gpu"))) {
         if (cJSON_IsBool(item)) {
             config->enable_gpu = cJSON_IsTrue(item);
@@ -440,8 +418,7 @@ int config_parse_uci_line(agent_config_t *config, const char *raw_line) {
     if (!config || !raw_line) return -1;
 
     char line[512];
-    strncpy(line, raw_line, sizeof(line) - 1);
-    line[sizeof(line) - 1] = '\0';
+    utils_set_string(line, sizeof(line), raw_line);
 
     /* Locate '=' first, then find the last '.' before it. Finding the last
      * dot (rather than the first) correctly handles option names whose
@@ -456,8 +433,7 @@ int config_parse_uci_line(agent_config_t *config, const char *raw_line) {
     if (!dot) return -1;
 
     char key[64];
-    strncpy(key, dot + 1, sizeof(key) - 1);
-    key[sizeof(key) - 1] = '\0';
+    utils_set_string(key, sizeof(key), dot + 1);
 
     /* Value: skip leading spaces/quotes, then trim trailing newline,
      * quote and space characters. */
@@ -465,8 +441,7 @@ int config_parse_uci_line(agent_config_t *config, const char *raw_line) {
     while (*val == ' ' || *val == '\'') val++;
 
     char value[256];
-    strncpy(value, val, sizeof(value) - 1);
-    value[sizeof(value) - 1] = '\0';
+    utils_set_string(value, sizeof(value), val);
 
     size_t vlen = strlen(value);
     while (vlen > 0 && (value[vlen - 1] == '\n' ||
@@ -476,11 +451,9 @@ int config_parse_uci_line(agent_config_t *config, const char *raw_line) {
     }
 
     if (strcmp(key, "token") == 0) {
-        strncpy(config->token, value, sizeof(config->token) - 1);
-        config->token[sizeof(config->token) - 1] = '\0';
+        utils_set_string(config->token, sizeof(config->token), value);
     } else if (strcmp(key, "endpoint") == 0) {
-        strncpy(config->endpoint, value, sizeof(config->endpoint) - 1);
-        config->endpoint[sizeof(config->endpoint) - 1] = '\0';
+        utils_set_string(config->endpoint, sizeof(config->endpoint), value);
     } else if (strcmp(key, "interval") == 0) {
         config->interval = atof(value);
     } else if (strcmp(key, "disable_web_ssh") == 0) {
@@ -488,8 +461,7 @@ int config_parse_uci_line(agent_config_t *config, const char *raw_line) {
     } else if (strcmp(key, "ignore_unsafe_cert") == 0) {
         config->ignore_unsafe_cert = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
     } else if (strcmp(key, "custom_dns") == 0) {
-        strncpy(config->custom_dns, value, sizeof(config->custom_dns) - 1);
-        config->custom_dns[sizeof(config->custom_dns) - 1] = '\0';
+        utils_set_string(config->custom_dns, sizeof(config->custom_dns), value);
     } else if (strcmp(key, "max_retries") == 0) {
         config->max_retries = atoi(value);
     } else if (strcmp(key, "reconnect_interval") == 0) {
@@ -507,8 +479,7 @@ int config_parse_uci_line(agent_config_t *config, const char *raw_line) {
     } else if (strcmp(key, "disable_auto_update") == 0) {
         config->disable_auto_update = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
     } else if (strcmp(key, "auto_discovery_key") == 0) {
-        strncpy(config->auto_discovery_key, value, sizeof(config->auto_discovery_key) - 1);
-        config->auto_discovery_key[sizeof(config->auto_discovery_key) - 1] = '\0';
+        utils_set_string(config->auto_discovery_key, sizeof(config->auto_discovery_key), value);
     }
 
     return 0;
@@ -639,8 +610,9 @@ int config_validate(agent_config_t *config) {
         config->info_report_interval = CONFIG_DEFAULT_INFO_REPORT_INTERVAL;
     }
 
-    if (config->protocol_version <= 0) {
-        KOMARI_LOG_ERROR("Config validation: protocol_version (%d) must be > 0, using default %d",
+    if (config->protocol_version != PROTOCOL_VERSION_V1 &&
+        config->protocol_version != PROTOCOL_VERSION_V2) {
+        KOMARI_LOG_ERROR("Config validation: protocol_version (%d) is not a known version, using default %d",
                          config->protocol_version, CONFIG_DEFAULT_PROTOCOL_VERSION);
         config->protocol_version = CONFIG_DEFAULT_PROTOCOL_VERSION;
     }

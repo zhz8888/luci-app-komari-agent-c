@@ -10,13 +10,10 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <pthread.h>
-#include <openssl/ssl.h>
+#include <stddef.h>
 
-#include "cJSON.h"
-#include "config.h"
-#include "monitoring.h"
 #include "v2.h"
+#include "protocol.h"
 
 #define WS_MAX_MESSAGE_SIZE (64 * 1024)
 #define WS_PING_INTERVAL 30
@@ -27,8 +24,8 @@
  * connection is closed to prevent unbounded memory growth. */
 #define WS_FRAGMENT_MAX_SIZE (1024 * 1024)
 
-/* Size of the buffer used to hold bytes read past the HTTP handshake response
- * (MAJ-24). The server may send the first WebSocket frame immediately after
+/* Size of the buffer used to hold bytes read past the HTTP handshake
+ * response. The server may send the first WebSocket frame immediately after
  * the 101 Switching Protocols response; those bytes are read into the same
  * buffer as the headers during ws_handshake and must be preserved for the
  * recv thread to consume via read_full. Matches the 2048-byte handshake
@@ -56,48 +53,15 @@ typedef struct {
     char ping_target[256];
 } ws_message_t;
 
+/* Opaque handle to a WebSocket client. The internal layout is defined in
+ * websocket_internal.h so that production code (main.c) cannot reach into
+ * private fields, while unit tests retain white-box access for state
+ * assertions. */
 typedef struct ws_client ws_client_t;
 
 typedef void (*ws_message_handler_t)(ws_client_t *client, const ws_message_t *msg);
 /* Raw data callback: used for terminal and similar scenarios, passes frame data directly without JSON parsing */
 typedef void (*ws_raw_handler_t)(ws_client_t *client, const char *data, size_t len);
-
-struct ws_client {
-    int fd;
-    bool connected;
-    bool should_stop;
-    bool use_tls;
-    SSL *ssl;
-    SSL_CTX *ssl_ctx;
-    pthread_t recv_thread;
-    pthread_mutex_t send_mutex;
-    pthread_mutex_t state_mutex;
-    ws_client_config_t config;
-    ws_message_handler_t handler;
-    ws_raw_handler_t raw_handler;
-    void *user_data;
-    v2_state_t v2_state;   /* v2 protocol runtime state, used for protocol fallback mechanism */
-    int protocol_version;  /* Currently used protocol version (1 or 2) */
-    /* Fragmented message accumulation state (RFC 6455 §5.4).
-     * fragment_buf accumulates continuation frame payloads until a final
-     * frame (FIN=1) is received. Only the recv thread reads/writes these
-     * fields, so no extra locking is required. */
-    char *fragment_buf;
-    size_t fragment_len;
-    size_t fragment_capacity;
-    int fragment_opcode;
-
-    /* Bytes read past the HTTP handshake response (MAJ-24). The server may
-     * start sending WebSocket frames immediately after the 101 Switching
-     * Protocols response; ws_handshake reads them into the same buffer as
-     * the headers and stores any overflow here so the recv thread can
-     * consume them via read_full before issuing recv()/SSL_read().
-     * pending_off tracks the next byte to consume; pending_len is the total
-     * bytes stored. Only the recv thread touches these after ws_handshake. */
-    unsigned char pending_buf[WS_PENDING_BUF_SIZE];
-    size_t pending_len;
-    size_t pending_off;
-};
 
 /**
  * Create a new WebSocket client from the given configuration.
@@ -201,17 +165,25 @@ void ws_client_stop(ws_client_t *client);
  * Get the currently used protocol version.
  *
  * @param client Pointer to the client.
- * @return 1 for the v1 protocol, 2 for the v2 protocol.
+ * @return PROTOCOL_VERSION_V1 or PROTOCOL_VERSION_V2; returns
+ *         PROTOCOL_VERSION_V1 when client is NULL.
  */
-int ws_client_get_protocol_version(ws_client_t *client);
+protocol_version_t ws_client_get_protocol_version(ws_client_t *client);
 
 /**
- * Check whether the v2 protocol should be used.
+ * Check whether the currently active protocol should be used for the next
+ * report cycle.
+ *
+ * The client tracks consecutive v2 failures and falls back to v1 once the
+ * threshold (V2_FALLBACK_THRESHOLD) is reached. This accessor centralizes
+ * that decision so callers (main.c report loop, ws_client_connect path
+ * selection) do not need to inspect protocol_version or v2_state directly.
  *
  * @param client Pointer to the client.
- * @return true when consecutive v2 failures have not reached the threshold (3 times).
+ * @return true when the active protocol should be used (i.e. the fallback
+ *         threshold has not been reached); false otherwise.
  */
-bool ws_client_should_use_v2(ws_client_t *client);
+bool ws_client_should_use_current_protocol(ws_client_t *client);
 
 /**
  * Record protocol attempt result (used for the protocol fallback mechanism).
@@ -222,71 +194,40 @@ bool ws_client_should_use_v2(ws_client_t *client);
  */
 void ws_client_note_protocol_result(ws_client_t *client, bool success);
 
-/* ====== Fragment accumulation (RFC 6455 §5.4) ======
- * The following helper is an internal function exposed for unit testing.
- * Application code should not call it directly; it is invoked by the
- * recv thread to assemble fragmented WebSocket messages. */
+/**
+ * Check whether the client is currently connected to the server.
+ *
+ * Reads the connected flag under the client's state mutex so callers do not
+ * need to take the lock themselves. Equivalent to the previous pattern:
+ *
+ *     pthread_mutex_lock(&client->state_mutex);
+ *     bool c = client->connected;
+ *     pthread_mutex_unlock(&client->state_mutex);
+ *
+ * @param client Pointer to the client. May be NULL (returns false).
+ * @return true when the client is connected, false otherwise.
+ */
+bool ws_client_is_connected(ws_client_t *client);
 
 /**
- * Accumulate a WebSocket fragment into the client's fragment buffer.
+ * Get the v2 protocol runtime state owned by the client.
  *
- * Handles RFC 6455 §5.4 message fragmentation. For unfragmented messages
- * (FIN=1 with a non-continuation opcode), returns the input buffer directly.
- * For fragmented messages, accumulates payload into the client's fragment_buf
- * until the final fragment is received.
+ * Returned pointer is valid for the lifetime of the client. Callers may pass
+ * it to v2_snapshot_ack_ids / v2_clear_acks and other v2_state_t accessors,
+ * which take the state's internal mutex. The pointer must not be freed by
+ * the caller.
  *
- * @param client     Pointer to the client.
- * @param opcode     Frame opcode (0x00 continuation, 0x01 text, 0x02 binary).
- * @param fin        FIN bit (1 = final frame, 0 = more fragments to follow).
- * @param data       Frame payload buffer (mutable; may be returned via `out`
- *                   for unfragmented messages).
- * @param len        Frame payload length.
- * @param out        On return value 1, points to the complete message
- *                   (either `data` for unfragmented messages or
- *                   `client->fragment_buf` for fragmented ones). The caller
- *                   may safely write a NUL terminator at `out[*out_len]`.
- * @param out_len    On return value 1, length of the complete message.
- * @param out_opcode On return value 1, opcode of the complete message
- *                   (0x01 text or 0x02 binary).
- * @return 0 = fragment accumulated, waiting for more data;
- *         1 = message complete (`out`/`out_len`/`out_opcode` set);
- *        -1 = error (oversize, allocation failure, or protocol error).
+ * @param client Pointer to the client. May be NULL (returns NULL).
+ * @return Pointer to the client's v2_state_t, or NULL if client is NULL.
  */
-int ws_fragment_accumulate(ws_client_t *client, int opcode, int fin,
-                           char *data, size_t len,
-                           char **out, size_t *out_len, int *out_opcode);
-
-/* ====== v2 JSON-RPC event handling ======
- * The following helper is an internal function exposed for unit testing.
- * Application code should not call it directly; it is invoked by the
- * recv thread to dispatch v2 JSON-RPC events received from the server. */
+v2_state_t *ws_client_get_v2_state(ws_client_t *client);
 
 /**
- * Handle a v2 JSON-RPC event message.
+ * Get the user data pointer previously stored via ws_client_set_user_data.
  *
- * Parses the JSON-RPC 2.0 event, deduplicates by event ID (using the
- * client's v2 state), dispatches to the registered message handler based
- * on the method field (agent.exec / agent.ping / agent.terminal.request /
- * agent.message / agent.event), and accumulates the event ID into the
- * pending ACK list for the next report cycle.
- *
- * Deduplication: if the event ID (string form) has been seen before, the
- * event is not dispatched to the handler but is still ACKed (so the server
- * stops retransmitting). Events without an ID are always dispatched.
- *
- * ACK accumulation: the event ID is converted to an int (via strtol for
- * string IDs, or directly for numeric IDs). If the ID is missing, empty,
- * or non-numeric, ACK accumulation is skipped (the C v2 interface uses
- * int ACK IDs, matching v2_add_ack_event).
- *
- * @param client Pointer to the WebSocket client.
- * @param root   Parsed cJSON tree of the JSON-RPC event. Ownership is
- *               transferred to this function, which frees it via cJSON_Delete
- *               before returning. The caller must not free or reuse root
- *               after this call. Passing NULL is invalid and returns -1.
- * @return 0 on success (event processed or duplicate skipped),
- *         -1 on parse failure or invalid arguments.
+ * @param client Pointer to the client. May be NULL (returns NULL).
+ * @return The stored user data pointer, or NULL if none has been set.
  */
-int ws_handle_v2_event(ws_client_t *client, cJSON *root);
+void *ws_client_get_user_data(ws_client_t *client);
 
 #endif

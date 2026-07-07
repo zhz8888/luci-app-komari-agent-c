@@ -24,6 +24,7 @@
 
 #include "utils.h"
 #include "logger.h"
+#include "paths.h"
 
 /* PATH_MAX is the kernel-enforced maximum path length on Linux (4096).
  * Provide a fallback for platforms where <limits.h> does not define it. */
@@ -220,7 +221,7 @@ int utils_write_file_string(const char *path, const char *data, mode_t mode) {
 }
 
 uint64_t utils_get_uptime_seconds(void) {
-    FILE *fp = fopen("/proc/uptime", "r");
+    FILE *fp = fopen(KOMARI_PATH_PROC_UPTIME, "r");
     if (!fp) return 0;
     
     double uptime;
@@ -506,4 +507,16 @@ int utils_json_unescape(const char *json, char *out, size_t out_len) {
     out[j] = '\0';
 
     return 0;
+}
+
+void utils_set_string(char *dst, size_t dst_size, const char *src) {
+    if (!dst || dst_size == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t len = strlen(src);
+    if (len >= dst_size) len = dst_size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
 }
