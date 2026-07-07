@@ -59,7 +59,7 @@ jobs:
           file "$BINARY"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: test-binary-linux-${{ matrix.goarch }}
           path: output/komari-agent-c-linux-${{ matrix.goarch }}
@@ -144,7 +144,7 @@ jobs:
           find bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/ -name "*.apk" -exec ls -lh {} \; 2>/dev/null || echo "  (none)"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: test-${{ matrix.arch }}-${{ matrix.version }}
           path: bin/packages/${{ matrix.arch }}/${{ env.FEED_NAME }}/*.*pk
@@ -152,7 +152,7 @@ jobs:
 
       - name: Upload build logs
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: build-logs-test-${{ matrix.arch }}-${{ matrix.version }}
           path: logs/
@@ -230,7 +230,7 @@ jobs:
           ls -lh i18n-artifacts/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: test-luci-${{ matrix.version }}
           path: i18n-artifacts/*
@@ -238,7 +238,7 @@ jobs:
 
       - name: Upload build logs
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: build-logs-luci-test-${{ matrix.version }}
           path: logs/
